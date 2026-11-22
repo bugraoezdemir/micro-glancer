@@ -21,8 +21,9 @@ struct Params {
     outside: vec4<f32>,
     opacity: f32,
     linear: u32,
-    _p0: f32,
-    _p1: f32,
+    // projections: the mode (see shader_mip.wgsl) and the opacity per voxel
+    mode: u32,
+    density: f32,
 }
 
 struct Level {

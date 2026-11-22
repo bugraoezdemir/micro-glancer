@@ -231,6 +231,46 @@ pub struct Pick {
     pub layers: Vec<LayerPick>,
 }
 
+/// What a projection shows of the volumes along the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Projection {
+    /// The highest value along the ray, per channel.
+    Mip,
+    /// Front-to-back compositing: brighter voxels more opaque (see the density).
+    Volume,
+    /// Surfaces where each channel reaches the middle of its contrast window.
+    Iso,
+}
+
+impl Projection {
+    pub fn name(self) -> &'static str {
+        match self {
+            Projection::Mip => "mip",
+            Projection::Volume => "volume",
+            Projection::Iso => "iso",
+        }
+    }
+
+    pub fn parse(name: &str) -> Result<Self, ViewerError> {
+        match name {
+            "mip" => Ok(Projection::Mip),
+            "volume" => Ok(Projection::Volume),
+            "iso" => Ok(Projection::Iso),
+            _ => Err(verr(format!(
+                "projection {name:?}: \"mip\", \"volume\" or \"iso\""
+            ))),
+        }
+    }
+
+    fn code(self) -> u32 {
+        match self {
+            Projection::Mip => 0,
+            Projection::Volume => 1,
+            Projection::Iso => 2,
+        }
+    }
+}
+
 /// How a layer is drawn for the current camera.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -753,6 +793,9 @@ struct FrameCtx {
     camera: Camera,
     moving: bool,
     threads: f64,
+    /// Projections: the mode (FrameParams::mode) and the volume's density.
+    mode: u32,
+    density: f32,
 }
 
 /// The most bricks a level may have to be projected (every brick is listed per frame).
@@ -768,6 +811,7 @@ fn level_gpu3(
     s: [u64; 3],
     (g, base, usable): ([u32; 3], u32, bool),
     dir: V3,
+    scale: f64,
 ) -> LevelGpu3 {
     let origin = p.at(-ox, -oy);
     let oi = origin.map(f64::floor);
@@ -783,7 +827,7 @@ fn level_gpu3(
         uy: [p.uy[0] as f32, p.uy[1] as f32, p.uy[2] as f32, 0.0],
         size: [s[0] as i32, s[1] as i32, s[2] as i32, base as i32],
         grid: [g[0], g[1], g[2], usable as u32],
-        dir: [dir[0] as f32, dir[1] as f32, dir[2] as f32, 0.0],
+        dir: [dir[0] as f32, dir[1] as f32, dir[2] as f32, scale as f32],
     }
 }
 
@@ -1073,7 +1117,8 @@ fn prepare_flat(
         outside: [0.0; 4],
         opacity: o.opacity.clamp(0.0, 1.0),
         linear: 0,
-        _pad: [0.0; 2],
+        mode: 0,
+        density: 0.0,
     };
     (Some(params), level)
 }
@@ -1240,7 +1285,15 @@ fn prepare_volume(
     let levels: Vec<LevelGpu3> = (0..nl)
         .map(|l| {
             let dir = o.to_index(l).linear(normal);
-            level_gpu3(&planes[l], cx.ox, cx.oy, size(l), o.bgrid[l], dir)
+            level_gpu3(
+                &planes[l],
+                cx.ox,
+                cx.oy,
+                size(l),
+                o.bgrid[l],
+                dir,
+                cx.camera.scale,
+            )
         })
         .collect();
     gpu.write_brick_levels(id, &levels);
@@ -1254,7 +1307,8 @@ fn prepare_volume(
         outside: [0.0; 4],
         opacity: o.opacity.clamp(0.0, 1.0),
         linear: o.linear as u32,
-        _pad: [0.0; 2],
+        mode: if mip { cx.mode } else { 0 },
+        density: cx.density,
     };
     (Some(params), level)
 }
@@ -1307,8 +1361,13 @@ pub struct Viewer {
     /// Linked views: the main view, its YZ and XZ companions and the projection, in
     /// quarters of the target.
     linked: bool,
-    /// The main view shows the projection (maximum intensity) instead of the plane.
+    /// The main view shows the projection instead of the plane.
     mip: bool,
+    /// What projections show, the volume's opacity per voxel, and whether they are
+    /// shaded.
+    projection: Projection,
+    density: f32,
+    shading: bool,
 }
 
 /// One view of the target: where it sits (None: the whole target), its size, camera, and
@@ -1400,6 +1459,9 @@ impl Viewer {
             deferred: false,
             linked: false,
             mip: false,
+            projection: Projection::Mip,
+            density: 0.05,
+            shading: true,
         }
     }
 
@@ -2380,6 +2442,38 @@ impl Viewer {
         self.moved();
     }
 
+    /// What projections show.
+    pub fn projection(&self) -> Projection {
+        self.projection
+    }
+
+    pub fn set_projection(&mut self, p: Projection) {
+        self.projection = p;
+        self.moved();
+    }
+
+    /// The volume projection's opacity per voxel at the top of the contrast window.
+    pub fn density(&self) -> f32 {
+        self.density
+    }
+
+    pub fn set_density(&mut self, density: f32) -> Result<(), ViewerError> {
+        if !(density > 0.0 && density <= 1.0) {
+            return Err(verr(format!("density {density}: more than 0, at most 1")));
+        }
+        self.density = density;
+        Ok(())
+    }
+
+    /// Whether volume and isosurface projections are shaded (lit from their gradients).
+    pub fn shading(&self) -> bool {
+        self.shading
+    }
+
+    pub fn set_shading(&mut self, shading: bool) {
+        self.shading = shading;
+    }
+
     /// How layer `l` is drawn in view `v`.
     fn mode_in(l: &Layer, v: &View) -> Mode {
         if v.mip {
@@ -2440,6 +2534,8 @@ impl Viewer {
             camera: v.camera,
             moving: self.moving(),
             threads: self.threads as f64,
+            mode: self.projection.code() | if self.shading { 4 } else { 0 },
+            density: self.density,
         };
         let mut draws = Vec::new();
         for (i, l) in self.layers.iter_mut().enumerate() {

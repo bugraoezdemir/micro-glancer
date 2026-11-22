@@ -219,3 +219,111 @@ def test_a_large_projection_is_drawn_smaller_and_scaled(stores, smooth):
     core[:, [0, -1]] = False
     diff = np.abs(rgba[..., 0].astype(int) - _grey(best, 0, 22000))[core]
     assert diff.mean() < 1.5 and np.percentile(diff, 99) <= 6
+
+
+# ------------------------------------------------------------------ shaded projections
+
+def test_volume_compositing_follows_the_formula(tmp_path):
+    """A uniform volume at the middle of the contrast window, seen along z, unshaded:
+    each of the ray's n samples is a little opaque (alpha = 1 - (1 - g density)^0.8 for
+    steps of 0.8 voxel), front to back: A = 1 - (1 - alpha)^n, colour white, the
+    background behind."""
+    data = np.full((D, 40, 60), 1000, "uint16")
+    path = _write(tmp_path / "uniform.ome.zarr", [data], "zyx", [[ZS, 1.0, 1.0]])
+    v = Viewer.offscreen(120, 80)
+    v.open(path)
+    v.set_contrast(0.0, 2000.0)                          # g = 0.5
+    v.look_at(29.5, 19.5, 1.0)
+    v.projection = "volume"
+    v.density = 0.02
+    v.shading = False
+    v.mip = True
+    rgba = _frame(v)
+    alpha = 1 - (1 - 0.5 * 0.02) ** 0.8
+    n = int(np.ceil((D * ZS) / (0.8 * ZS)))              # the ray through all of z
+    a = 1 - (1 - alpha) ** n
+    want = round((a + 0.08 * (1 - a)) * 255)
+    inner = rgba[25:55, 35:85, 0].astype(int)            # well inside the 60 x 40 image
+    assert np.abs(inner - want).max() <= 2, (inner.min(), inner.max(), want)
+    assert (rgba[2, 2, :3] == BACKGROUND).all()          # outside the image
+
+
+def test_isosurfaces_outline_where_the_rays_reach_the_level(stores, smooth):
+    v = Viewer.offscreen(200, 150)
+    v.open(stores["smooth"])
+    v.set_contrast(0.0, 24000.0)                         # the surface at 12000
+    v.look_at_3d(75.0, 60.0, 50.0, 1.0)
+    v.turn(30.0, 20.0)
+    v.projection = "iso"
+    v.shading = False
+    v.mip = True
+    rgba = _frame(v)
+    best, inside = _mip_reference(smooth, v)
+    got = rgba[..., 0].astype(int)
+    hit, miss = inside & (best >= 12000 * 1.03), (best <= 12000 * 0.97)
+    assert hit.sum() > 500 and miss.sum() > 500
+    assert (got[hit] == 255).mean() > 0.99               # the surface, unshaded: white
+    assert (got[miss] == BACKGROUND).mean() > 0.99
+    v.shading = True                                     # lit: shades of the colour
+    lit = _frame(v)[..., 0].astype(int)
+    assert lit[hit].std() > 5 and (lit[hit] != BACKGROUND).all()
+
+
+def test_shading_changes_the_volume(stores):
+    v = Viewer.offscreen(200, 150)
+    v.open(stores["smooth"])
+    v.set_contrast(0.0, 24000.0)
+    v.look_at_3d(75.0, 60.0, 50.0, 1.0)
+    v.projection = "volume"
+    v.density = 0.2
+    v.mip = True
+    v.shading = False
+    flat = _frame(v).astype(int)
+    v.shading = True
+    lit = _frame(v).astype(int)
+    assert np.abs(lit - flat).max() > 10
+
+
+def test_projection_settings_in_the_view_state(stores):
+    a = Viewer.offscreen(160, 120)
+    a.open(stores["smooth"])
+    a.projection = "iso"
+    a.density = 0.3
+    a.shading = False
+    a.mip = True
+    a.linked = True
+    state = a.view_state()
+    b = Viewer.offscreen(160, 120)
+    b.set_view_state(state)
+    assert (b.projection, b.density, b.shading, b.mip, b.linked) == ("iso", pytest.approx(0.3),
+                                                                     False, True, True)
+    with pytest.raises(Exception, match="projection"):
+        b.projection = "fog"
+    with pytest.raises(Exception, match="density"):
+        b.density = 0.0
+
+
+def test_qt_keys_cycle_the_projection(stores):
+    qt = pytest.importorskip("PyQt6.QtWidgets")
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtTest import QTest
+    from micro_viewer.qt import ViewerWidget
+    app = qt.QApplication.instance() or qt.QApplication([])
+    w = ViewerWidget(mode="offscreen")
+    w.resize(200, 150)
+    w.open(stores["smooth"])
+    w.show()
+    app.processEvents()
+    v = w.viewer
+    QTest.keyClick(w, Qt.Key.Key_P)                      # shows the projection
+    assert v.mip and v.projection == "mip"
+    QTest.keyClick(w, Qt.Key.Key_P)
+    assert v.projection == "volume"
+    d = v.density
+    QTest.keyClick(w, Qt.Key.Key_Plus)
+    assert v.density == pytest.approx(d * 1.5)
+    QTest.keyClick(w, Qt.Key.Key_P)
+    assert v.projection == "iso"
+    QTest.keyClick(w, Qt.Key.Key_P, Qt.KeyboardModifier.ShiftModifier)
+    assert not v.shading
+    w.close()

@@ -20,7 +20,9 @@ Input (the view, and the current layer of several):
   screen's vertical, up-down about its horizontal); 1, 2, 3: look along z (XY), y (XZ)
   or x (YZ); Page Up / Page Down move the plane by one voxel along the view; I switches
   trilinear sampling on and off; Ctrl + Alt + drag tilts the current layer; M shows
-  the projection (maximum intensity along the view) instead of the plane;
+  the projection instead of the plane; P shows it and cycles what it shows (maximum
+  intensity, volume, surfaces); Shift + P switches shading; - and + make the volume
+  thinner or denser;
 - L: linked views (the main view, its YZ and XZ companions and the projection in
   quarters, a crosshair where the planes cross); dragging, the wheel and Page Up /
   Page Down act in the view under the pointer;
@@ -331,6 +333,18 @@ class ViewerWidget(QWidget):
         elif key == K.Key_M:
             v.mip = not v.mip
             self._changed()
+        elif key == K.Key_P and shift:
+            v.shading = not v.shading
+            self._changed()
+        elif key == K.Key_P:
+            if v.mip:
+                order = ["mip", "volume", "iso"]
+                v.projection = order[(order.index(v.projection) + 1) % len(order)]
+            v.mip = True
+            self._changed()
+        elif key in (K.Key_Minus, K.Key_Plus, K.Key_Equal):
+            factor = 1 / 1.5 if key == K.Key_Minus else 1.5
+            self._guard(lambda: setattr(v, "density", min(1.0, max(1e-4, v.density * factor))))
         elif key == K.Key_I and v.layers:
             cur = v.layers[v.current]["interpolation"]
             self._guard(lambda: v.set_interpolation("nearest" if cur == "linear" else "linear"))
@@ -394,6 +408,9 @@ def main(argv=None) -> int:
         which = f"layer {v.current + 1}/{len(layers)}  " if len(layers) > 1 else ""
         moved = _turn_and_shift(cur["transform"])
         view = f"view {v.rotation:.0f} deg  " if v.rotation else ""
+        if v.mip:
+            view += f"projection {v.projection}  " + (
+                f"density {v.density:.3g}  " if v.projection == "volume" else "")
         status.setText(f"{which}{pos}  level {level}  pending {pending}  {view}{moved}  "
                        f"{state['pick']}{err}  {state['note']}")
 

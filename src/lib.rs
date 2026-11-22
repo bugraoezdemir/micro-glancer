@@ -302,6 +302,44 @@ impl Viewer {
         self.inner.set_mip(mip);
     }
 
+    /// What projections show: "mip" (the highest value along the ray), "volume" (front
+    /// to back, brighter voxels more opaque) or "iso" (surfaces where each channel
+    /// reaches the middle of its contrast window).
+    #[getter]
+    fn projection(&self) -> &'static str {
+        self.inner.projection().name()
+    }
+
+    #[setter]
+    fn set_projection(&mut self, name: &str) -> PyResult<()> {
+        let p = core::Projection::parse(name).map_err(err)?;
+        self.inner.set_projection(p);
+        Ok(())
+    }
+
+    /// The volume projection's opacity per voxel at the top of the contrast window
+    /// (more than 0, at most 1).
+    #[getter]
+    fn density(&self) -> f32 {
+        self.inner.density()
+    }
+
+    #[setter]
+    fn set_density(&mut self, density: f32) -> PyResult<()> {
+        self.inner.set_density(density).map_err(err)
+    }
+
+    /// Whether volume and isosurface projections are lit from their gradients.
+    #[getter]
+    fn shading(&self) -> bool {
+        self.inner.shading()
+    }
+
+    #[setter]
+    fn set_shading(&mut self, shading: bool) {
+        self.inner.set_shading(shading);
+    }
+
     fn zoom(&mut self, factor: f64, x: f64, y: f64) {
         self.inner.zoom(factor, x, y);
     }

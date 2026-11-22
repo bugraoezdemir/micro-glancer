@@ -34,7 +34,10 @@ pub struct FrameParams {
     pub opacity: f32,
     /// Volumes: 1 samples trilinearly between voxel centres, 0 takes the nearest voxel.
     pub linear: u32,
-    pub _pad: [f32; 2],
+    /// Projections: 0 maximum intensity, 1 volume, 2 isosurfaces; + 4 shaded.
+    pub mode: u32,
+    /// Volume: the opacity per voxel at the top of the contrast window.
+    pub density: f32,
 }
 
 /// One level's placement for a volume's plane (storage, 112 bytes): the voxel at screen
@@ -50,7 +53,8 @@ pub struct LevelGpu3 {
     pub size: [i32; 4],
     /// Bricks along x, y, z, and 1 when the level has a page table (0: never drawn).
     pub grid: [u32; 4],
-    /// Projections: the voxel index change per world unit along the view's normal.
+    /// Projections: the voxel index change per world unit along the view's normal, and
+    /// the camera's scale (w).
     pub dir: [f32; 4],
 }
 
@@ -1081,7 +1085,11 @@ impl Gpu {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("view"),
             });
-        let solo = rect.is_none() && frames.len() == 1 && frames[0].params().opacity >= 1.0;
+        // one opaque layer draws the background itself (a projection may be translucent)
+        let solo = rect.is_none()
+            && frames.len() == 1
+            && frames[0].params().opacity >= 1.0
+            && frames[0].target().1 != KIND_MIP;
         let mut drawn = Vec::new();
         for d in frames {
             let mut fp = *d.params();

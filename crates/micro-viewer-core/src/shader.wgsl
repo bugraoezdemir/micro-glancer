@@ -22,8 +22,8 @@ struct Params {
     opacity: f32,
     // (volumes only)
     linear: u32,
-    _p1: f32,
-    _p2: f32,
+    mode: u32,
+    density: f32,
 }
 
 // One level's placement on screen: the level pixel at screen position p (pixels, centres

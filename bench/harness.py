@@ -147,6 +147,12 @@ def offscreen(path):
         out["mip_sharp_s"] = sharp(v)
         out["mip_level"] = v.render_into(frame_for(v))[3]
         out["mip_cached_fps"] = cached_fps(v, lambda: v.render_into(frame_for(v)))
+        # shaded: the volume composited front to back, then the isosurfaces
+        for mode in ("volume", "iso"):
+            v.projection = mode
+            out[f"{mode}_sharp_s"] = sharp(v)
+            out[f"{mode}_cached_fps"] = cached_fps(v, lambda: v.render_into(frame_for(v)))
+        v.projection = "mip"
         v.mip = False
         # linked views: three planes and the projection in quarters
         v.linked = True

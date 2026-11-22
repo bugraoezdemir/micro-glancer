@@ -94,6 +94,20 @@ pub struct LayerState {
     pub channels: Vec<ChannelState>,
 }
 
+/// The projection: whether the main view shows it, what it shows ("mip", "volume",
+/// "iso"), the volume's opacity per voxel, and whether it is shaded.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ProjectionState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub density: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shading: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewState {
     #[serde(default = "version")]
@@ -105,6 +119,11 @@ pub struct ViewState {
     pub current: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layers: Vec<LayerState>,
+    /// Linked views (the plane, YZ, XZ and the projection in quarters).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<ProjectionState>,
     /// Version 1: the one image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -206,6 +225,13 @@ impl ViewState {
                         .collect(),
                 })
                 .collect(),
+            linked: open.then(|| v.linked()),
+            projection: open.then(|| ProjectionState {
+                shown: Some(v.mip()),
+                mode: Some(v.projection().name().to_string()),
+                density: Some(v.density()),
+                shading: Some(v.shading()),
+            }),
             image: None,
             position: BTreeMap::new(),
             channels: Vec::new(),
@@ -316,6 +342,23 @@ impl ViewState {
         }
         if let Some(c) = self.current {
             v.set_current(c)?;
+        }
+        if let Some(p) = &self.projection {
+            if let Some(m) = &p.mode {
+                v.set_projection(crate::Projection::parse(m)?);
+            }
+            if let Some(d) = p.density {
+                v.set_density(d)?;
+            }
+            if let Some(sh) = p.shading {
+                v.set_shading(sh);
+            }
+            if let Some(shown) = p.shown {
+                v.set_mip(shown);
+            }
+        }
+        if let Some(l) = self.linked {
+            v.set_linked(l);
         }
         Ok(())
     }
