@@ -31,6 +31,8 @@ Input (the view, and the current layer of several):
   put it back where its image places it; Ctrl + S: save its transform into its image
   (``micro_viewer.save``);
 - Tab: the next layer becomes the current one;
+- label images: double-click selects the id under the pointer (highlighted; again on
+  the background clears it), Esc clears it, O switches outlines;
 - Page Up / Page Down: the current layer's first plane axis (z; for a volume the
   plane moves along the view), with Shift the next one (t).
 
@@ -279,6 +281,22 @@ class ViewerWidget(QWidget):
         self._drag = None
 
     @_safe
+    def mouseDoubleClickEvent(self, event):
+        """Select the label id under the pointer (the topmost shown label layer)."""
+        v = self.viewer
+        r = self.devicePixelRatioF()
+        p = v.pick(event.position().x() * r, event.position().y() * r)
+        layers = v.layers
+        for entry in reversed(p["layers"]):
+            k = entry["layer"]
+            if not (layers[k]["label"] and layers[k]["visible"]):
+                continue
+            ident = entry["values"][0]["id"] if entry["values"] else None
+            v.set_labels(layer=k, selected=ident if ident else -1)
+            self._changed()
+            return
+
+    @_safe
     def wheelEvent(self, event):
         d = event.angleDelta()
         steps = (d.y() or d.x()) / 120.0                 # Shift may turn the wheel sideways
@@ -343,6 +361,14 @@ class ViewerWidget(QWidget):
         elif key in (K.Key_1, K.Key_2, K.Key_3) and not ctrl:
             name = {K.Key_1: "xy", K.Key_2: "xz", K.Key_3: "yz"}[key]
             self._guard(lambda: v.set_orientation(name))
+        elif key == K.Key_Escape and v.layers:
+            for k, lay in enumerate(v.layers):
+                if lay["label"] and lay["selected"] is not None:
+                    v.set_labels(layer=k, selected=-1)
+            self._changed()
+        elif key == K.Key_O and v.layers and v.layers[v.current]["label"]:
+            v.set_labels(outline=not v.layers[v.current]["outline"])
+            self._changed()
         elif key == K.Key_L:
             v.linked = not v.linked
             self._changed()

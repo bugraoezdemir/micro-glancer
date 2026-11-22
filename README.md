@@ -42,7 +42,13 @@ reading are Rust (the crate `micro-viewer-core`); Python gets a small API and a 
   0.5 images take a shift only. NGFF 0.6 images take the whole transform, kept apart
   from the image's own placement (in a coordinate system called "aligned"). Reopening
   the image shows it where it was saved.
-- Read the values under the pointer, for every channel of every layer.
+- Show an image's label images (its `labels/` group) over it, as filled areas or
+  outlines, each id in its own colour. Double-click a label to highlight it, or show
+  only that one. Ids stay exact up to 64 bits. A label image moves with its image when
+  the image is moved or turned, on flat planes and on planes at an angle through a
+  volume. Label images are left out of projections.
+- Read the values under the pointer, for every channel of every layer (for a label
+  image, its id).
 - Save the whole view (camera, layers with their images, transforms, planes and
   channels) as JSON and restore it later.
 
@@ -95,6 +101,13 @@ transform into its image. Two one-channel
 images open in green and magenta. The status bar shows the current layer, its plane,
 level and transform, and the values under the pointer.
 
+The Labels button under the layers lists the current image's label images that are not
+open yet; the one you pick opens right above its image and follows it. For a label
+layer, the panel on the right holds outlines, "only the selected id", the selected id
+and New colours instead of the histogram. Double-click a label in the view to select
+it (double-click the background or press Esc to clear it), and press O to switch
+outlines.
+
 From Python:
 
 ```python
@@ -131,6 +144,11 @@ v.set_channel(0, opacity=[(0.2, 0.0), (0.6, 0.9)])  # the opacity curve over the
 v.set_channel(0, iso=5000)      # the surface level (a stored value)
 h = v.histogram(0, bins=256, whole=True)  # counts and edges
 v.linked = True                 # the plane, YZ, XZ and the projection in quarters
+
+v.label_names()                 # ["cells", ...] from the image's labels/ group
+v.add_label("cells")            # above its image, following its transform
+v.set_labels(outline=True, selected=42, only_selected=False, seed=3)
+print(v.pick(512, 384)["layers"][1]["values"][0]["id"])  # the exact id
 ```
 
 `micro_viewer.panel.ChannelPanel` (and its `HistogramWidget`) adjusts the channels of a

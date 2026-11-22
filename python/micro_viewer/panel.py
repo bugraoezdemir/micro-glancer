@@ -12,7 +12,9 @@ volume while a projection is shown):
   drag its points, double-click to add one, right-click a point to remove it.
 
 ``ChannelPanel`` puts a channel choice, visibility, colour map, "whole image" and an
-Auto contrast button around it, for the current layer of a ``ViewerWidget``. Both report
+Auto contrast button around it, for the current layer of a ``ViewerWidget``. For a label
+image it shows the label controls instead: outlines, only the selected id, the selected
+id (double-click one in the view), new colours. Both report
 errors on the widget's ``failed`` signal instead of raising (PyQt6 ends the process when a
 slot raises).
 """
@@ -260,6 +262,26 @@ class ChannelPanel(QWidget):
         self.whole = QCheckBox("whole image")
         self.auto = QPushButton("Auto")
         self.info = QLabel()
+        # label images
+        self.labels = QWidget()
+        self.outline = QCheckBox("outlines")
+        self.only = QCheckBox("only the selected id")
+        self.selected = QLabel()
+        self.clear = QPushButton("Clear")
+        self.recolour = QPushButton("New colours")
+        lab = QVBoxLayout(self.labels)
+        lab.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.addWidget(self.outline)
+        row.addWidget(self.only)
+        lab.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(self.selected, 1)
+        row.addWidget(self.clear)
+        lab.addLayout(row)
+        lab.addWidget(self.recolour)
+        lab.addWidget(QLabel("double-click a label in the view to select it"))
+        lab.addStretch(1)
         top = QHBoxLayout()
         top.addWidget(self.pick, 1)
         top.addWidget(self.shown)
@@ -268,11 +290,21 @@ class ChannelPanel(QWidget):
         bottom.addWidget(self.whole)
         bottom.addStretch(1)
         bottom.addWidget(self.auto)
+        self.images = QWidget()
+        img = QVBoxLayout(self.images)
+        img.setContentsMargins(0, 0, 0, 0)
+        img.addLayout(top)
+        img.addWidget(self.hist, 1)
+        img.addWidget(self.info)
+        img.addLayout(bottom)
         lay = QVBoxLayout(self)
-        lay.addLayout(top)
-        lay.addWidget(self.hist, 1)
-        lay.addWidget(self.info)
-        lay.addLayout(bottom)
+        lay.addWidget(self.images, 1)
+        lay.addWidget(self.labels, 1)
+        self.labels.hide()
+        self.outline.toggled.connect(lambda on: self._labels(outline=on))
+        self.only.toggled.connect(lambda on: self._labels(only_selected=on))
+        self.clear.clicked.connect(lambda: self._labels(selected=-1))
+        self.recolour.clicked.connect(self._recolour)
         self._filling = False
         self.pick.currentIndexChanged.connect(self._picked)
         self.shown.toggled.connect(lambda on: self._set(visible=on))
@@ -295,6 +327,18 @@ class ChannelPanel(QWidget):
             chans = v.channels
         except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
             self.view._fail(exc, force=True)
+            return
+        layer = v.layers[v.current] if v.layers else None
+        is_label = bool(layer and layer["label"])
+        self.images.setVisible(not is_label)
+        self.labels.setVisible(is_label)
+        if is_label:
+            self._filling = True
+            self.outline.setChecked(layer["outline"])
+            self.only.setChecked(layer["only_selected"])
+            sel = layer["selected"]
+            self.selected.setText("selected id: " + ("none" if sel is None else str(sel)))
+            self._filling = False
             return
         self._filling = True
         names = [c["label"] for c in chans]
@@ -342,6 +386,26 @@ class ChannelPanel(QWidget):
             return
         self.view._changed()
         self.hist.update()
+
+    def _labels(self, **kw):
+        if self._filling:
+            return
+        try:
+            self.view.viewer.set_labels(**kw)
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
+            self.view._fail(exc, force=True)
+            return
+        self.view._changed()
+        self.refresh()
+
+    def _recolour(self):
+        try:
+            v = self.view.viewer
+            v.set_labels(seed=(v.layers[v.current]["seed"] + 1) % (2 ** 32))
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
+            self.view._fail(exc, force=True)
+            return
+        self.view._changed()
 
     def _whole(self, on):
         self.hist.whole = on

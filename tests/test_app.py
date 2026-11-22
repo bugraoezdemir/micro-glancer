@@ -1,5 +1,8 @@
 """micro-viewer's app window (micro_viewer.app): opening images, the layers, planes and
-channel panels, and the toolbar driving the viewer."""
+channel panels, the toolbar driving the viewer, and label images (Labels button,
+double-click selection, the label controls)."""
+import json
+import os
 import time
 
 import numpy as np
@@ -113,4 +116,92 @@ def test_the_add_and_open_buttons(qapp, images, monkeypatch):
     actions["Add layer"].trigger()                       # an error: reported, no crash
     _pump(qapp, 0.2)
     assert "missing" in win.status.text() or win.view.viewer.error is None
+    win.close()
+
+
+@pytest.fixture(scope="module")
+def labelled(tmp_path_factory):
+    """A flat image with one label image "cells" (id 5 over its middle)."""
+    tmp = tmp_path_factory.mktemp("app_labels")
+    yy, xx = np.mgrid[0:60, 0:80]
+    img = ((yy * 30 + xx * 20) % 4000).astype("uint16")
+    path = str(tmp / "img.ome.zarr")
+    ozp.IO().write_pyramid(ozp.Pyramid().from_arrays(
+        [img], axis_order="yx", scales=[[1.0, 1.0]], version="0.5"), path, overwrite=True)
+    lab = np.zeros((60, 80), "uint32")
+    lab[15:45, 20:60] = 5
+    lp = os.path.join(path, "labels", "cells")
+    ozp.IO().write_pyramid(ozp.Pyramid().from_arrays(
+        [lab], axis_order="yx", scales=[[1.0, 1.0]], version="0.5"), lp, overwrite=True)
+    meta = os.path.join(lp, "zarr.json")
+    with open(meta) as f:
+        doc = json.load(f)
+    doc["attributes"]["ome"]["image-label"] = {"version": "0.5",
+                                               "source": {"image": "../../"}}
+    with open(meta, "w") as f:
+        json.dump(doc, f)
+    with open(os.path.join(path, "labels", "zarr.json"), "w") as f:
+        json.dump({"zarr_format": 3, "node_type": "group",
+                   "attributes": {"ome": {"version": "0.5", "labels": ["cells"]}}}, f)
+    return path
+
+
+def test_label_images_in_the_app(qapp, labelled, monkeypatch):
+    monkeypatch.setenv("MICRO_VIEWER_MODE", "offscreen")
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QKeyEvent, QMouseEvent
+    from PyQt6.QtWidgets import QMenu
+    from micro_viewer.app import MainWindow
+    chosen = []
+
+    def first_action(menu, *a, **k):                     # the menu without a click
+        acts = [x for x in menu.actions() if x.isEnabled()]
+        chosen.append([x.text() for x in menu.actions()])
+        if acts:
+            acts[0].trigger()
+    monkeypatch.setattr(QMenu, "exec", first_action)
+    win = MainWindow([labelled])
+    win.show()
+    _pump(qapp)
+    v = win.view.viewer
+    win.layer_panel.labels.click()
+    _pump(qapp, 0.4)
+    assert chosen == [["cells"]]
+    assert len(v.layers) == 2 and v.layers[1]["label"] and v.current == 1
+    assert win.layer_panel.list.item(1).text().strip() == "labels: cells"
+    # the channel panel shows the label controls for a label layer
+    win.channel_panel.refresh()
+    assert win.channel_panel.labels.isVisibleTo(win.channel_panel)
+    assert not win.channel_panel.images.isVisibleTo(win.channel_panel)
+    win.channel_panel.outline.setChecked(True)
+    assert v.layers[1]["outline"]
+    # double-click in the middle selects id 5; on the background clears it
+    view = win.view
+    r = view.devicePixelRatioF()
+
+    def dbl(x, y):
+        e = QMouseEvent(QEvent.Type.MouseButtonDblClick, QPointF(x / r, y / r),
+                        QPointF(x / r, y / r), Qt.MouseButton.LeftButton,
+                        Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        view.mouseDoubleClickEvent(e)
+    w, h = v.size
+    dbl(w / 2, h / 2)
+    assert v.layers[1]["selected"] == 5
+    win.channel_panel.refresh()
+    assert win.channel_panel.selected.text() == "selected id: 5"
+    view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape,
+                                 Qt.KeyboardModifier.NoModifier))
+    assert v.layers[1]["selected"] is None
+    view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_O,
+                                 Qt.KeyboardModifier.NoModifier))
+    assert not v.layers[1]["outline"]
+    seed = v.layers[1]["seed"]
+    win.channel_panel.recolour.click()
+    assert v.layers[1]["seed"] == seed + 1
+    # the image layer: the image controls again; its one label image is open already
+    win.layer_panel.list.setCurrentRow(0)
+    win.channel_panel.refresh()
+    assert win.channel_panel.images.isVisibleTo(win.channel_panel)
+    win.layer_panel.labels.click()
+    assert chosen[-1] == ["(all open)"] and len(v.layers) == 2
     win.close()

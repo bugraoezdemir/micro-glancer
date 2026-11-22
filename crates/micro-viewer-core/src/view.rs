@@ -99,6 +99,25 @@ pub struct LayerState {
     pub position: BTreeMap<String, f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub channels: Vec<ChannelState>,
+    /// A label image: how it is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<LabelState>,
+    /// The index of the layer this one follows (a label image its image).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follows: Option<usize>,
+}
+
+/// How a label image is shown: outlines, the selected id, only it, the colours' seed.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct LabelState {
+    #[serde(default)]
+    pub outline: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<u64>,
+    #[serde(default)]
+    pub only_selected: bool,
+    #[serde(default)]
+    pub seed: u32,
 }
 
 /// The projection: whether the main view shows it, what it shows ("mip", "volume",
@@ -216,6 +235,15 @@ impl ViewState {
                         .is_volume()
                         .then(|| if l.linear { "linear" } else { "nearest" }.to_string()),
                     transform: Some(l.transform().m.iter().map(|r| r.to_vec()).collect()),
+                    labels: l.is_label().then_some(LabelState {
+                        outline: l.outline,
+                        selected: l.selected,
+                        only_selected: l.only_selected,
+                        seed: l.seed,
+                    }),
+                    follows: l
+                        .follows()
+                        .and_then(|id| v.layers().iter().position(|p| p.id() == id)),
                     position: l.position().into_iter().map(|(n, i, _)| (n, i)).collect(),
                     channels: l
                         .channels()
@@ -448,6 +476,12 @@ fn apply_layer(
     }
     v.set_layer(i, visible, opacity)?;
     v.set_linear(i, linear)?;
+    if let Some(ls) = &s.labels {
+        v.set_labels(i, ls.outline, ls.selected, ls.only_selected, ls.seed)?;
+    }
+    if s.follows.is_some() {
+        v.set_follows(i, s.follows)?;
+    }
     for (c, d) in displays.into_iter().enumerate() {
         v.set_channel(i, c, d)?;
     }

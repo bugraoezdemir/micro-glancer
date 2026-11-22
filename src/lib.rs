@@ -196,6 +196,55 @@ impl Viewer {
         self.inner.reload(index).map_err(err)
     }
 
+    /// The names of a layer's label images (its image's `labels/` group).
+    #[pyo3(signature = (layer = None))]
+    fn label_names(&self, layer: Option<usize>) -> PyResult<Vec<String>> {
+        let i = self.layer_index(layer)?;
+        self.inner.label_names(i).map_err(err)
+    }
+
+    /// Open label image `name` of a layer (the current one by default) as a layer right
+    /// above it that follows its transform; it becomes the current layer. Returns its
+    /// index.
+    #[pyo3(signature = (name, layer = None))]
+    fn add_label(&mut self, name: &str, layer: Option<usize>) -> PyResult<usize> {
+        let i = self.layer_index(layer)?;
+        self.inner.add_label(i, name).map_err(err)
+    }
+
+    /// How a label image layer is shown (the current one by default); arguments left
+    /// out stay: `outline` (outlines instead of filled areas), `selected` (an id to
+    /// highlight; -1 for none), `only_selected` (show only that id), `seed` (another
+    /// seed gives every id another colour).
+    #[pyo3(signature = (layer = None, *, outline = None, selected = None, only_selected = None, seed = None))]
+    fn set_labels(
+        &mut self,
+        layer: Option<usize>,
+        outline: Option<bool>,
+        selected: Option<i128>,
+        only_selected: Option<bool>,
+        seed: Option<u32>,
+    ) -> PyResult<()> {
+        let i = self.layer_index(layer)?;
+        let l = self.inner.layer(i).map_err(err)?;
+        let sel = match selected {
+            None => l.selected,
+            Some(v) if v < 0 => None,
+            Some(v) if v <= u64::MAX as i128 => Some(v as u64),
+            Some(v) => {
+                return Err(ViewerError::new_err(format!(
+                    "label id {v}: beyond 64 bits"
+                )))
+            }
+        };
+        let (o, only, s) = (
+            outline.unwrap_or(l.outline),
+            only_selected.unwrap_or(l.only_selected),
+            seed.unwrap_or(l.seed),
+        );
+        self.inner.set_labels(i, o, sel, only, s).map_err(err)
+    }
+
     /// Remove layer `index`.
     fn remove(&mut self, index: usize) -> PyResult<()> {
         self.inner.layer(index).map_err(err)?;
@@ -219,6 +268,16 @@ impl Viewer {
             d.set_item("transform", rows(&l.transform().to_2d()))?;
             d.set_item("transform_3d", rows3(&l.transform()))?;
             d.set_item("volume", l.is_volume())?;
+            d.set_item("label", l.is_label())?;
+            d.set_item("outline", l.outline)?;
+            d.set_item("selected", l.selected)?;
+            d.set_item("only_selected", l.only_selected)?;
+            d.set_item("seed", l.seed)?;
+            d.set_item(
+                "follows",
+                l.follows()
+                    .and_then(|id| self.inner.layers().iter().position(|p| p.id() == id)),
+            )?;
             d.set_item("mode", mode_name(l.mode(&self.inner.camera)))?;
             d.set_item("interpolation", if l.linear { "linear" } else { "nearest" })?;
             d.set_item("position", l.position())?;
@@ -909,6 +968,7 @@ impl Viewer {
                 e.set_item("channel", v.channel)?;
                 e.set_item("value", v.value)?;
                 e.set_item("level", v.level)?;
+                e.set_item("id", v.id)?;
                 values.append(e)?;
             }
             let pixel = lp.pixel.map(|q| (q[0], q[1]));

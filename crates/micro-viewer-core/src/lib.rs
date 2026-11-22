@@ -238,6 +238,8 @@ pub struct PickedValue {
     pub value: Option<f64>,
     /// The level the value came from.
     pub level: Option<usize>,
+    /// For a label image: the id, exact (its bits as an unsigned integer).
+    pub id: Option<u64>,
 }
 
 /// What one layer has under a screen point.
@@ -363,9 +365,52 @@ pub struct Layer {
     bricks: Option<Bricks>,
     /// Bricks could not be made (the error says why): not tried again.
     no_bricks: bool,
+    /// Label images: outlines instead of filled areas, the selected id and whether only
+    /// it is shown, the colours' seed, and the layer (id) it belongs to and follows.
+    pub outline: bool,
+    pub selected: Option<u64>,
+    pub only_selected: bool,
+    pub seed: u32,
+    parent: Option<u16>,
 }
 
 impl Layer {
+    /// Whether this is a label image.
+    pub fn is_label(&self) -> bool {
+        self.source.label
+    }
+
+    /// The index-free id of the layer this one follows (a label image its image), if any.
+    pub fn follows(&self) -> Option<u16> {
+        self.parent
+    }
+
+    /// The layer's own id (stable while it is open).
+    pub fn id(&self) -> u16 {
+        self.id
+    }
+
+    /// The label shader's mode bits (1 outlines, 2 only the selected id, 4 an id is
+    /// selected); 0 for an image.
+    fn label_mode(&self) -> u32 {
+        if !self.source.label {
+            return 0;
+        }
+        (self.outline as u32)
+            | if self.only_selected && self.selected.is_some() {
+                2
+            } else {
+                0
+            }
+            | if self.selected.is_some() { 4 } else { 0 }
+    }
+
+    /// The label shader's extra words: the selected id's low and high bits, the seed.
+    fn label_extra(&self) -> [u32; 4] {
+        let s = self.selected.unwrap_or(0);
+        [s as u32, (s >> 32) as u32, self.seed, 0]
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -1153,8 +1198,9 @@ fn prepare_flat(
         outside: [0.0; 4],
         opacity: o.opacity.clamp(0.0, 1.0),
         linear: 0,
-        mode: 0,
+        mode: o.label_mode(),
         density: 0.0,
+        extra: o.label_extra(),
     };
     (Some(params), level)
 }
@@ -1343,8 +1389,15 @@ fn prepare_volume(
         outside: [0.0; 4],
         opacity: o.opacity.clamp(0.0, 1.0),
         linear: o.linear as u32,
-        mode: if mip { cx.mode } else { 0 },
+        mode: if o.source.label {
+            o.label_mode()
+        } else if mip {
+            cx.mode
+        } else {
+            0
+        },
         density: cx.density,
+        extra: o.label_extra(),
     };
     (Some(params), level)
 }
@@ -1645,9 +1698,10 @@ impl Viewer {
     /// plane put at its default z). It becomes the current layer; returns its index.
     pub fn add(&mut self, path: &Path) -> Result<usize, ViewerError> {
         let source = Source::open(path)?;
+        let label = source.label;
         if source.z_axis.is_some() {
             // its brick and projection pipelines, built while the plane is looked at
-            self.gpu.warm(source.texel);
+            self.gpu.warm(source.texel, label);
         }
         let (transform, note) = saved_transform(&source);
         let nc = source.channels.len();
@@ -1708,13 +1762,18 @@ impl Viewer {
             transform,
             inverse: transform.inverse().unwrap_or(Affine3::IDENTITY),
             visible: true,
-            opacity: 1.0,
+            opacity: if label { 0.6 } else { 1.0 },
             linear: false,
             read_s: 0.0,
             bgrid,
             bstride,
             bricks: None,
             no_bricks: false,
+            outline: false,
+            selected: None,
+            only_selected: false,
+            seed: 0,
+            parent: None,
         };
         if first {
             // the camera's plane where the image opens (its default z)
@@ -1754,6 +1813,9 @@ impl Viewer {
         }
         let l = self.layers.remove(i);
         self.gpu.remove_layer(l.id);
+        for f in self.layers.iter_mut().filter(|f| f.parent == Some(l.id)) {
+            f.parent = None;
+        }
         // its arrays are freed: forget their decoded blocks (and what was in flight)
         self.loader.reset();
         if self.current >= self.layers.len() {
@@ -1805,6 +1867,24 @@ impl Viewer {
     /// Channels as the image describes them; contrast from omero's window, else the
     /// 0.1 and 99.9 percentiles of the coarsest level's middle tile.
     fn initial_display(source: &Source, position: &[f64]) -> Vec<ChannelDisplay> {
+        if source.label {
+            // ids, not intensities: no contrast to look for
+            return source
+                .channels
+                .iter()
+                .map(|info| ChannelDisplay {
+                    label: info.label.clone(),
+                    color: [1.0, 1.0, 1.0],
+                    lut: None,
+                    lo: 0.0,
+                    hi: 1.0,
+                    gamma: 1.0,
+                    visible: true,
+                    opacity: None,
+                    iso: None,
+                })
+                .collect();
+        }
         let last = source.levels.len() - 1;
         let lv = &source.levels[last];
         let (h, w) = (lv.height.min(TILE as u64), lv.width.min(TILE as u64));
@@ -2037,7 +2117,82 @@ impl Viewer {
         }
         l.transform = t;
         l.inverse = inverse;
+        // the layers that follow this one (its label images) move with it
+        let id = l.id;
+        for f in self.layers.iter_mut().filter(|f| f.parent == Some(id)) {
+            f.transform = t;
+            f.inverse = inverse;
+        }
         self.moved();
+        Ok(())
+    }
+
+    /// The names of layer `i`'s label images (its image's `labels/` group).
+    pub fn label_names(&self, i: usize) -> Result<Vec<String>, ViewerError> {
+        Ok(self.layer(i)?.source.label_names())
+    }
+
+    /// Open layer `i`'s label image `name` as a layer right above it that follows its
+    /// transform; it becomes the current layer. Returns its index.
+    pub fn add_label(&mut self, i: usize, name: &str) -> Result<usize, ViewerError> {
+        let names = self.label_names(i)?;
+        if !names.iter().any(|n| n == name) {
+            return Err(verr(format!(
+                "no label image {name:?}: the image's are {names:?}"
+            )));
+        }
+        let (path, parent, transform) = {
+            let l = self.layer(i)?;
+            (l.path.join("labels").join(name), l.id, l.transform)
+        };
+        let n = self.add(&path)?;
+        if !self.layers[n].source.label {
+            self.remove(n);
+            return Err(verr(format!(
+                "{}: no \"image-label\" metadata, not a label image",
+                path.display()
+            )));
+        }
+        let fresh = self.layers.remove(n);
+        let at = (i + 1).min(self.layers.len());
+        self.layers.insert(at, fresh);
+        let l = &mut self.layers[at];
+        l.parent = Some(parent);
+        l.transform = transform;
+        l.inverse = transform.inverse().unwrap_or(Affine3::IDENTITY);
+        self.current = at;
+        self.moved();
+        Ok(at)
+    }
+
+    /// How label image layer `i` is shown: outlines or filled areas, the selected id
+    /// (None: none), whether only it is shown, and the colours' seed.
+    pub fn set_labels(
+        &mut self,
+        i: usize,
+        outline: bool,
+        selected: Option<u64>,
+        only_selected: bool,
+        seed: u32,
+    ) -> Result<(), ViewerError> {
+        let l = self.layer_mut(i)?;
+        if !l.source.label {
+            return Err(verr(format!("layer {i} is not a label image")));
+        }
+        l.outline = outline;
+        l.selected = selected;
+        l.only_selected = only_selected;
+        l.seed = seed;
+        Ok(())
+    }
+
+    /// Make layer `i` follow layer `parent`'s transform (None: on its own).
+    pub fn set_follows(&mut self, i: usize, parent: Option<usize>) -> Result<(), ViewerError> {
+        let pid = match parent {
+            Some(p) => Some(self.layer(p)?.id),
+            None => None,
+        };
+        self.layer_mut(i)?.parent = pid;
         Ok(())
     }
 
@@ -2550,7 +2705,8 @@ impl Viewer {
     /// How layer `l` is drawn in view `v`.
     fn mode_in(l: &Layer, v: &View) -> Mode {
         if v.mip {
-            if l.is_volume() {
+            // label images are not projected
+            if l.is_volume() && !l.source.label {
                 Mode::Volume
             } else {
                 Mode::Off
@@ -2625,8 +2781,10 @@ impl Viewer {
             }
             if let Some(p) = params {
                 draws.push(match mode {
+                    Mode::Volume if l.source.label => Draw::LabelVolume(l.id, p),
                     Mode::Volume if v.mip => Draw::Mip(l.id, p),
                     Mode::Volume => Draw::Volume(l.id, p),
+                    _ if l.source.label => Draw::Label(l.id, p),
                     _ => Draw::Flat(l.id, p),
                 });
             }
@@ -2961,6 +3119,7 @@ impl Viewer {
                     channel: ch,
                     value: None,
                     level: None,
+                    id: None,
                 };
                 if at0.is_some() {
                     for &l in &order {
@@ -3004,6 +3163,9 @@ impl Viewer {
                             )?
                         };
                         found.value = Some(o.source.texel.value(&bytes, 0));
+                        if o.source.label {
+                            found.id = Some(o.source.texel.id(&bytes, 0));
+                        }
                         found.level = Some(l);
                         break;
                     }

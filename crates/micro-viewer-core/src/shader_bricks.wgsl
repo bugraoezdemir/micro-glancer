@@ -24,6 +24,8 @@ struct Params {
     // projections: the mode (see shader_mip.wgsl) and the opacity per voxel
     mode: u32,
     density: f32,
+    // label images: the selected id's low and high 32 bits, the colour seed
+    extra: vec4<u32>,
 }
 
 struct Level {

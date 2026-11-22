@@ -24,6 +24,8 @@ struct Params {
     linear: u32,
     mode: u32,
     density: f32,
+    // label images: the selected id's low and high 32 bits, the colour seed
+    extra: vec4<u32>,
 }
 
 // One level's placement on screen: the level pixel at screen position p (pixels, centres

@@ -27,8 +27,8 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog,
                              QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-                             QMessageBox, QPushButton, QSlider, QToolBar, QVBoxLayout,
-                             QWidget)
+                             QMenu, QMessageBox, QPushButton, QSlider, QToolBar,
+                             QVBoxLayout, QWidget)
 
 from . import ERRORS
 from .panel import ChannelPanel
@@ -45,7 +45,9 @@ L switches linked views (dragging, the wheel and Page Up / Down act in the view 
 the pointer).
 Layers: Tab picks the current layer; Ctrl + drag moves it, Ctrl + wheel turns it
 (with Shift finely), Ctrl + arrows nudge it, Ctrl + Alt + drag tilts a volume,
-Ctrl + 0 puts it back, Ctrl + S saves its transform into its image."""
+Ctrl + 0 puts it back, Ctrl + S saves its transform into its image.
+Label images (Layers > Labels adds one): double-click selects the id under the pointer,
+Esc clears it, O switches outlines."""
 
 
 def _guarded(method):
@@ -77,11 +79,14 @@ class LayerPanel(QWidget):
         self.opacity.setRange(0, 100)
         self.remove = QPushButton("Remove")
         self.reset = QPushButton("Put back")
+        self.labels = QPushButton("Labels")
+        self.labels.setToolTip("add one of the current image's label images")
         self.reset.setToolTip("the current layer back where its image places it")
         row = QHBoxLayout()
         row.addWidget(QLabel("opacity"))
         row.addWidget(self.opacity, 1)
         buttons = QHBoxLayout()
+        buttons.addWidget(self.labels)
         buttons.addWidget(self.reset)
         buttons.addWidget(self.remove)
         lay = QVBoxLayout(self)
@@ -93,13 +98,16 @@ class LayerPanel(QWidget):
         self.list.itemChanged.connect(self._ticked)
         self.opacity.valueChanged.connect(self._opacity)
         self.remove.clicked.connect(self._remove)
+        self.labels.clicked.connect(self._label_menu)
         self.reset.clicked.connect(self._reset)
 
     def refresh(self):
         v = self.window.view.viewer
         layers = v.layers
         self._filling = True
-        names = [os.path.basename(l["path"].rstrip("/\\")) or l["path"] for l in layers]
+        names = [("    " if l["follows"] is not None else "")
+                 + ("labels: " if l["label"] else "")
+                 + (os.path.basename(l["path"].rstrip("/\\")) or l["path"]) for l in layers]
         if [self.list.item(k).text() for k in range(self.list.count())] != names:
             self.list.clear()
             for name, l in zip(names, layers):
@@ -139,6 +147,33 @@ class LayerPanel(QWidget):
 
     def _remove(self):
         self._do(lambda v: v.remove(v.current) if v.layers else None)
+
+    def _label_menu(self):
+        """The current image's label images to add (those not open yet)."""
+        try:
+            v = self.window.view.viewer
+            if not v.layers:
+                return
+            layer = v.current
+            if v.layers[layer]["follows"] is not None:
+                layer = v.layers[layer]["follows"]      # a label layer: its image
+            names = v.label_names(layer=layer)
+            layers = v.layers
+        except ERRORS as exc:  # noqa: BLE001 (see _guarded)
+            self.window.note(str(exc))
+            return
+        open_ = {os.path.basename(l["path"].rstrip("/\\")) for l in layers
+                 if l["follows"] == layer}
+        menu = QMenu(self)
+        if not names:
+            menu.addAction("(no label images)").setEnabled(False)
+        elif all(n in open_ for n in names):
+            menu.addAction("(all open)").setEnabled(False)
+        names = [n for n in names if n not in open_]
+        for name in names:
+            menu.addAction(name, lambda n=name, k=layer: self._do(
+                lambda v: v.add_label(n, layer=k)))
+        menu.exec(self.labels.mapToGlobal(self.labels.rect().bottomLeft()))
 
     def _reset(self):
         self._do(lambda v: v.reset_transform() if v.layers else None)
@@ -440,7 +475,8 @@ class MainWindow(QMainWindow):
             else:
                 names = [c["label"] for c in self.view.viewer.channels]
                 vals = "  ".join(
-                    f"{names[e['channel']]}: {e['value']:g}" if e["value"] is not None
+                    f"label id {e['id']}" if e.get("id") is not None
+                    else f"{names[e['channel']]}: {e['value']:g}" if e["value"] is not None
                     else f"{names[e['channel']]}: -" for e in p["values"])
                 where = (f"x={p['voxel'][0]} y={p['voxel'][1]} z={p['voxel'][2]}"
                          if p.get("voxel") else f"x={p['pixel'][0]} y={p['pixel'][1]}")

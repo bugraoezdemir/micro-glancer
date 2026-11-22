@@ -10,6 +10,10 @@
 //! World coordinates follow NGFF: a level's matrix maps a pixel's index to the world
 //! position of the pixel's centre. A world point shows the pixel whose centre is nearest.
 //!
+//! A label image (one with "image-label" metadata, usually in an image's `labels/` group)
+//! keeps its stored integers: texels of its own width (8, 16, 32 bits, or two 32-bit
+//! halves for 64), never cast to float, so every id stays exact.
+//!
 //! The axis right before y, when it is spatial (type "space", or named "z") and not the
 //! channel axis, is the image's z: such an image is a volume, placed in 3-D by its
 //! matrix's x, y and z rows and columns, and can be cut by planes at any angle.
@@ -20,7 +24,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use dyna_zarr_arrays::{read, Cast, DType, Source as _, SourceRef};
-use ome_zarr_pyramid::Image;
+use ome_zarr_pyramid::{Image, Location};
 use serde_json::Value;
 
 use crate::geom::Affine3;
@@ -40,6 +44,10 @@ pub enum Texel {
     U16,
     I16,
     F32,
+    /// Label images: 32-bit ids (signed ids by their bits).
+    L32,
+    /// Label images: 64-bit ids, as two 32-bit halves (low, high).
+    L64,
 }
 
 impl Texel {
@@ -62,6 +70,23 @@ impl Texel {
         })
     }
 
+    /// The texel type for a label image of `dtype`: its own width, the bits kept (a
+    /// signed id by its bits); booleans as 8 bits. Floats are refused.
+    pub fn of_labels(dtype: DType) -> Result<Texel, ViewerError> {
+        Ok(match dtype {
+            DType::UInt8 | DType::Int8 | DType::Bool => Texel::U8,
+            DType::UInt16 | DType::Int16 => Texel::U16,
+            DType::UInt32 | DType::Int32 => Texel::L32,
+            DType::UInt64 | DType::Int64 => Texel::L64,
+            _ => {
+                return Err(err(format!(
+                    "a label image of {}: label ids are integers",
+                    dtype.name()
+                )))
+            }
+        })
+    }
+
     pub fn dtype(self) -> DType {
         match self {
             Texel::U8 => DType::UInt8,
@@ -69,6 +94,8 @@ impl Texel {
             Texel::U16 => DType::UInt16,
             Texel::I16 => DType::Int16,
             Texel::F32 => DType::Float32,
+            Texel::L32 => DType::UInt32,
+            Texel::L64 => DType::UInt64,
         }
     }
 
@@ -76,7 +103,27 @@ impl Texel {
         match self {
             Texel::U8 | Texel::I8 => 1,
             Texel::U16 | Texel::I16 => 2,
-            Texel::F32 => 4,
+            Texel::F32 | Texel::L32 => 4,
+            Texel::L64 => 8,
+        }
+    }
+
+    /// Value `i` of `data` as an id: its bits as an unsigned integer (exact).
+    pub fn id(self, data: &[u8], i: usize) -> u64 {
+        let b = self.bytes();
+        let mut v = [0u8; 8];
+        v[..b].copy_from_slice(&data[i * b..i * b + b]);
+        match self {
+            Texel::F32 => self.value(data, i).max(0.0) as u64,
+            _ => u64::from_le_bytes(if cfg!(target_endian = "little") {
+                v
+            } else {
+                let mut w = [0u8; 8];
+                for k in 0..b {
+                    w[k] = v[b - 1 - k];
+                }
+                w
+            }),
         }
     }
 
@@ -93,6 +140,7 @@ impl Texel {
                 data[4 * i + 2],
                 data[4 * i + 3],
             ]) as f64,
+            Texel::L32 | Texel::L64 => self.id(data, i) as f64,
         }
     }
 
@@ -104,6 +152,8 @@ impl Texel {
             Texel::U16 => (0.0, 65535.0),
             Texel::I16 => (-32768.0, 32767.0),
             Texel::F32 => (0.0, 1.0),
+            Texel::L32 => (0.0, u32::MAX as f64),
+            Texel::L64 => (0.0, u64::MAX as f64),
         }
     }
 }
@@ -245,6 +295,39 @@ pub struct Source {
     /// The NGFF affine (n rows of n + 1, over the image's axes) of an edge from the
     /// image's own coordinate system to the "aligned" one (NGFF 0.6), if there is one.
     pub aligned: Option<Vec<Vec<f64>>>,
+    /// A label image (its ids kept exact; see the module's notes).
+    pub label: bool,
+    /// Its ids are signed (shown as such when picked).
+    pub signed: bool,
+    /// Where the image is (for its label images).
+    location: Location,
+}
+
+/// The location of `path`: a folder, or a place inside a zip file (`.zip`, `.ozx`) on
+/// the path (`plate.ozx/labels/cells`: the zip and "labels/cells").
+fn locate(path: &Path) -> Location {
+    for a in path.ancestors() {
+        let zipped = a
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("ozx"));
+        if zipped && a.is_file() {
+            let inner = path
+                .strip_prefix(a)
+                .map(|r| {
+                    r.components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .unwrap_or_default();
+            return Location::Zip {
+                zip: a.to_path_buf(),
+                inner,
+            };
+        }
+    }
+    Location::Folder(path.to_path_buf())
 }
 
 /// Default colours for `n` channels without colours of their own.
@@ -321,16 +404,10 @@ impl Source {
     /// The image at `path`: a folder, or a zip file (`.zip`, `.ozx`) holding the image at
     /// its root.
     pub fn open(path: &Path) -> Result<Self, ViewerError> {
-        let zipped = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("ozx"));
-        let image = if zipped {
-            Image::open_zip(path, "")
-        } else {
-            Image::open(path)
-        }
-        .map_err(err)?;
+        let location = locate(path);
+        let image = Image::at(location.clone()).map_err(err)?;
+        let label = image.image_label.is_some();
+        let mut signed = false;
         let ms = image
             .multiscales
             .first()
@@ -365,12 +442,24 @@ impl Source {
             let dtype = zarr.dtype();
             let source: SourceRef = Arc::new(zarr);
             let cast = match texel {
+                None if label => {
+                    dtype_name = dtype.name().to_string();
+                    signed = matches!(
+                        dtype,
+                        DType::Int8 | DType::Int16 | DType::Int32 | DType::Int64
+                    );
+                    let t = Texel::of_labels(dtype)?;
+                    texel = Some(t);
+                    (dtype == DType::Bool).then_some(DType::UInt8)
+                }
                 None => {
                     dtype_name = dtype.name().to_string();
                     let (t, cast) = Texel::of(dtype)?;
                     texel = Some(t);
                     cast
                 }
+                // labels: the bits as they are when the width matches
+                Some(t) if label && dtype.size() == t.bytes() && dtype != DType::Bool => None,
                 // a level of another type than the first is cast to the first's texels
                 Some(t) => (dtype != t.dtype()).then_some(t.dtype()),
             };
@@ -466,6 +555,9 @@ impl Source {
             .and_then(|e| e.matrix(n).ok())
             .map(|m| m.rows());
         Ok(Self {
+            label,
+            signed,
+            location,
             aligned,
             z_axis,
             axes,
@@ -524,6 +616,25 @@ impl Source {
         start.extend([ty, tx]);
         stop.extend([ty + h, tx + w]);
         (start, stop)
+    }
+
+    /// The names of the image's label images (its `labels/` group), if any.
+    pub fn label_names(&self) -> Vec<String> {
+        let Ok(attrs) = self.location.child("labels").attributes() else {
+            return Vec::new();
+        };
+        let list = attrs
+            .get("ome")
+            .and_then(|o| o.get("labels"))
+            .or_else(|| attrs.get("labels"));
+        list.and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The volume's lead indices at `level` without z (its other plane axes, the channel

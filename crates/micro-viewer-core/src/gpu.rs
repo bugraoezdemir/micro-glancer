@@ -38,6 +38,8 @@ pub struct FrameParams {
     pub mode: u32,
     /// Volume: the opacity per voxel at the top of the contrast window.
     pub density: f32,
+    /// Label images: the selected id's low and high 32 bits, the colour seed.
+    pub extra: [u32; 4],
 }
 
 /// One level's placement for a volume's plane (storage, 112 bytes): the voxel at screen
@@ -67,6 +69,10 @@ pub enum Draw {
     Volume(u16, FrameParams),
     /// From the brick atlas: the volume projected along the view (maximum intensity).
     Mip(u16, FrameParams),
+    /// A label image from the tile atlas (blended over what lies beneath).
+    Label(u16, FrameParams),
+    /// A label volume cut by a plane, from the brick atlas.
+    LabelVolume(u16, FrameParams),
 }
 
 /// A pipeline and its bind group layout.
@@ -76,11 +82,17 @@ type Built = (wgpu::RenderPipeline, wgpu::BindGroupLayout);
 const KIND_FLAT: u8 = 0;
 const KIND_BRICKS: u8 = 1;
 const KIND_MIP: u8 = 2;
+const KIND_LABEL: u8 = 3;
+const KIND_LABEL_BRICKS: u8 = 4;
 
 impl Draw {
     fn params(&self) -> &FrameParams {
         match self {
-            Draw::Flat(_, p) | Draw::Volume(_, p) | Draw::Mip(_, p) => p,
+            Draw::Flat(_, p)
+            | Draw::Volume(_, p)
+            | Draw::Mip(_, p)
+            | Draw::Label(_, p)
+            | Draw::LabelVolume(_, p) => p,
         }
     }
 
@@ -90,6 +102,8 @@ impl Draw {
             Draw::Flat(id, _) => (id, KIND_FLAT),
             Draw::Volume(id, _) => (id, KIND_BRICKS),
             Draw::Mip(id, _) => (id, KIND_MIP),
+            Draw::Label(id, _) => (id, KIND_LABEL),
+            Draw::LabelVolume(id, _) => (id, KIND_LABEL_BRICKS),
         }
     }
 }
@@ -265,6 +279,8 @@ fn texel_format(t: Texel) -> (wgpu::TextureFormat, wgpu::TextureSampleType, &'st
         Texel::U16 => (F::R16Uint, S::Uint, "u32"),
         Texel::I16 => (F::R16Sint, S::Sint, "i32"),
         Texel::F32 => (F::R32Float, S::Float { filterable: false }, "f32"),
+        Texel::L32 => (F::R32Uint, S::Uint, "u32"),
+        Texel::L64 => (F::Rg32Uint, S::Uint, "u32"),
     }
 }
 
@@ -599,8 +615,13 @@ impl Gpu {
     /// Start building the volume pipelines (planes from bricks, projections) for
     /// `texel`s on threads, so the first view that needs them does not wait for the
     /// shader compiler.
-    pub fn warm(&mut self, texel: Texel) {
-        for kind in [KIND_BRICKS, KIND_MIP] {
+    pub fn warm(&mut self, texel: Texel, label: bool) {
+        let kinds: &[u8] = if label {
+            &[KIND_LABEL_BRICKS]
+        } else {
+            &[KIND_BRICKS, KIND_MIP]
+        };
+        for &kind in kinds {
             let key = (texel, kind);
             if self.pipelines.contains_key(&key) || self.warming.contains_key(&key) {
                 continue;
@@ -648,8 +669,7 @@ impl Gpu {
             .get(&id)
             .ok_or_else(|| err("no such layer"))?
             .texel;
-        self.ensure_pipeline(texel, KIND_BRICKS)?;
-        self.ensure_pipeline(texel, KIND_MIP)?;
+
         if let Some(p) = self.planes.get_mut(&id) {
             p.bricks = None; // its memory first
         }
@@ -811,16 +831,23 @@ impl Gpu {
         kind: u8,
     ) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
         let (_, sample_type, wgsl_type) = texel_format(texel);
+        // the brick shader's bindings and sampling (all before its fragment entry), for
+        // the kinds with fragment entries of their own
+        let bricks = include_str!("shader_bricks.wgsl");
+        let shared = bricks.find("@fragment").map_or(bricks, |at| &bricks[..at]);
         let code = match kind {
             KIND_FLAT => include_str!("shader.wgsl").to_string(),
-            KIND_BRICKS => include_str!("shader_bricks.wgsl").to_string(),
-            // the projection: the brick shader's bindings and sampling (all before its
-            // fragment entry), then its own fragment entry
-            _ => {
-                let bricks = include_str!("shader_bricks.wgsl");
-                let shared = bricks.find("@fragment").map_or(bricks, |at| &bricks[..at]);
-                shared.to_string() + include_str!("shader_mip.wgsl")
+            KIND_BRICKS => bricks.to_string(),
+            KIND_LABEL => {
+                include_str!("shader.wgsl").to_string() + include_str!("shader_label.wgsl")
             }
+            KIND_LABEL_BRICKS => shared.to_string() + include_str!("shader_label_bricks.wgsl"),
+            _ => shared.to_string() + include_str!("shader_mip.wgsl"),
+        };
+        let entry = if kind == KIND_LABEL || kind == KIND_LABEL_BRICKS {
+            "fs_label"
+        } else {
+            "fs"
         };
         let source = code.replace("TEXEL", wgsl_type);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -874,7 +901,7 @@ impl Gpu {
             ],
         });
         // bricks: their value ranges too (binding 7)
-        let layout = if kind == KIND_FLAT {
+        let layout = if kind == KIND_FLAT || kind == KIND_LABEL {
             layout
         } else {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -925,6 +952,17 @@ impl Gpu {
             dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Add,
         };
+        // label images lie over what is beneath (premultiplied)
+        let over = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let blend = if kind == KIND_LABEL || kind == KIND_LABEL_BRICKS {
+            over
+        } else {
+            add
+        };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("plane"),
             layout: Some(&pl),
@@ -936,12 +974,12 @@ impl Gpu {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs"),
+                entry_point: Some(entry),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState {
-                        color: add,
-                        alpha: add,
+                        color: blend,
+                        alpha: blend,
                     }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1239,7 +1277,7 @@ impl Gpu {
         let solo = rect.is_none()
             && frames.len() == 1
             && frames[0].params().opacity >= 1.0
-            && frames[0].target().1 != KIND_MIP;
+            && matches!(frames[0].target().1, KIND_FLAT | KIND_BRICKS);
         let mut drawn = Vec::new();
         for d in frames {
             let mut fp = *d.params();
@@ -1247,13 +1285,22 @@ impl Gpu {
                 fp.outside = BACKGROUND;
             }
             let (id, kind) = d.target();
+            let Some(texel) = self.planes.get(&id).map(|p| p.texel) else {
+                continue;
+            };
+            // made the first time a view needs it (a refusal shows as the GPU error)
+            if !self.pipelines.contains_key(&(texel, kind))
+                && self.ensure_pipeline(texel, kind).is_err()
+            {
+                continue;
+            }
             let Some(p) = self.planes.get_mut(&id) else {
                 continue;
             };
             let Some((pipeline, layout)) = self.pipelines.get(&(p.texel, kind)) else {
                 continue;
             };
-            if kind == KIND_FLAT {
+            if kind == KIND_FLAT || kind == KIND_LABEL {
                 self.queue
                     .write_buffer(&p.params, 0, bytemuck::bytes_of(&fp));
                 let bind = Self::bind_group(&self.device, layout, &self.sampler, p);
