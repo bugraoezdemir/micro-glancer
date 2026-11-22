@@ -53,9 +53,21 @@ tile read.
 
 ## Trying it
 
+micro-viewer has its own virtual environment in `.venv` (Python 3.12, PyQt6, numpy),
+with micro-viewer installed in development mode: after a change to the Rust code,
+`maturin develop --release` (run in this folder) builds it again into the same place.
+Then:
+
 ```
-python -m micro_viewer.qt PATH [PATH ...]
+.venv\Scripts\micro-viewer PATH [PATH ...]
 ```
+
+opens the app (also `python -m micro_viewer`), with the images as layers; File > Open,
+or dropping a folder or a .zip / .ozx on the window, adds more. The toolbar switches
+the views (XY, XZ, YZ), linked views, the projection and what it shows, the volume's
+density, shading and smooth sampling. The layers are on the left, the current layer's
+channels with their histograms on the right, its planes (z, t) at the bottom, and
+Help > Keys lists the keys.
 
 Drag to pan, scroll to zoom at the pointer, press F to fit, and press Page Up or Page
 Down to move through z (with Shift: t). Shift + scroll turns the view; [ and ] turn it
@@ -148,5 +160,11 @@ opening, after a jump and after a step in z or t, and the frames per second of c
 and zoom. For volumes also: the time until sharp after turning the plane through the
 volume, and the frames per second on the turned plane, cached and while turning on.
 
-`scratch/inspect_mv.py` is eubi's Inspect page with micro-viewer in its Viewer tab, to
-try the viewer inside eubi without changing eubi.
+The tests write their images with ome-zarr-pyramid, which `.venv` does not hold: run
+them from an environment that has it, with this folder's `python` directory (where the
+development build puts the compiled module) on `PYTHONPATH`.
+
+`scratch/inspect_mv.py` is eubi's Inspect page with micro-viewer in its Viewer tab (and
+micro-viewer's histogram panel under eubi's channel panel), to try the viewer inside
+eubi without changing eubi: run it with eubi's Python and `PYTHONPATH` set to this
+folder's `python` directory and the eubi checkout.

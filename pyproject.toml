@@ -17,6 +17,9 @@ classifiers = [
 ]
 dependencies = ["numpy>=1.26"]
 
+[project.scripts]
+micro-viewer = "micro_viewer.app:main"
+
 [project.optional-dependencies]
 qt = ["PyQt6>=6.7"]
 dev = ["PyQt6>=6.7", "pytest", "ome_zarr_pyramid"]

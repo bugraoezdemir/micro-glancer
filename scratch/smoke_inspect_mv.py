@@ -54,6 +54,15 @@ print("auto contrast, channel 0:", before, "->", (v.channels[0]["lo"], v.channel
       "| panel:", (mv.channel_panel.channel_data()[0]["intensityMin"],
                    mv.channel_panel.channel_data()[0]["intensityMax"]))
 
+# micro-viewer's histogram panel: contrast changed there reaches eubi's panel
+hp = mv.histogram_panel
+hp.refresh()
+v.set_channel(0, hi=1234.0)
+mv.view._changed()
+pump(0.4)
+print("histogram bins:", len(hp.hist._hist["counts"]) if hp.hist._hist else None,
+      "| eubi panel max after the histogram:", mv.channel_panel.channel_data()[0]["intensityMax"])
+
 # the z slider moves the plane
 name, slider, _ = mv._sliders[0]
 slider.setValue(10)

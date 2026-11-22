@@ -367,98 +367,11 @@ class ViewerWidget(QWidget):
             super().keyPressEvent(event)
 
 
-def _turn_and_shift(m):
-    """A 2 x 3 transform as words: its turn (degrees) and shift."""
-    import math
-    angle = math.degrees(math.atan2(m[1][0], m[0][0]))
-    return f"turned {angle:+.2f} deg, moved ({m[0][2]:+.2f}, {m[1][2]:+.2f})"
-
-
 def main(argv=None) -> int:
-    """``python -m micro_viewer.qt PATH [PATH ...]``: a window showing the images as
-    layers (two one-channel images in green and magenta, to align them), with the
-    current layer, its plane, transform and level and the values under the pointer in
-    the status bar, and the current layer's channels (histogram, contrast, isosurface
-    level, opacity curve; micro_viewer.panel) on the right."""
-    from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
-
-    argv = list(sys.argv if argv is None else argv)
-    app = QApplication.instance() or QApplication(argv)
-    if len(argv) < 2:
-        print("usage: python -m micro_viewer.qt PATH [PATH ...]")
-        return 2
-    from PyQt6.QtWidgets import QDockWidget
-    from .panel import ChannelPanel
-
-    win = QMainWindow()
-    widget = ViewerWidget()
-    win.setCentralWidget(widget)
-    win.resize(1500, 850)
-    panel = ChannelPanel(widget)
-    dock = QDockWidget("Channels", win)
-    dock.setWidget(panel)
-    dock.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-    win.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
-    win.setWindowTitle("micro-viewer: " + "  +  ".join(argv[1:]))
-    status = QLabel()
-    win.statusBar().addWidget(status, 1)
-    state = {"pick": "", "note": ""}
-
-    def show():
-        v = widget.viewer
-        layers = v.layers
-        if not layers:
-            status.setText(state["note"])
-            return
-        cur = layers[v.current]
-        pos = "  ".join(f"{n}={round(i)}/{s}" for n, i, s in cur["position"])
-        visible, loaded, pending, level, missing = widget.last_stats
-        err = f"  error: {v.error}" if v.error else ""
-        which = f"layer {v.current + 1}/{len(layers)}  " if len(layers) > 1 else ""
-        moved = _turn_and_shift(cur["transform"])
-        view = f"view {v.rotation:.0f} deg  " if v.rotation else ""
-        if v.mip:
-            view += f"projection {v.projection}  " + (
-                f"density {v.density:.3g}  " if v.projection == "volume" else "")
-        status.setText(f"{which}{pos}  level {level}  pending {pending}  {view}{moved}  "
-                       f"{state['pick']}{err}  {state['note']}")
-
-    def picked(p):
-        if p["pixel"] is None:
-            state["pick"] = ""
-        else:
-            names = [c["label"] for c in widget.viewer.channels]
-            vals = "  ".join(
-                f"{names[e['channel']]}: {e['value']:g}" if e["value"] is not None
-                else f"{names[e['channel']]}: -" for e in p["values"])
-            state["pick"] = f"x={p['pixel'][0]} y={p['pixel'][1]}  {vals}"
-        show()
-
-    def note(text):
-        state["note"] = text
-        show()
-
-    widget.viewChanged.connect(show)
-    widget.picked.connect(picked)
-    widget.saved.connect(note)
-    widget.failed.connect(note)
-    widget.open(argv[1])
-    for path in argv[2:]:
-        widget.add(path)
-    win.show()
-    try:
-        v = widget.viewer                                # made now: the window exists
-        if len(v.layers) == 2 and all(len(l["channels"]) == 1 for l in v.layers):
-            v.set_channel(0, color=(0.0, 1.0, 0.0), layer=0)
-            v.set_channel(0, color=(1.0, 0.0, 1.0), layer=1)
-    except Exception as exc:  # noqa: BLE001 (shown in the status bar)
-        note(str(exc))
-    panel.refresh()
-    widget.setFocus()
-    timer = QTimer(win)
-    timer.timeout.connect(show)
-    timer.start(250)
-    return app.exec()
+    """``python -m micro_viewer.qt PATH [PATH ...]``: micro-viewer's app window
+    (micro_viewer.app)."""
+    from .app import main as app_main
+    return app_main(argv)
 
 
 if __name__ == "__main__":

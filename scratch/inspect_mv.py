@@ -7,11 +7,15 @@
 ``level_paths``, ``orientation``, ``z``, ``fov_center``, ``image_widget``). eubi's own ``ChannelPanel`` drives the channels. The metadata tab,
 the sidebar and the save buttons are eubi's, unchanged. Nothing in eubi is modified.
 
-The Auto buttons set a channel's contrast from what is in view (micro-viewer's
+Below eubi's channel panel sits micro-viewer's (micro_viewer.panel): the channel's
+histogram with the contrast limits dragged on it (and the surface level and opacity
+curve for projections); contrast changed there flows back into eubi's panel, so "Save
+Channels" writes what is shown. The Auto buttons set a channel's contrast from what is in view (micro-viewer's
 ``auto_contrast``: the 0.1 and 99.9 percentiles over the view). Not in this copy: XZ / YZ
 orientations (V4), the field-of-view combo and the reload button.
 
-usage (eubi's venv; micro-viewer from a wheel on PYTHONPATH):
+usage (eubi's venv; micro-viewer's python folder, built by `maturin develop` in its own
+.venv, on PYTHONPATH):
     python scratch/inspect_mv.py [IMAGE]
 """
 from __future__ import annotations
@@ -26,6 +30,7 @@ from PyQt6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QSizePolicy, QSlide
 
 from eubi_bridge.qt_gui.pages.inspect_page import InspectPage, pyramid_cache
 from eubi_bridge.qt_gui.widgets.channel_panel import ChannelPanel
+from micro_viewer.panel import ChannelPanel as MicroChannelPanel
 from micro_viewer.qt import ViewerWidget
 
 
@@ -76,6 +81,11 @@ class MicroZarrViewer(QWidget):
         side_layout.setContentsMargins(0, 0, 0, 0)
         side_layout.addWidget(self._planes)
         side_layout.addWidget(self.channel_panel, 1)
+        # micro-viewer's own panel: the histogram, contrast dragged on it, surface level
+        # and opacity curve; what it changes flows back into eubi's panel
+        self.histogram_panel = MicroChannelPanel(self.view)
+        side_layout.addWidget(self.histogram_panel, 1)
+        self.view.viewChanged.connect(self._sync_eubi_panel)
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.view)
         split.addWidget(side)
@@ -163,6 +173,7 @@ class MicroZarrViewer(QWidget):
              "visible": c["visible"], "intensityMin": c["lo"], "intensityMax": c["hi"]}
             for i, c in enumerate(v.channels)])
         self._build_sliders()
+        self.histogram_panel.refresh()
         self.status_changed.emit(zarr_path)
         self.dataset_loaded.emit(pyr)
         self._frame()
@@ -224,6 +235,20 @@ class MicroZarrViewer(QWidget):
         c = v.channels[index]
         self.channel_panel.set_channel_range(index, c["lo"], c["hi"])
         self.view._changed()
+
+    @_safe
+    def _sync_eubi_panel(self):
+        """Contrast changed on micro-viewer's histogram: into eubi's panel (only what
+        differs: eubi's set_range always signals, and that would come back here)."""
+        if not self._path:
+            return
+        rows = self.channel_panel.channel_data()
+        for i, c in enumerate(self.view.viewer.channels):
+            if i >= len(rows):
+                break
+            lo, hi = rows[i].get("intensityMin"), rows[i].get("intensityMax")
+            if lo is None or hi is None or abs(lo - c["lo"]) > 1e-9 or abs(hi - c["hi"]) > 1e-9:
+                self.channel_panel.set_channel_range(i, c["lo"], c["hi"])
 
     @_safe
     def _frame(self):
