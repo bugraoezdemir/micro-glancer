@@ -47,6 +47,11 @@ struct Channel {
     shown: u32,
     // 1: the colour map (a row of the colour map texture) instead of the colour
     lut: u32,
+    // isosurfaces: the level when has_iso, else the middle of the contrast window
+    iso: f32,
+    has_iso: u32,
+    _c0: u32,
+    _c1: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;

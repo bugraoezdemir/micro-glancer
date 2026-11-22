@@ -580,6 +580,29 @@ pub fn read_region(
     read(array, start, stop, 1).map_err(err)
 }
 
+/// The lowest and highest finite value of `data` (native byte order) of `dtype` (one of
+/// the texel types), or None.
+pub fn value_range(dtype: DType, data: &[u8]) -> Option<(f32, f32)> {
+    let texel = match dtype {
+        DType::UInt8 => Texel::U8,
+        DType::Int8 => Texel::I8,
+        DType::UInt16 => Texel::U16,
+        DType::Int16 => Texel::I16,
+        DType::Float32 => Texel::F32,
+        _ => return None,
+    };
+    let n = data.len() / texel.bytes();
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for i in 0..n {
+        let v = texel.value(data, i);
+        if v.is_finite() {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    (lo <= hi).then_some((lo as f32, hi as f32))
+}
+
 /// The `lo` and `hi` quantiles (0..1) of the finite values in `data`.
 pub fn quantiles(texel: Texel, data: &[u8], lo: f64, hi: f64) -> Option<(f64, f64)> {
     let n = data.len() / texel.bytes();

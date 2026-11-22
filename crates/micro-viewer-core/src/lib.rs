@@ -201,6 +201,33 @@ pub struct ChannelDisplay {
     pub hi: f64,
     pub gamma: f64,
     pub visible: bool,
+    /// Volume projections: the opacity curve over the contrast window, points (x, y) in
+    /// 0..1 with x rising (straight lines between, flat beyond the ends); None: opacity
+    /// rises straight with the mapped value.
+    pub opacity: Option<Vec<[f64; 2]>>,
+    /// Isosurfaces: the level (a stored value), or None for the middle of the contrast
+    /// window.
+    pub iso: Option<f64>,
+}
+
+impl ChannelDisplay {
+    /// The opacity at mapped value `g` (0..1).
+    pub fn opacity_at(&self, g: f64) -> f64 {
+        let Some(pts) = self.opacity.as_deref().filter(|p| !p.is_empty()) else {
+            return g.clamp(0.0, 1.0);
+        };
+        if g <= pts[0][0] {
+            return pts[0][1];
+        }
+        for w in pts.windows(2) {
+            let ([x0, y0], [x1, y1]) = (w[0], w[1]);
+            if g <= x1 {
+                let f = if x1 > x0 { (g - x0) / (x1 - x0) } else { 1.0 };
+                return y0 + f * (y1 - y0);
+            }
+        }
+        pts[pts.len() - 1][1]
+    }
 }
 
 /// One channel's value at a picked point.
@@ -680,15 +707,18 @@ impl Layer {
                 .as_deref()
                 .and_then(|n| luts::NAMES.iter().position(|&m| m == n));
             for i in 0..LUT_SIZE as usize {
+                // alpha: the opacity curve (volume projections)
+                let f = i as f64 / (LUT_SIZE - 1) as f64;
+                let a = (d.opacity_at(f).clamp(0.0, 1.0) * 255.0).round() as u8;
                 rows.push(match table {
                     Some(t) => {
                         let [r, g, b] = luts::TABLES[t][i];
-                        [r, g, b, 255]
+                        [r, g, b, a]
                     }
                     None => {
-                        let f = i as f32 / (LUT_SIZE - 1) as f32;
+                        let f = f as f32;
                         let c = |v: f32| (v.clamp(0.0, 1.0) * f * 255.0).round() as u8;
-                        [c(d.color[0]), c(d.color[1]), c(d.color[2]), 255]
+                        [c(d.color[0]), c(d.color[1]), c(d.color[2]), a]
                     }
                 });
             }
@@ -706,6 +736,9 @@ impl Layer {
                 hi: d.hi as f32,
                 active: d.visible as u32,
                 lut: d.lut.is_some() as u32,
+                iso: d.iso.unwrap_or(0.0) as f32,
+                has_iso: d.iso.is_some() as u32,
+                _pad: [0; 2],
             })
             .collect()
     }
@@ -864,6 +897,9 @@ fn place_loaded(
                 }
             }
             gpu.upload_brick(o.id, slot, &data);
+            if let Some(r) = t.range {
+                gpu.write_brick_range(o.id, slot, r);
+            }
             if o.brick_current(&t.key) {
                 o.set_brick_page(&t.key, slot + 1);
             }
@@ -1368,6 +1404,8 @@ pub struct Viewer {
     projection: Projection,
     density: f32,
     shading: bool,
+    /// Rays jump over bricks that cannot add to the picture.
+    skip_empty: bool,
 }
 
 /// One view of the target: where it sits (None: the whole target), its size, camera, and
@@ -1462,6 +1500,7 @@ impl Viewer {
             projection: Projection::Mip,
             density: 0.05,
             shading: true,
+            skip_empty: true,
         }
     }
 
@@ -1789,6 +1828,8 @@ impl Viewer {
                     hi,
                     gamma: 1.0,
                     visible: info.active,
+                    opacity: None,
+                    iso: None,
                 }
             })
             .collect()
@@ -1869,6 +1910,23 @@ impl Viewer {
                 d.lo, d.hi, d.gamma
             )));
         }
+        if let Some(pts) = &d.opacity {
+            let ok = pts
+                .iter()
+                .all(|p| p.iter().all(|v| (0.0..=1.0).contains(v)))
+                && pts.windows(2).all(|w| w[0][0] <= w[1][0]);
+            if !ok {
+                return Err(verr(format!(
+                    "channel {c}: an opacity curve is points (x, y) in 0..1 with x rising: \
+                     {pts:?}"
+                )));
+            }
+        }
+        if let Some(v) = d.iso {
+            if !v.is_finite() {
+                return Err(verr(format!("channel {c}: an isosurface level of {v}")));
+            }
+        }
         if let Some(n) = &d.lut {
             if !luts::NAMES.contains(&n.as_str()) {
                 return Err(verr(format!(
@@ -1883,7 +1941,7 @@ impl Viewer {
             .channels
             .get_mut(c)
             .ok_or_else(|| verr(format!("channel {c}: the image has {n}")))?;
-        if slot.color != d.color || slot.lut != d.lut {
+        if slot.color != d.color || slot.lut != d.lut || slot.opacity != d.opacity {
             l.luts_dirty = true;
         }
         *slot = d;
@@ -2474,6 +2532,17 @@ impl Viewer {
         self.shading = shading;
     }
 
+    /// Whether projections jump over bricks that cannot add to the picture (below the
+    /// visible range for volumes, below the level for isosurfaces, no brighter than the
+    /// highest value so far for maximum intensity). On by default; off to compare.
+    pub fn skip_empty(&self) -> bool {
+        self.skip_empty
+    }
+
+    pub fn set_skip_empty(&mut self, skip: bool) {
+        self.skip_empty = skip;
+    }
+
     /// How layer `l` is drawn in view `v`.
     fn mode_in(l: &Layer, v: &View) -> Mode {
         if v.mip {
@@ -2534,7 +2603,9 @@ impl Viewer {
             camera: v.camera,
             moving: self.moving(),
             threads: self.threads as f64,
-            mode: self.projection.code() | if self.shading { 4 } else { 0 },
+            mode: self.projection.code()
+                | if self.shading { 4 } else { 0 }
+                | if self.skip_empty { 0 } else { 8 },
             density: self.density,
         };
         let mut draws = Vec::new();
@@ -2720,6 +2791,133 @@ impl Viewer {
         Ok(())
     }
 
+    /// A histogram of layer `i`'s channel `c`: `bins` equal bins over `range` (default:
+    /// the values' lowest to highest; the highest value counts in the last bin, values
+    /// outside are left out). Of what is in view (`whole` false: the view's box at the
+    /// finest level within about a million pixels, for a volume cut at an angle the
+    /// voxels next to the plane), or of the whole plane of a 2-D image or the whole volume
+    /// (at the finest level within about four million pixels or voxels).
+    pub fn histogram(
+        &self,
+        i: usize,
+        c: usize,
+        bins: usize,
+        range: Option<(f64, f64)>,
+        whole: bool,
+    ) -> Result<Histogram, ViewerError> {
+        if bins == 0 || bins > 1 << 16 {
+            return Err(verr(format!("{bins} bins: 1 to 65536")));
+        }
+        let l = self.layer(i)?;
+        if c >= l.channels.len() {
+            return Err(verr(format!(
+                "channel {c}: the image has {}",
+                l.channels.len()
+            )));
+        }
+        let (values, level) = self.channel_values(l, c, whole)?;
+        let (lo, hi) = match range {
+            Some((a, b)) if a.is_finite() && b.is_finite() && a < b => (a, b),
+            Some((a, b)) => return Err(verr(format!("a histogram over {a} .. {b}"))),
+            None => {
+                let lo = values.iter().copied().fold(f64::MAX, f64::min);
+                let hi = values.iter().copied().fold(f64::MIN, f64::max);
+                if lo > hi {
+                    (0.0, 1.0)
+                } else if lo == hi {
+                    (lo - 0.5, hi + 0.5)
+                } else {
+                    (lo, hi)
+                }
+            }
+        };
+        let mut counts = vec![0u64; bins];
+        let k = bins as f64 / (hi - lo);
+        for v in values {
+            if v < lo || v > hi {
+                continue;
+            }
+            let b = (((v - lo) * k) as usize).min(bins - 1);
+            counts[b] += 1;
+        }
+        Ok(Histogram {
+            counts,
+            lo,
+            hi,
+            level,
+        })
+    }
+
+    /// Channel `c`'s finite values for a histogram (see [`Viewer::histogram`]) and the
+    /// level they come from.
+    fn channel_values(
+        &self,
+        l: &Layer,
+        c: usize,
+        whole: bool,
+    ) -> Result<(Vec<f64>, usize), ViewerError> {
+        let nl = l.source.levels.len();
+        let texel = l.source.texel;
+        let finite = |data: Vec<u8>| -> Vec<f64> {
+            (0..data.len() / texel.bytes())
+                .map(|k| texel.value(&data, k))
+                .filter(|v| v.is_finite())
+                .collect()
+        };
+        if whole {
+            let size = |lv: &Level| lv.width * lv.height * if l.is_volume() { lv.depth } else { 1 };
+            let level = (0..nl)
+                .find(|&k| size(&l.source.levels[k]) <= 1 << 22)
+                .unwrap_or(nl - 1);
+            let lv = &l.source.levels[level];
+            let data = if l.is_volume() {
+                let (lead, _) = l.source.lead(level, &l.position);
+                let (start, stop) =
+                    l.source
+                        .region3(&lead, c, (0, lv.depth), (0, lv.height), (0, lv.width));
+                l.source.read(level, &start, &stop)?
+            } else {
+                let (plane, _) = l.source.plane(level, &l.position);
+                let (start, stop) = l.source.region(&plane, c, 0, 0, lv.height, lv.width);
+                l.source.read(level, &start, &stop)?
+            };
+            return Ok((finite(data), level));
+        }
+        // what is in view: the same boxes as for the contrast from the view
+        let (tw, th) = self.gpu.size();
+        let plane = self.camera.plane(tw, th);
+        if l.mode(&self.camera) == Mode::Volume {
+            let mut values = Vec::new();
+            let mut level = 0;
+            collect_volume(l, &plane, tw, th, c, &mut |lv, v| {
+                level = lv;
+                values.push(v)
+            })?;
+            return Ok((values, level));
+        }
+        let mut pick = None;
+        for lv in 0..nl {
+            let level = &l.source.levels[lv];
+            let m = plane.through(&l.to_index(lv)).to_2d();
+            let (x0, y0, x1, y1) = index_box(&m, tw, th);
+            let cx0 = (x0 + 0.5).floor().max(0.0) as u64;
+            let cy0 = (y0 + 0.5).floor().max(0.0) as u64;
+            let cx1 = ((x1 + 0.5).floor() + 1.0).min(level.width as f64).max(0.0) as u64;
+            let cy1 = ((y1 + 0.5).floor() + 1.0).min(level.height as f64).max(0.0) as u64;
+            if cx1 <= cx0 || cy1 <= cy0 {
+                return Err(verr("the image is not in view"));
+            }
+            pick = Some((lv, cy0, cx0, cy1 - cy0, cx1 - cx0));
+            if (cx1 - cx0) * (cy1 - cy0) <= 1 << 20 {
+                break;
+            }
+        }
+        let (lv, ty, tx, h, w) = pick.ok_or_else(|| verr("the image has no levels"))?;
+        let (plane_idx, _) = l.source.plane(lv, &l.position);
+        let (start, stop) = l.source.region(&plane_idx, c, ty, tx, h, w);
+        Ok((finite(l.source.read(lv, &start, &stop)?), lv))
+    }
+
     /// What lies under screen point (`x`, `y`): the world point, and per layer the
     /// level-0 pixel (and voxel) and every channel's value from the finest cached tile or
     /// brick holding it (read back from the GPU; the frame's level first, then coarser,
@@ -2850,6 +3048,81 @@ impl Viewer {
 }
 
 type Found = Vec<(usize, f64, f64)>;
+
+/// A channel's histogram: counts in equal bins over `lo` .. `hi`, and the level the
+/// values came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Histogram {
+    pub counts: Vec<u64>,
+    pub lo: f64,
+    pub hi: f64,
+    pub level: usize,
+}
+
+/// The voxels of channel `c` within half a voxel of a volume's plane (in the box the view
+/// spans, at the finest level whose box holds about four million voxels at most), each
+/// handed to `take` with its level.
+fn collect_volume(
+    l: &Layer,
+    plane: &Plane3,
+    tw: u32,
+    th: u32,
+    c: usize,
+    take: &mut dyn FnMut(usize, f64),
+) -> Result<(), ViewerError> {
+    let nl = l.source.levels.len();
+    let mut pick = None;
+    for lv in 0..nl {
+        let level = &l.source.levels[lv];
+        let p = plane.through(&l.to_index(lv));
+        let corners = [
+            p.at(0.0, 0.0),
+            p.at(tw as f64, 0.0),
+            p.at(0.0, th as f64),
+            p.at(tw as f64, th as f64),
+        ];
+        let size = [level.width, level.height, level.depth];
+        let mut b = [(0u64, 0u64); 3];
+        for a in 0..3 {
+            let mn = corners.iter().map(|q| q[a]).fold(f64::MAX, f64::min);
+            let mx = corners.iter().map(|q| q[a]).fold(f64::MIN, f64::max);
+            let s = (mn + 0.5).floor().max(0.0) as u64;
+            let e = (((mx + 0.5).floor() + 1.0).max(0.0) as u64).min(size[a]);
+            if e <= s {
+                return Err(verr("the image is not in view"));
+            }
+            b[a] = (s, e);
+        }
+        let voxels: u64 = b.iter().map(|(s, e)| e - s).product();
+        pick = Some((lv, b, p));
+        if voxels <= 1 << 22 {
+            break;
+        }
+    }
+    let (lv, b, p) = pick.ok_or_else(|| verr("the image has no levels"))?;
+    let n = cross(p.ux, p.uy);
+    let nn = norm(n).max(1e-300);
+    let (lead, _) = l.source.lead(lv, &l.position);
+    let texel = l.source.texel;
+    let (start, stop) = l.source.region3(&lead, c, b[2], b[1], b[0]);
+    let data = l.source.read(lv, &start, &stop)?;
+    let (w, h) = (b[0].1 - b[0].0, b[1].1 - b[1].0);
+    for k in 0..data.len() / texel.bytes() {
+        let (x, y, z) = (
+            b[0].0 + (k as u64 % w),
+            b[1].0 + (k as u64 / w % h),
+            b[2].0 + (k as u64 / (w * h)),
+        );
+        let d = sub([x as f64, y as f64, z as f64], p.origin);
+        if (dot(d, n) / nn).abs() <= 0.5 {
+            let v = texel.value(&data, k);
+            if v.is_finite() {
+                take(lv, v);
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Quantiles over a flat view: the view's box of the current plane at the finest level
 /// within about a million pixels.

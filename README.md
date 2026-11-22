@@ -28,8 +28,13 @@ reading are Rust (the crate `micro-viewer-core`); Python gets a small API and a 
 - See a volume whole, turned freely like the plane: the maximum intensity projection
   along the view; the volume itself, composited front to back (brighter voxels more
   opaque, with an adjustable density); or surfaces where each channel reaches the
-  middle of its contrast window. The volume and the surfaces are lit from their
-  gradients (shading can be switched off).
+  middle of its contrast window or at a level of its own. The volume and the surfaces
+  are lit from their gradients (shading can be switched off). Each channel has an
+  opacity curve for the volume. Rays jump over bricks that cannot add to the picture,
+  which makes sparse volumes much faster.
+- See each channel's histogram (of what is in view, or of the whole plane or volume) and
+  adjust on it: drag the contrast limits, the surface level and the points of the
+  opacity curve.
 - Open several images as layers in one view. They add up, each can be hidden or made
   fainter, and each can be moved and turned by hand, for example to line two images up
   before a registration tool refines it.
@@ -63,6 +68,13 @@ and cycles what it shows (maximum intensity, volume, surfaces); Shift + P switch
 shading; - and + make the volume thinner or denser. L
 switches linked views on and off (dragging, the wheel and Page Up / Page Down then act in
 the view under the pointer).
+
+The panel on the right shows the current layer's channels: pick a channel, show or hide
+it, choose its colour map, and adjust it on its histogram. Drag the solid lines for the
+contrast limits; with surfaces shown, drag the dashed line for the surface level; with
+the volume shown, drag the opacity curve's points (double-click adds one, right-click
+removes one). "whole image" switches the histogram from the view to the whole plane or
+volume, and Auto takes the contrast from the view.
 
 With several images, Tab picks the current layer. Ctrl + drag moves it, Ctrl + scroll
 turns it (1 degree a notch, with Shift 0.1), Ctrl + arrow keys nudge it by a pixel,
@@ -103,8 +115,14 @@ print(v.pick(512, 384)["voxel"])  # the voxel (x, y, z) under the centre
 v.mip = True                    # the projection along the view
 v.projection = "volume"         # or "mip", "iso"
 v.density = 0.1                 # the volume's opacity per voxel at full brightness
+v.set_channel(0, opacity=[(0.2, 0.0), (0.6, 0.9)])  # the opacity curve over the window
+v.set_channel(0, iso=5000)      # the surface level (a stored value)
+h = v.histogram(0, bins=256, whole=True)  # counts and edges
 v.linked = True                 # the plane, YZ, XZ and the projection in quarters
 ```
+
+`micro_viewer.panel.ChannelPanel` (and its `HistogramWidget`) adjusts the channels of a
+`ViewerWidget`'s current layer.
 
 In Qt, `micro_viewer.qt.ViewerWidget` shows the layers. It emits `viewChanged` when the
 camera, a plane, a layer or the channels change, `picked` with the values under the

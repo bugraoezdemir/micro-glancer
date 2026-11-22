@@ -45,6 +45,8 @@ pub struct Loaded {
     pub data: Result<Vec<u8>, String>,
     /// Seconds the read took (the block's decode included when this tile started it).
     pub took: f64,
+    /// A brick's lowest and highest value (to skip empty bricks).
+    pub range: Option<(f32, f32)>,
 }
 
 /// The host's wake-up, shared with the workers.
@@ -122,7 +124,11 @@ fn work(shared: Arc<Shared>, tx: Sender<Loaded>, notify: Wakeup, slow: std::time
                 r.start, r.stop
             ))
         });
+        let mut range = None;
         if r.key.brick {
+            if let Ok(b) = &data {
+                range = crate::source::value_range(r.array.dtype(), b);
+            }
             // laid out for the brick atlas: a strip of its planes side by side
             let d = (r.stop[n - 3] - r.start[n - 3]) as usize;
             let item = r.array.dtype().size();
@@ -143,6 +149,7 @@ fn work(shared: Arc<Shared>, tx: Sender<Loaded>, notify: Wakeup, slow: std::time
                 h,
                 data,
                 took,
+                range,
             })
             .is_err()
         {

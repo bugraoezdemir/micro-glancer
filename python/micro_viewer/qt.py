@@ -378,7 +378,8 @@ def main(argv=None) -> int:
     """``python -m micro_viewer.qt PATH [PATH ...]``: a window showing the images as
     layers (two one-channel images in green and magenta, to align them), with the
     current layer, its plane, transform and level and the values under the pointer in
-    the status bar."""
+    the status bar, and the current layer's channels (histogram, contrast, isosurface
+    level, opacity curve; micro_viewer.panel) on the right."""
     from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
 
     argv = list(sys.argv if argv is None else argv)
@@ -386,10 +387,18 @@ def main(argv=None) -> int:
     if len(argv) < 2:
         print("usage: python -m micro_viewer.qt PATH [PATH ...]")
         return 2
+    from PyQt6.QtWidgets import QDockWidget
+    from .panel import ChannelPanel
+
     win = QMainWindow()
     widget = ViewerWidget()
     win.setCentralWidget(widget)
-    win.resize(1280, 800)
+    win.resize(1500, 850)
+    panel = ChannelPanel(widget)
+    dock = QDockWidget("Channels", win)
+    dock.setWidget(panel)
+    dock.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    win.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
     win.setWindowTitle("micro-viewer: " + "  +  ".join(argv[1:]))
     status = QLabel()
     win.statusBar().addWidget(status, 1)
@@ -444,6 +453,8 @@ def main(argv=None) -> int:
             v.set_channel(0, color=(1.0, 0.0, 1.0), layer=1)
     except Exception as exc:  # noqa: BLE001 (shown in the status bar)
         note(str(exc))
+    panel.refresh()
+    widget.setFocus()
     timer = QTimer(win)
     timer.timeout.connect(show)
     timer.start(250)

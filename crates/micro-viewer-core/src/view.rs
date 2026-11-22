@@ -71,6 +71,13 @@ pub struct ChannelState {
     pub gamma: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible: Option<bool>,
+    /// The volume projection's opacity curve, points (x, y) in 0..1 ([] for a straight
+    /// rise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<Vec<[f64; 2]>>,
+    /// The isosurface level (a stored value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iso: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -221,6 +228,8 @@ impl ViewState {
                             hi: Some(d.hi),
                             gamma: Some(d.gamma),
                             visible: Some(d.visible),
+                            opacity: Some(d.opacity.clone().unwrap_or_default()),
+                            iso: d.iso,
                         })
                         .collect(),
                 })
@@ -395,6 +404,12 @@ fn apply_layer(
         d.hi = c.hi.unwrap_or(d.hi);
         d.gamma = c.gamma.unwrap_or(d.gamma);
         d.visible = c.visible.unwrap_or(d.visible);
+        if let Some(pts) = &c.opacity {
+            d.opacity = (!pts.is_empty()).then(|| pts.clone());
+        }
+        if let Some(v) = c.iso {
+            d.iso = Some(v);
+        }
     }
     let linear = match s.interpolation.as_deref() {
         None => l.linear,

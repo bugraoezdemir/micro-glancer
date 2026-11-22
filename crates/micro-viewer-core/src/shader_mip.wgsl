@@ -1,13 +1,25 @@
 
-// Maximum intensity projection (appended to the brick shader, whose own fragment entry is
-// renamed): every screen pixel casts a ray along the view's normal through the volume
-// (orthographic), the part inside the volume's box at the frame's level, in steps of at
-// most 0.8 voxel along any axis (at most MAX_STEPS steps). Per active channel the ray
-// keeps the highest value it meets (each sample from the frame's level, or else the
-// nearest coarser level holding its brick, or else a finer one; nearest voxel or
-// trilinear); contrast, gamma and colour map the highest value (they keep the order).
+// Projections (appended to the brick shader's bindings and sampling): every screen pixel
+// casts a ray along the view's normal through the volume (orthographic), the part inside
+// the volume's box at the frame's level, in steps of at most 0.8 voxel along any axis (at
+// most MAX_STEPS steps). Each sample comes from the frame's level, or else the nearest
+// coarser level holding its brick, or else a finer one (nearest voxel or trilinear).
+//
+// p.mode bits 0-1: 0 maximum intensity (per channel the highest value along the ray,
+// then contrast, gamma and colour, which keep the order); 1 volume (front-to-back
+// compositing: a channel's opacity per voxel is its opacity curve at the mapped value
+// (the colour map's alpha) times p.density, channels combine as layers of glass, the
+// colour is the channels' colours weighted by their opacity); 2 isosurfaces (the first
+// point where a channel reaches its level: its own, or the middle of its contrast
+// window). Bit 2: shading, from the gradient of the most opaque channel (volume) or of
+// the surface's channel (iso): a light from the viewer's upper left, both sides lit.
+// Bit 3: no skipping (else rays jump over bricks that cannot add: no brighter than the
+// highest value so far or below the window (maximum), below every window where the
+// opacity curves start at zero (volume), below every level (iso); each brick's lowest
+// and highest value come with it).
 
 const MAX_STEPS: f32 = 2048.0;
+const MAX_CHANNELS: u32 = 16u;
 
 struct Hit {
     found: bool,
@@ -70,102 +82,6 @@ fn slab(o: f32, d: f32, lo: f32, hi: f32, t: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(max(t.x, min(a, b)), min(t.y, max(a, b)));
 }
 
-fn fs_mip(s: vec2<f32>) -> vec4<f32> {
-    let top = levels[p.level];
-    // the ray at the frame's level: its point at t = 0 (on the view's plane) and its
-    // direction (voxels per world unit along the normal)
-    let o = vec3<f32>(top.origin_int.xyz) + frac_at(top, s);
-    let d = top.dir.xyz;
-    let hi = vec3<f32>(top.size.xyz) - 0.5;
-    var t = vec2<f32>(-1e30, 1e30);
-    t = slab(o.x, d.x, -0.5, hi.x, t);
-    t = slab(o.y, d.y, -0.5, hi.y, t);
-    t = slab(o.z, d.z, -0.5, hi.z, t);
-    if (t.x > t.y) {
-        return p.outside;
-    }
-    let most = max(abs(d.x), max(abs(d.y), abs(d.z)));
-    let step = max(0.8 / max(most, 1e-30), (t.y - t.x) / MAX_STEPS);
-    let n = u32(ceil((t.y - t.x) / step));
-    var rgb = vec3<f32>(0.0);
-    var shown = false;
-    var wanted = false;
-    for (var c = 0u; c < p.n_channels; c++) {
-        let ch = channels[c];
-        if (ch.shown == 0u) {
-            continue;
-        }
-        wanted = true;
-        var best = -3.4e38;
-        var found = false;
-        // the frame level's brick page, looked up when the ray enters a new brick
-        var last_b = vec3<i32>(-1);
-        var last_page = 0u;
-        for (var i = 0u; i < n; i++) {
-            let tt = t.x + (f32(i) + 0.5) * step;
-            if (top.grid.w != 0u) {
-                let q = o + tt * d;
-                let vox = voxel_of(top, q);
-                let b = vox / STEP;
-                if (any(b != last_b)) {
-                    last_b = b;
-                    last_page = page_of(top, c, vox);
-                }
-                if (last_page != 0u) {
-                    best = max(best, value_in(top, last_page - 1u, q));
-                    found = true;
-                    continue;
-                }
-            }
-            // that brick is missing: a coarser level, else a finer one
-            for (var k = 1u; k < p.n_levels; k++) {
-                let l = levels[level_order(k)];
-                if (l.grid.w == 0u) {
-                    continue;
-                }
-                let q = vec3<f32>(l.origin_int.xyz) + frac_at(l, s) + tt * l.dir.xyz;
-                let h = sample_at(l, c, q);
-                if (h.found) {
-                    best = max(best, h.v);
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if (!found) {
-            continue;
-        }
-        var g = clamp((best - ch.lo) / max(ch.hi - ch.lo, 1e-30), 0.0, 1.0);
-        if (ch.gamma != 1.0) {
-            g = pow(g, ch.gamma);
-        }
-        if (ch.lut != 0u) {
-            let lu = (g * (LUT_SIZE - 1.0) + 0.5) / LUT_SIZE;
-            let lv = (f32(c) + 0.5) / f32(p.n_channels);
-            rgb += textureSampleLevel(luts, lut_sampler, vec2<f32>(lu, lv), 0.0).rgb;
-        } else {
-            rgb += g * ch.color;
-        }
-        shown = true;
-    }
-    if (!wanted) {
-        return p.outside;
-    }
-    if (!shown) {
-        return vec4<f32>(p.missing.rgb * p.opacity, p.opacity);
-    }
-    return vec4<f32>(min(rgb, vec3<f32>(1.0)) * p.opacity, p.opacity);
-}
-
-// ------------------------------------------------------------------ shaded projections
-//
-// p.mode (bits 0-1): 0 maximum intensity, 1 volume (front-to-back compositing: a sample's
-// opacity grows with its brightest channel, `p.density` the opacity per voxel at the top
-// of the contrast window; its colour the channels' colours weighted by brightness), 2
-// isosurfaces (the first point along the ray where a channel reaches the middle of its
-// contrast window). Bit 2: shading, from the gradient of the brightest channel (volume)
-// or of the surface's channel (iso): a light from the viewer's upper left, both sides lit.
-
 struct Ray {
     ok: bool,
     o: vec3<f32>,
@@ -198,10 +114,33 @@ fn ray_for(s: vec2<f32>) -> Ray {
     return r;
 }
 
+fn skipping() -> bool {
+    return (p.mode & 8u) == 0u;
+}
+
+// The first sample index past the frame level's brick b on ray r (from sample i): where
+// the ray leaves the cells whose samples fall into that brick.
+fn after_brick(r: Ray, b: vec3<i32>, i: u32) -> u32 {
+    var lo = vec3<f32>(b * STEP) - 0.5;
+    if (p.linear != 0u) {
+        lo = vec3<f32>(b * STEP);
+    }
+    let hi = lo + f32(STEP);
+    var t_exit = 1e30;
+    if (r.d.x > 1e-12) { t_exit = min(t_exit, (hi.x - r.o.x) / r.d.x); }
+    if (r.d.x < -1e-12) { t_exit = min(t_exit, (lo.x - r.o.x) / r.d.x); }
+    if (r.d.y > 1e-12) { t_exit = min(t_exit, (hi.y - r.o.y) / r.d.y); }
+    if (r.d.y < -1e-12) { t_exit = min(t_exit, (lo.y - r.o.y) / r.d.y); }
+    if (r.d.z > 1e-12) { t_exit = min(t_exit, (hi.z - r.o.z) / r.d.z); }
+    if (r.d.z < -1e-12) { t_exit = min(t_exit, (lo.z - r.o.z) / r.d.z); }
+    let next = ceil((t_exit - r.t0) / r.step - 0.5);
+    return max(u32(clamp(next, 0.0, f32(r.n))), i + 1u);
+}
+
 // Channel c's raw value on the ray of screen point s at tt (world units along the view's
-// normal): the frame's level, else a coarser one, else a finer one.
-fn value_on_ray(c: u32, s: vec2<f32>, tt: f32) -> Hit {
-    for (var k = 0u; k < p.n_levels; k++) {
+// normal) from the levels other than the frame's (coarser first).
+fn value_elsewhere(c: u32, s: vec2<f32>, tt: f32) -> Hit {
+    for (var k = 1u; k < p.n_levels; k++) {
         let l = levels[level_order(k)];
         if (l.grid.w == 0u) {
             continue;
@@ -227,14 +166,26 @@ fn mapped(ch: Channel, v: f32) -> f32 {
     return g;
 }
 
+fn lut_at(c: u32, g: f32) -> vec4<f32> {
+    let lu = (g * (LUT_SIZE - 1.0) + 0.5) / LUT_SIZE;
+    let lv = (f32(c) + 0.5) / f32(p.n_channels);
+    return textureSampleLevel(luts, lut_sampler, vec2<f32>(lu, lv), 0.0);
+}
+
 // The channel's colour at mapped value g: its colour map's, or its colour.
 fn tint(ch: Channel, c: u32, g: f32) -> vec3<f32> {
     if (ch.lut != 0u) {
-        let lu = (g * (LUT_SIZE - 1.0) + 0.5) / LUT_SIZE;
-        let lv = (f32(c) + 0.5) / f32(p.n_channels);
-        return textureSampleLevel(luts, lut_sampler, vec2<f32>(lu, lv), 0.0).rgb;
+        return lut_at(c, g).rgb;
     }
     return ch.color;
+}
+
+// The channel's isosurface level (a stored value).
+fn iso_level(ch: Channel) -> f32 {
+    if (ch.has_iso != 0u) {
+        return ch.iso;
+    }
+    return ch.lo + 0.5 * (ch.hi - ch.lo);
 }
 
 // The surface normal at level l's point q from channel c's gradient (central
@@ -253,21 +204,11 @@ fn normal_at(l: Level, c: u32, q: vec3<f32>) -> vec3<f32> {
     if (!(x1.found && x0.found && y1.found && y0.found && z1.found && z0.found)) {
         return vec3<f32>(0.0);
     }
-    // index-space gradient to the camera's axes: the level's steps per screen pixel along
-    // right and down (over the scale) and per world unit along the normal
-    let g = vec3<f32>(x1.v - x0.v, y1.v - y0.v, z1.v - z0.v);
-    let k = max(l.dir.w, 1e-30);
-    let n = vec3<f32>(dot(g, l.ux.xyz) / k, dot(g, l.uy.xyz) / k, dot(g, l.dir.xyz));
-    let len = length(n);
-    if (len < 1e-20) {
-        return vec3<f32>(0.0);
-    }
-    return n / len;
+    return to_camera(l, vec3<f32>(x1.v - x0.v, y1.v - y0.v, z1.v - z0.v));
 }
 
 // The normal from the gradient around voxel `vox` of level l, all from its brick slot
-// `slot` (one-sided at the brick's and the volume's edges: no more page lookups), seen
-// by the camera as in normal_at.
+// `slot` (one-sided at the brick's and the volume's edges: no more page lookups).
 fn normal_in(l: Level, slot: u32, vox: vec3<i32>) -> vec3<f32> {
     let o = vox - (vox / STEP) * STEP;
     let last = l.size.xyz - 1;
@@ -279,6 +220,13 @@ fn normal_in(l: Level, slot: u32, vox: vec3<i32>) -> vec3<f32> {
         load(slot, o + vec3<i32>(0, up.y, 0)) - load(slot, o - vec3<i32>(0, dn.y, 0)),
         load(slot, o + vec3<i32>(0, 0, up.z)) - load(slot, o - vec3<i32>(0, 0, dn.z))
     ) / span;
+    return to_camera(l, g);
+}
+
+// An index-space gradient as a unit normal in the camera's axes: the level's steps per
+// screen pixel along right and down (over the scale, in dir.w) and per world unit along
+// the normal.
+fn to_camera(l: Level, g: vec3<f32>) -> vec3<f32> {
     let k = max(l.dir.w, 1e-30);
     let n = vec3<f32>(dot(g, l.ux.xyz) / k, dot(g, l.uy.xyz) / k, dot(g, l.dir.xyz));
     let len = length(n);
@@ -300,6 +248,89 @@ fn shade(n: vec3<f32>) -> f32 {
     return 0.3 + 0.7 * diffuse + specular;
 }
 
+fn finish(rgb: vec3<f32>, wanted: bool, shown: bool) -> vec4<f32> {
+    if (!wanted) {
+        return p.outside;
+    }
+    if (!shown) {
+        return vec4<f32>(p.missing.rgb * p.opacity, p.opacity);
+    }
+    return vec4<f32>(min(rgb, vec3<f32>(1.0)) * p.opacity, p.opacity);
+}
+
+fn fs_mip(s: vec2<f32>) -> vec4<f32> {
+    let r = ray_for(s);
+    if (!r.ok) {
+        return p.outside;
+    }
+    let top = levels[p.level];
+    var rgb = vec3<f32>(0.0);
+    var shown = false;
+    var wanted = false;
+    for (var c = 0u; c < p.n_channels; c++) {
+        let ch = channels[c];
+        if (ch.shown == 0u) {
+            continue;
+        }
+        wanted = true;
+        var best = -3.4e38;
+        var found = false;
+        // the frame level's brick and its page, looked up when the ray enters a new brick
+        var last_b = vec3<i32>(-1);
+        var last_page = 0u;
+        var i = 0u;
+        loop {
+            if (i >= r.n) {
+                break;
+            }
+            let tt = r.t0 + (f32(i) + 0.5) * r.step;
+            if (top.grid.w != 0u) {
+                let q = r.o + tt * r.d;
+                let vox = voxel_of(top, q);
+                let b = vox / STEP;
+                if (any(b != last_b)) {
+                    last_b = b;
+                    last_page = page_of(top, c, vox);
+                    if (skipping() && last_page != 0u) {
+                        let most = ranges[last_page - 1u].y;
+                        // nothing brighter here, or all of it below the window (black)
+                        if (most <= best || most <= ch.lo) {
+                            best = max(best, min(most, max(best, ch.lo)));
+                            found = true;
+                            i = after_brick(r, b, i);
+                            continue;
+                        }
+                    }
+                }
+                if (last_page != 0u) {
+                    best = max(best, value_in(top, last_page - 1u, q));
+                    found = true;
+                    i += 1u;
+                    continue;
+                }
+            }
+            // that brick is missing: a coarser level, else a finer one
+            let h = value_elsewhere(c, s, tt);
+            if (h.found) {
+                best = max(best, h.v);
+                found = true;
+            }
+            i += 1u;
+        }
+        if (!found) {
+            continue;
+        }
+        let g = mapped(ch, best);
+        if (ch.lut != 0u) {
+            rgb += lut_at(c, g).rgb;
+        } else {
+            rgb += g * ch.color;
+        }
+        shown = true;
+    }
+    return finish(rgb, wanted, shown);
+}
+
 fn fs_volume(s: vec2<f32>) -> vec4<f32> {
     let r = ray_for(s);
     if (!r.ok) {
@@ -311,23 +342,48 @@ fn fs_volume(s: vec2<f32>) -> vec4<f32> {
     var a = 0.0;
     var wanted = false;
     var seen = false;
-    // per channel: the frame level's brick and its page, looked up when the ray enters it
-    var bk: array<vec3<i32>, 16>;
+    // per channel: the frame level's page for the brick the ray is in
     var pg: array<u32, 16>;
-    for (var c = 0u; c < ISO_CHANNELS; c++) {
-        bk[c] = vec3<i32>(-1);
+    for (var c = 0u; c < MAX_CHANNELS; c++) {
         pg[c] = 0u;
     }
-    for (var i = 0u; i < r.n; i++) {
+    var last_b = vec3<i32>(-1);
+    var i = 0u;
+    loop {
+        if (i >= r.n) {
+            break;
+        }
         let tt = r.t0 + (f32(i) + 0.5) * r.step;
         let q = r.o + tt * r.d;
         let vox = voxel_of(top, q);
         let b = vox / STEP;
+        if (top.grid.w != 0u && any(b != last_b)) {
+            last_b = b;
+            // a new brick: every channel's page, and whether all of it is clear
+            var clear = skipping();
+            for (var c = 0u; c < min(p.n_channels, MAX_CHANNELS); c++) {
+                let ch = channels[c];
+                if (ch.shown == 0u) {
+                    continue;
+                }
+                pg[c] = page_of(top, c, vox);
+                if (pg[c] == 0u || ranges[pg[c] - 1u].y > ch.lo || lut_at(c, 0.0).a > 0.0) {
+                    clear = false;
+                }
+            }
+            if (clear && p.n_channels <= MAX_CHANNELS) {
+                wanted = true;
+                seen = true;
+                i = after_brick(r, b, i);
+                continue;
+            }
+        }
         var rgb = vec3<f32>(0.0);
         var weight = 0.0;
-        var gmax = 0.0;
-        var brightest = 0u;
-        var brightest_slot = 0u;
+        var keep = 1.0;
+        var most = 0.0;
+        var densest = 0u;
+        var densest_slot = 0u;
         var found = false;
         for (var c = 0u; c < p.n_channels; c++) {
             let ch = channels[c];
@@ -338,54 +394,50 @@ fn fs_volume(s: vec2<f32>) -> vec4<f32> {
             var h: Hit;
             h.found = false;
             var slot1 = 0u;
-            if (top.grid.w != 0u && c < ISO_CHANNELS) {
-                if (any(b != bk[c])) {
-                    bk[c] = b;
-                    pg[c] = page_of(top, c, vox);
-                }
-                if (pg[c] != 0u) {
-                    h.v = value_in(top, pg[c] - 1u, q);
-                    h.found = true;
-                    slot1 = pg[c];
-                }
+            if (top.grid.w != 0u && c < MAX_CHANNELS && pg[c] != 0u) {
+                h.v = value_in(top, pg[c] - 1u, q);
+                h.found = true;
+                slot1 = pg[c];
             }
             if (!h.found) {
-                h = value_on_ray(c, s, tt);
+                h = value_elsewhere(c, s, tt);
             }
             if (!h.found) {
                 continue;
             }
             found = true;
             let g = mapped(ch, h.v);
-            rgb += g * tint(ch, c, g);
-            weight += g;
-            if (g > gmax) {
-                gmax = g;
-                brightest = c;
-                brightest_slot = slot1;
+            let opacity = lut_at(c, g).a;
+            let alpha = 1.0 - pow(1.0 - clamp(opacity * p.density, 0.0, 0.999), r.vox);
+            rgb += alpha * tint(ch, c, g);
+            weight += alpha;
+            keep *= 1.0 - alpha;
+            if (alpha > most) {
+                most = alpha;
+                densest = c;
+                densest_slot = slot1;
             }
         }
-        if (!found) {
-            continue;
+        if (found) {
+            seen = true;
         }
-        seen = true;
-        if (gmax <= 0.0) {
-            continue;
-        }
-        let alpha = 1.0 - pow(1.0 - clamp(gmax * p.density, 0.0, 0.999), r.vox);
-        var colour = rgb / max(weight, 1e-30);
-        if (shading && alpha > 0.004) {
-            if (brightest_slot != 0u) {
-                colour *= shade(normal_in(top, brightest_slot - 1u, vox));
-            } else {
-                colour *= shade(normal_at(top, brightest, q));
+        let alpha = 1.0 - keep;
+        if (found && alpha > 0.0) {
+            var colour = rgb / max(weight, 1e-30);
+            if (shading && alpha > 0.004) {
+                if (densest_slot != 0u) {
+                    colour *= shade(normal_in(top, densest_slot - 1u, vox));
+                } else {
+                    colour *= shade(normal_at(top, densest, q));
+                }
+            }
+            acc += (1.0 - a) * alpha * min(colour, vec3<f32>(1.0));
+            a += (1.0 - a) * alpha;
+            if (a > 0.995) {
+                break;
             }
         }
-        acc += (1.0 - a) * alpha * min(colour, vec3<f32>(1.0));
-        a += (1.0 - a) * alpha;
-        if (a > 0.995) {
-            break;
-        }
+        i += 1u;
     }
     if (!wanted) {
         return p.outside;
@@ -396,8 +448,6 @@ fn fs_volume(s: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(acc * p.opacity, a * p.opacity);
 }
 
-const ISO_CHANNELS: u32 = 16u;
-
 fn fs_iso(s: vec2<f32>) -> vec4<f32> {
     let r = ray_for(s);
     if (!r.ok) {
@@ -406,23 +456,48 @@ fn fs_iso(s: vec2<f32>) -> vec4<f32> {
     let top = levels[p.level];
     let shading = (p.mode & 4u) != 0u;
     var prev: array<f32, 16>;
-    for (var c = 0u; c < ISO_CHANNELS; c++) {
+    var pg: array<u32, 16>;
+    for (var c = 0u; c < MAX_CHANNELS; c++) {
         prev[c] = -3.4e38;
+        pg[c] = 0u;
     }
     var wanted = false;
     var seen = false;
-    let nc = min(p.n_channels, ISO_CHANNELS);
-    var bk: array<vec3<i32>, 16>;
-    var pg: array<u32, 16>;
-    for (var c = 0u; c < ISO_CHANNELS; c++) {
-        bk[c] = vec3<i32>(-1);
-        pg[c] = 0u;
-    }
-    for (var i = 0u; i < r.n; i++) {
+    let nc = min(p.n_channels, MAX_CHANNELS);
+    var last_b = vec3<i32>(-1);
+    var i = 0u;
+    loop {
+        if (i >= r.n) {
+            break;
+        }
         let tt = r.t0 + (f32(i) + 0.5) * r.step;
         let q = r.o + tt * r.d;
         let vox = voxel_of(top, q);
         let b = vox / STEP;
+        if (top.grid.w != 0u && any(b != last_b)) {
+            last_b = b;
+            var below = skipping();
+            for (var c = 0u; c < nc; c++) {
+                let ch = channels[c];
+                if (ch.shown == 0u) {
+                    continue;
+                }
+                pg[c] = page_of(top, c, vox);
+                if (pg[c] == 0u || ranges[pg[c] - 1u].y >= iso_level(ch)) {
+                    below = false;
+                }
+            }
+            if (below) {
+                // to the brick's last sample: its true value is the next crossing's start
+                wanted = true;
+                seen = true;
+                let next = after_brick(r, b, i);
+                if (next > i + 1u) {
+                    i = next - 1u;
+                    continue;
+                }
+            }
+        }
         for (var c = 0u; c < nc; c++) {
             let ch = channels[c];
             if (ch.shown == 0u) {
@@ -431,24 +506,18 @@ fn fs_iso(s: vec2<f32>) -> vec4<f32> {
             wanted = true;
             var h: Hit;
             h.found = false;
-            if (top.grid.w != 0u) {
-                if (any(b != bk[c])) {
-                    bk[c] = b;
-                    pg[c] = page_of(top, c, vox);
-                }
-                if (pg[c] != 0u) {
-                    h.v = value_in(top, pg[c] - 1u, q);
-                    h.found = true;
-                }
+            if (top.grid.w != 0u && pg[c] != 0u) {
+                h.v = value_in(top, pg[c] - 1u, q);
+                h.found = true;
             }
             if (!h.found) {
-                h = value_on_ray(c, s, tt);
+                h = value_elsewhere(c, s, tt);
             }
             if (!h.found) {
                 continue;
             }
             seen = true;
-            let level = ch.lo + 0.5 * (ch.hi - ch.lo);
+            let level = iso_level(ch);
             if (h.v >= level) {
                 // where between this sample and the one before the value crossed it
                 var t_hit = tt;
@@ -470,6 +539,7 @@ fn fs_iso(s: vec2<f32>) -> vec4<f32> {
             }
             prev[c] = h.v;
         }
+        i += 1u;
     }
     if (!wanted) {
         return p.outside;

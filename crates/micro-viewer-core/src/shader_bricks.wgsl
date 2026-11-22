@@ -46,6 +46,11 @@ struct Channel {
     hi: f32,
     shown: u32,
     lut: u32,
+    // isosurfaces: the level when has_iso, else the middle of the contrast window
+    iso: f32,
+    has_iso: u32,
+    _c0: u32,
+    _c1: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -55,6 +60,8 @@ struct Channel {
 @group(0) @binding(4) var<storage, read> channels: array<Channel>;
 @group(0) @binding(5) var luts: texture_2d<f32>;
 @group(0) @binding(6) var lut_sampler: sampler;
+// per brick slot: its lowest and highest value
+@group(0) @binding(7) var<storage, read> ranges: array<vec2<f32>>;
 
 const BRICK: i32 = 32;
 const STEP: i32 = 31;

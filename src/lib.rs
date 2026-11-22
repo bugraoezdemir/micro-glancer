@@ -102,6 +102,13 @@ fn channel_list<'py>(
         d.set_item("hi", c.hi)?;
         d.set_item("gamma", c.gamma)?;
         d.set_item("visible", c.visible)?;
+        d.set_item(
+            "opacity",
+            c.opacity
+                .as_ref()
+                .map(|pts| pts.iter().map(|p| (p[0], p[1])).collect::<Vec<_>>()),
+        )?;
+        d.set_item("iso", c.iso)?;
         out.append(d)?;
     }
     Ok(out)
@@ -329,6 +336,51 @@ impl Viewer {
         self.inner.set_density(density).map_err(err)
     }
 
+    /// Whether projections jump over bricks that cannot add to the picture (on by
+    /// default; off to compare).
+    #[getter]
+    fn skip_empty(&self) -> bool {
+        self.inner.skip_empty()
+    }
+
+    #[setter]
+    fn set_skip_empty(&mut self, skip: bool) {
+        self.inner.set_skip_empty(skip);
+    }
+
+    /// A histogram of channel `channel` (of the current layer, or `layer`): {"counts":
+    /// [...], "edges": [... bins + 1], "lo", "hi", "level"} with `bins` equal bins over
+    /// `range` (lo, hi) (default: the values' lowest to highest). Of what is in view
+    /// (`whole` false), or of the whole plane of a 2-D image or the whole volume (`whole`
+    /// true), at a level of about a million (four million) pixels or voxels.
+    #[pyo3(signature = (channel = 0, *, bins = 256, range = None, whole = false, layer = None))]
+    fn histogram<'py>(
+        &self,
+        py: Python<'py>,
+        channel: usize,
+        bins: usize,
+        range: Option<(f64, f64)>,
+        whole: bool,
+        layer: Option<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let i = self.layer_index(layer)?;
+        let h = self
+            .inner
+            .histogram(i, channel, bins, range, whole)
+            .map_err(err)?;
+        let d = PyDict::new(py);
+        let step = (h.hi - h.lo) / h.counts.len() as f64;
+        let edges: Vec<f64> = (0..=h.counts.len())
+            .map(|k| h.lo + k as f64 * step)
+            .collect();
+        d.set_item("counts", h.counts)?;
+        d.set_item("edges", edges)?;
+        d.set_item("lo", h.lo)?;
+        d.set_item("hi", h.hi)?;
+        d.set_item("level", h.level)?;
+        Ok(d)
+    }
+
     /// Whether volume and isosurface projections are lit from their gradients.
     #[getter]
     fn shading(&self) -> bool {
@@ -417,8 +469,11 @@ impl Viewer {
 
     /// Change channel `index`'s display (of the current layer, or `layer`); arguments
     /// left out stay. `lut` names a colour map (`COLOUR_MAPS`); "" goes back to the
-    /// colour.
-    #[pyo3(signature = (index, *, color = None, lut = None, lo = None, hi = None, gamma = None, visible = None, label = None, layer = None))]
+    /// colour. `opacity`: the volume projection's opacity curve over the contrast
+    /// window, points (x, y) in 0..1 with x rising ([] goes back to a straight rise).
+    /// `iso`: the isosurface level, a stored value (nan goes back to the middle of the
+    /// contrast window).
+    #[pyo3(signature = (index, *, color = None, lut = None, lo = None, hi = None, gamma = None, visible = None, label = None, opacity = None, iso = None, layer = None))]
     #[allow(clippy::too_many_arguments)]
     fn set_channel(
         &mut self,
@@ -430,6 +485,8 @@ impl Viewer {
         gamma: Option<f64>,
         visible: Option<bool>,
         label: Option<String>,
+        opacity: Option<Vec<(f64, f64)>>,
+        iso: Option<f64>,
         layer: Option<usize>,
     ) -> PyResult<()> {
         let i = self.layer_index(layer)?;
@@ -449,6 +506,12 @@ impl Viewer {
         d.visible = visible.unwrap_or(d.visible);
         if let Some(l) = label {
             d.label = l;
+        }
+        if let Some(pts) = opacity {
+            d.opacity = (!pts.is_empty()).then(|| pts.iter().map(|&(x, y)| [x, y]).collect());
+        }
+        if let Some(v) = iso {
+            d.iso = (!v.is_nan()).then_some(v);
         }
         self.inner.set_channel(i, index, d).map_err(err)
     }

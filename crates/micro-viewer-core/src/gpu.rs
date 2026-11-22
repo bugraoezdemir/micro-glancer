@@ -124,6 +124,10 @@ pub struct ChannelGpu {
     pub hi: f32,
     pub active: u32,
     pub lut: u32,
+    /// Isosurfaces: the level, when `has_iso` (else the middle of the contrast window).
+    pub iso: f32,
+    pub has_iso: u32,
+    pub _pad: [u32; 2],
 }
 
 /// Entries of a colour map row.
@@ -182,6 +186,8 @@ struct BrickAtlas {
     slots: u32,
     pages: wgpu::Buffer,
     levels: wgpu::Buffer,
+    /// Per slot: the lowest and highest value its brick holds (to skip empty bricks).
+    ranges: wgpu::Buffer,
     bind: Option<wgpu::BindGroup>,
 }
 
@@ -491,7 +497,7 @@ impl Gpu {
                 }),
                 storage(&self.device, "pages", 4),
                 storage(&self.device, "levels", 48),
-                storage(&self.device, "channels", 32),
+                storage(&self.device, "channels", 48),
                 lut_texture(&self.device, 1),
                 None,
             ),
@@ -598,7 +604,12 @@ impl Gpu {
             atlas,
             slots: layers * bricks::PER_LAYER,
             pages: storage(&self.device, "brick pages", 4),
-            levels: storage(&self.device, "brick levels", 96),
+            levels: storage(&self.device, "brick levels", 112),
+            ranges: storage(
+                &self.device,
+                "brick ranges",
+                layers as u64 * bricks::PER_LAYER as u64 * 8,
+            ),
             bind: None,
         };
         let slots = made.slots;
@@ -645,6 +656,16 @@ impl Gpu {
                 depth_or_array_layers: 1,
             },
         );
+    }
+
+    /// The lowest and highest value of the brick in layer `id`'s slot `slot`.
+    pub fn write_brick_range(&self, id: u16, slot: u32, range: (f32, f32)) {
+        let Some(b) = self.planes.get(&id).and_then(|p| p.bricks.as_ref()) else {
+            return;
+        };
+        let data = [range.0, range.1];
+        self.queue
+            .write_buffer(&b.ranges, slot as u64 * 8, bytemuck::cast_slice(&data));
     }
 
     /// Layer `id`'s brick page table (as [`Gpu::write_pages`]).
@@ -764,6 +785,48 @@ impl Gpu {
                     },
                 ],
             });
+        // bricks: their value ranges too (binding 7)
+        let layout = if kind == KIND_FLAT {
+            layout
+        } else {
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("bricks"),
+                    entries: &[
+                        buffer(0, wgpu::BufferBindingType::Uniform),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type,
+                                view_dimension: wgpu::TextureViewDimension::D2Array,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        buffer(2, read_only),
+                        buffer(3, read_only),
+                        buffer(4, read_only),
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 5,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 6,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                        buffer(7, read_only),
+                    ],
+                })
+        };
         let pl = self
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1032,6 +1095,10 @@ impl Gpu {
                     wgpu::BindGroupEntry {
                         binding: 6,
                         resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: b.ranges.as_entire_binding(),
                     },
                 ],
             }));
