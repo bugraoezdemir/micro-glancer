@@ -17,6 +17,11 @@ reading are Rust (the crate `micro-viewer-core`); Python gets a small API and a 
 - Move through z and t. The image opens at omero's default z and t. The planes next to
   the current one are read ahead, so stepping is quick.
 - Turn the view.
+- Cut a volume (an image with z) by a plane at any angle: look along y or x (XZ, YZ),
+  or turn the plane freely through the volume. Voxels show as they are (the nearest
+  one), or smoothly between voxel centres (trilinear), per layer. Anisotropic voxels
+  are placed by their physical size. z is shared by all layers: the plane cuts every
+  volume where it is in the world.
 - Open several images as layers in one view. They add up, each can be hidden or made
   fainter, and each can be moved and turned by hand, for example to line two images up
   before a registration tool refines it.
@@ -43,9 +48,14 @@ Drag to pan, scroll to zoom at the pointer, press F to fit, and press Page Up or
 Down to move through z (with Shift: t). Shift + scroll turns the view; [ and ] turn it
 by 90 degrees, 0 turns it back.
 
+For a volume, Alt + drag turns the plane through it, and 1, 2 and 3 look along z, y and
+x. Page Up and Page Down move the plane one voxel along the view, and I switches
+trilinear sampling on and off.
+
 With several images, Tab picks the current layer. Ctrl + drag moves it, Ctrl + scroll
 turns it (1 degree a notch, with Shift 0.1), Ctrl + arrow keys nudge it by a pixel,
-Ctrl + 0 puts it back, and Ctrl + S saves its transform into its image. Two one-channel
+Ctrl + 0 puts it back, Ctrl + Alt + drag tilts a volume, and Ctrl + S saves its
+transform into its image. Two one-channel
 images open in green and magenta. The status bar shows the current layer, its plane,
 level and transform, and the values under the pointer.
 
@@ -71,6 +81,13 @@ v.move_layer(40, -10)           # move it (screen pixels)
 print(v.transform_matrix())     # the NGFF affine over the image's axes
 save_transform(v)               # into moving.ome.zarr
 state = v.view_state()          # JSON
+
+v.open("stack.ome.zarr")        # a volume
+v.set_orientation("xz")         # look along y: x right, z down
+v.turn(30, 20)                  # turn the plane through the volume (degrees)
+v.set_interpolation("linear")   # trilinear between voxel centres
+v.step_depth(5)                 # move the plane 5 voxels along the view
+print(v.pick(512, 384)["voxel"])  # the voxel (x, y, z) under the centre
 ```
 
 In Qt, `micro_viewer.qt.ViewerWidget` shows the layers. It emits `viewChanged` when the
@@ -94,7 +111,8 @@ python bench/harness.py DIR [IMAGE ...]
 
 The harness measures, on a 3840 x 2160 target: the time until the view is sharp after
 opening, after a jump and after a step in z or t, and the frames per second of cached pan
-and zoom.
+and zoom. For volumes also: the time until sharp after turning the plane through the
+volume, and the frames per second on the turned plane, cached and while turning on.
 
 `scratch/inspect_mv.py` is eubi's Inspect page with micro-viewer in its Viewer tab, to
 try the viewer inside eubi without changing eubi.

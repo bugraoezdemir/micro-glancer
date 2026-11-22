@@ -9,6 +9,10 @@
 //!
 //! World coordinates follow NGFF: a level's matrix maps a pixel's index to the world
 //! position of the pixel's centre. A world point shows the pixel whose centre is nearest.
+//!
+//! The axis right before y, when it is spatial (type "space", or named "z") and not the
+//! channel axis, is the image's z: such an image is a volume, placed in 3-D by its
+//! matrix's x, y and z rows and columns, and can be cut by planes at any angle.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -19,6 +23,7 @@ use dyna_zarr_arrays::{read, Cast, DType, Source as _, SourceRef};
 use ome_zarr_pyramid::Image;
 use serde_json::Value;
 
+use crate::geom::Affine3;
 use crate::ViewerError;
 
 fn err(e: impl std::fmt::Display) -> ViewerError {
@@ -202,6 +207,11 @@ pub struct Level {
     pub to_index: Affine2,
     /// World units per pixel (the square root of the plane's area scale).
     pub pixel: f64,
+    /// Index (x, y, z) to world (x, y, z) and back; z is the identity for a 2-D image.
+    pub to_world3: Affine3,
+    pub to_index3: Affine3,
+    /// Voxels along z (1 for a 2-D image).
+    pub depth: u64,
     /// Per axis: index to world scale and translation (used for the axes before y, x).
     lead: Vec<(f64, f64)>,
 }
@@ -221,6 +231,8 @@ pub struct Source {
     pub axes: Vec<String>,
     pub levels: Vec<Level>,
     pub channel_axis: Option<usize>,
+    /// The z axis (see the module's notes), if the image is a volume.
+    pub z_axis: Option<usize>,
     /// The axes before y and x other than the channel axis (z, t, ...).
     pub plane_axes: Vec<usize>,
     pub channels: Vec<ChannelInfo>,
@@ -329,6 +341,14 @@ impl Source {
         }
         let axes: Vec<String> = ms.axes.iter().map(|a| a.name.clone()).collect();
         let (y, x) = (n - 2, n - 1);
+        let channel_axis = ms.axes[..y]
+            .iter()
+            .position(|a| a.kind.as_deref() == Some("channel"))
+            .or_else(|| ms.axes[..y].iter().position(|a| a.name == "c"));
+        let z_axis = (n >= 3)
+            .then_some(n - 3)
+            .filter(|&a| Some(a) != channel_axis)
+            .filter(|&a| ms.axes[a].kind.as_deref() == Some("space") || ms.axes[a].name == "z");
         let mut levels = Vec::new();
         let mut texel = None;
         let mut dtype_name = String::new();
@@ -378,10 +398,29 @@ impl Source {
                     lv.path
                 ))
             })?;
+            let to_world3 = match z_axis {
+                None => Affine3::from_2d(&to_world),
+                Some(z) => Affine3 {
+                    m: [
+                        [m.get(x, x), m.get(x, y), m.get(x, z), m.get(x, n)],
+                        [m.get(y, x), m.get(y, y), m.get(y, z), m.get(y, n)],
+                        [m.get(z, x), m.get(z, y), m.get(z, z), m.get(z, n)],
+                    ],
+                },
+            };
+            let to_index3 = to_world3.inverse().ok_or_else(|| {
+                err(format!(
+                    "level {:?}: its z-y-x placement cannot be inverted",
+                    lv.path
+                ))
+            })?;
             levels.push(Level {
                 path: lv.path.clone(),
                 width: shape[x],
                 height: shape[y],
+                depth: z_axis.map_or(1, |z| shape[z]),
+                to_world3,
+                to_index3,
                 shape,
                 array,
                 pixel: to_world.det().abs().sqrt(),
@@ -391,10 +430,6 @@ impl Source {
             });
         }
         let texel = texel.ok_or_else(|| err("the image has no levels"))?;
-        let channel_axis = ms.axes[..y]
-            .iter()
-            .position(|a| a.kind.as_deref() == Some("channel"))
-            .or_else(|| ms.axes[..y].iter().position(|a| a.name == "c"));
         let plane_axes: Vec<usize> = (0..y).filter(|&a| Some(a) != channel_axis).collect();
         let nc = channel_axis.map_or(1, |c| levels[0].shape[c] as usize);
         let omero = image.omero.as_ref();
@@ -432,6 +467,7 @@ impl Source {
             .map(|m| m.rows());
         Ok(Self {
             aligned,
+            z_axis,
             axes,
             levels,
             channel_axis,
@@ -487,6 +523,41 @@ impl Source {
         let mut stop: Vec<u64> = start.iter().map(|i| i + 1).collect();
         start.extend([ty, tx]);
         stop.extend([ty + h, tx + w]);
+        (start, stop)
+    }
+
+    /// The volume's lead indices at `level` without z (its other plane axes, the channel
+    /// axis at 0) and their id: what a brick shares with its neighbours in z.
+    pub fn lead(&self, level: usize, position: &[f64]) -> (Vec<u64>, u64) {
+        let (mut idx, _) = self.plane(level, position);
+        if let Some(z) = self.z_axis {
+            idx[z] = 0;
+        }
+        let mut h = DefaultHasher::new();
+        (idx.clone(), 1u8).hash(&mut h);
+        (idx, h.finish())
+    }
+
+    /// A brick's region: z `z0 .. z1`, rows `y0 .. y1`, columns `x0 .. x1` of channel
+    /// `channel` (lead indices from [`Source::lead`]).
+    pub fn region3(
+        &self,
+        lead: &[u64],
+        channel: usize,
+        z: (u64, u64),
+        y: (u64, u64),
+        x: (u64, u64),
+    ) -> (Vec<u64>, Vec<u64>) {
+        let za = self.z_axis.expect("a volume");
+        let mut start = lead.to_vec();
+        if let Some(c) = self.channel_axis {
+            start[c] = channel as u64;
+        }
+        let mut stop: Vec<u64> = start.iter().map(|i| i + 1).collect();
+        start[za] = z.0;
+        stop[za] = z.1;
+        start.extend([y.0, x.0]);
+        stop.extend([y.1, x.1]);
         (start, stop)
     }
 

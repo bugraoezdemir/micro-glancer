@@ -269,9 +269,9 @@ def test_the_view_state_keeps_layers_and_turns(stores):
     a.current = 0
     state = a.view_state()
     doc = json.loads(state)
-    assert doc["version"] == 2 and doc["current"] == 0 and len(doc["layers"]) == 2
+    assert doc["version"] == 3 and doc["current"] == 0 and len(doc["layers"]) == 2
     assert doc["camera"]["rotation"] == pytest.approx(30.0)
-    assert doc["layers"][1]["transform"][0] == pytest.approx([0.9, -0.2, 30.0])
+    assert doc["layers"][1]["transform"][0] == pytest.approx([0.9, -0.2, 0.0, 30.0])
     assert doc["layers"][0]["channels"][0]["lut"] == "magma"
     b = Viewer.offscreen(300, 200)
     b.set_view_state(state)

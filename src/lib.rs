@@ -68,6 +68,18 @@ fn rows(t: &core::Affine2) -> Vec<Vec<f64>> {
     t.m.iter().map(|r| r.to_vec()).collect()
 }
 
+fn rows3(t: &core::Affine3) -> Vec<Vec<f64>> {
+    t.m.iter().map(|r| r.to_vec()).collect()
+}
+
+fn mode_name(m: core::Mode) -> &'static str {
+    match m {
+        core::Mode::Flat => "flat",
+        core::Mode::Volume => "volume",
+        core::Mode::Off => "off",
+    }
+}
+
 fn finite(v: &[f64]) -> PyResult<()> {
     if v.iter().all(|x| x.is_finite()) {
         Ok(())
@@ -183,7 +195,11 @@ impl Viewer {
             d.set_item("axes", &l.source().axes)?;
             d.set_item("visible", l.visible)?;
             d.set_item("opacity", l.opacity)?;
-            d.set_item("transform", rows(&l.transform()))?;
+            d.set_item("transform", rows(&l.transform().to_2d()))?;
+            d.set_item("transform_3d", rows3(&l.transform()))?;
+            d.set_item("volume", l.is_volume())?;
+            d.set_item("mode", mode_name(l.mode(&self.inner.camera)))?;
+            d.set_item("interpolation", if l.linear { "linear" } else { "nearest" })?;
             d.set_item("position", l.position())?;
             d.set_item("channels", channel_list(py, l.channels())?)?;
             d.set_item("level", l.level_for(scale))?;
@@ -276,14 +292,14 @@ impl Viewer {
     /// Degrees the image appears turned clockwise (0 <= rotation < 360).
     #[getter]
     fn rotation(&self) -> f64 {
-        self.inner.camera.rotation
+        self.inner.camera.rotation()
     }
 
     /// Turn the view to `degrees` about the centre.
     fn set_rotation(&mut self, degrees: f64) -> PyResult<()> {
         finite(&[degrees])?;
         let (w, h) = self.inner.size();
-        let by = degrees - self.inner.camera.rotation;
+        let by = degrees - self.inner.camera.rotation();
         self.inner.rotate(by, w as f64 / 2.0, h as f64 / 2.0);
         Ok(())
     }
@@ -392,26 +408,23 @@ impl Viewer {
     #[pyo3(signature = (layer = None))]
     fn transform(&self, layer: Option<usize>) -> PyResult<Vec<Vec<f64>>> {
         let i = self.layer_index(layer)?;
-        Ok(rows(&self.inner.layer(i).map_err(err)?.transform()))
+        Ok(rows(&self.inner.layer(i).map_err(err)?.transform().to_2d()))
     }
 
-    /// Set a layer's transform: [[a, b, tx], [c, d, ty]] over (x, y).
+    /// A layer's whole transform as the 3-D affine over (x, y, z): 3 rows of 4.
+    #[pyo3(signature = (layer = None))]
+    fn transform_3d(&self, layer: Option<usize>) -> PyResult<Vec<Vec<f64>>> {
+        let i = self.layer_index(layer)?;
+        Ok(rows3(&self.inner.layer(i).map_err(err)?.transform()))
+    }
+
+    /// Set a layer's transform: 2 rows of 3 over (x, y) ([[a, b, tx], [c, d, ty]]), or
+    /// 3 rows of 4 over (x, y, z). A 2-D image moves and turns in its plane only.
     #[pyo3(signature = (matrix, layer = None))]
     fn set_transform(&mut self, matrix: Vec<Vec<f64>>, layer: Option<usize>) -> PyResult<()> {
         let i = self.layer_index(layer)?;
-        let ok = matrix.len() == 2 && matrix.iter().all(|r| r.len() == 3);
-        if !ok {
-            return Err(ViewerError::new_err(
-                "a transform is 2 rows of 3: [[a, b, tx], [c, d, ty]]",
-            ));
-        }
-        let m = [
-            [matrix[0][0], matrix[0][1], matrix[0][2]],
-            [matrix[1][0], matrix[1][1], matrix[1][2]],
-        ];
-        self.inner
-            .set_transform(i, core::Affine2 { m })
-            .map_err(err)
+        let t = core::parse_transform(&matrix).map_err(err)?;
+        self.inner.set_transform(i, t).map_err(err)
     }
 
     /// Take a layer back to where its image places it (the identity transform).
@@ -419,7 +432,7 @@ impl Viewer {
     fn reset_transform(&mut self, layer: Option<usize>) -> PyResult<()> {
         let i = self.layer_index(layer)?;
         self.inner
-            .set_transform(i, core::Affine2::IDENTITY)
+            .set_transform(i, core::Affine3::IDENTITY)
             .map_err(err)
     }
 
@@ -431,20 +444,139 @@ impl Viewer {
         self.inner.move_layer(i, dx, dy).map_err(err)
     }
 
-    /// Turn a layer by `degrees` (clockwise on an unturned view) about world point
-    /// `about` (x, y), by default the image's centre.
+    /// Turn a layer by `degrees` about the view's normal (clockwise on screen; a 2-D
+    /// image about z) through world point `about` ((x, y) or (x, y, z)), by default the
+    /// image's centre.
     #[pyo3(signature = (degrees, about = None, layer = None))]
     fn rotate_layer(
         &mut self,
         degrees: f64,
-        about: Option<(f64, f64)>,
+        about: Option<Vec<f64>>,
         layer: Option<usize>,
     ) -> PyResult<()> {
         finite(&[degrees])?;
         let i = self.layer_index(layer)?;
+        let about = match about.as_deref() {
+            None => None,
+            Some([x, y]) => {
+                let c = self.inner.layer(i).map_err(err)?.centre();
+                Some([*x, *y, c[2]])
+            }
+            Some([x, y, z]) => Some([*x, *y, *z]),
+            Some(_) => return Err(ViewerError::new_err("about is (x, y) or (x, y, z)")),
+        };
+        self.inner.rotate_layer(i, degrees, about).map_err(err)
+    }
+
+    /// Tilt a volume layer: `yaw` degrees about the screen's down axis and `pitch`
+    /// degrees about its right axis, through the image's centre.
+    #[pyo3(signature = (yaw, pitch, layer = None))]
+    fn turn_layer(&mut self, yaw: f64, pitch: f64, layer: Option<usize>) -> PyResult<()> {
+        finite(&[yaw, pitch])?;
+        let i = self.layer_index(layer)?;
+        self.inner.turn_layer(i, yaw, pitch).map_err(err)
+    }
+
+    /// Volumes: "nearest" (the voxel whose centre is nearest) or "linear" (trilinear
+    /// between voxel centres) for a layer cut at an angle.
+    #[pyo3(signature = (mode, layer = None))]
+    fn set_interpolation(&mut self, mode: &str, layer: Option<usize>) -> PyResult<()> {
+        let i = self.layer_index(layer)?;
+        let linear = match mode {
+            "linear" => true,
+            "nearest" => false,
+            _ => {
+                return Err(ViewerError::new_err(format!(
+                    "interpolation {mode:?}: \"nearest\" or \"linear\""
+                )))
+            }
+        };
+        self.inner.set_linear(i, linear).map_err(err)
+    }
+
+    /// The view's orientation: the screen's right and down directions and the view's
+    /// normal, as world unit vectors (3 rows of 3).
+    #[getter]
+    fn orientation(&self) -> Vec<Vec<f64>> {
+        let c = &self.inner.camera;
+        vec![c.right.to_vec(), c.down.to_vec(), c.normal().to_vec()]
+    }
+
+    /// Set the view's orientation from the screen's right and down directions in the
+    /// world (made unit and perpendicular), or by name: "xy" (along z), "xz" (x right, z
+    /// down), "yz" (z right, y down). The world point at the centre stays.
+    #[pyo3(signature = (right, down = None))]
+    fn set_orientation(
+        &mut self,
+        right: &Bound<'_, PyAny>,
+        down: Option<(f64, f64, f64)>,
+    ) -> PyResult<()> {
+        if let Ok(name) = right.extract::<String>() {
+            return self.inner.look_along(&name).map_err(err);
+        }
+        let r: (f64, f64, f64) = right.extract()?;
+        let d =
+            down.ok_or_else(|| ViewerError::new_err("set_orientation(right, down) needs both"))?;
         self.inner
-            .rotate_layer(i, degrees, about.map(|(x, y)| [x, y]))
+            .set_orientation([r.0, r.1, r.2], [d.0, d.1, d.2])
             .map_err(err)
+    }
+
+    /// Turn the view's plane: `yaw` degrees about the screen's down axis, `pitch` degrees
+    /// about its right axis, keeping the world point under screen (`x`, `y`) (the centre
+    /// by default).
+    #[pyo3(signature = (yaw, pitch, x = None, y = None))]
+    fn turn(&mut self, yaw: f64, pitch: f64, x: Option<f64>, y: Option<f64>) -> PyResult<()> {
+        finite(&[yaw, pitch])?;
+        let (w, h) = self.inner.size();
+        self.inner.turn(
+            yaw,
+            pitch,
+            x.unwrap_or(w as f64 / 2.0),
+            y.unwrap_or(h as f64 / 2.0),
+        );
+        Ok(())
+    }
+
+    /// Move the view's plane by `steps` voxels of the current layer along the view's
+    /// normal (along z: one plane per step).
+    #[pyo3(signature = (steps = 1.0))]
+    fn step_depth(&mut self, steps: f64) -> PyResult<()> {
+        finite(&[steps])?;
+        self.inner.step_depth(steps).map_err(err)
+    }
+
+    /// The world point (x, y, z) at the view's centre.
+    #[getter]
+    fn center_3d(&self) -> (f64, f64, f64) {
+        let c = self.inner.camera.center;
+        (c[0], c[1], c[2])
+    }
+
+    /// Put world point (`x`, `y`, `z`) at the view's centre, `scale` world units per
+    /// pixel.
+    fn look_at_3d(&mut self, x: f64, y: f64, z: f64, scale: f64) -> PyResult<()> {
+        if !(scale > 0.0 && scale.is_finite() && x.is_finite() && y.is_finite() && z.is_finite()) {
+            return Err(ViewerError::new_err(format!(
+                "a view centred at ({x}, {y}, {z}) with scale {scale}"
+            )));
+        }
+        self.inner.look_at_3d([x, y, z], scale);
+        Ok(())
+    }
+
+    /// The world point (x, y, z) at screen pixel (`x`, `y`).
+    fn screen_to_world_3d(&self, x: f64, y: f64) -> (f64, f64, f64) {
+        let w = self.inner.screen_to_world_3d(x, y);
+        (w[0], w[1], w[2])
+    }
+
+    /// Bricks a volume layer's brick atlas holds (0 before a plane at an angle needed
+    /// them).
+    #[pyo3(signature = (layer = None))]
+    fn brick_slots(&self, layer: Option<usize>) -> PyResult<u32> {
+        let i = self.layer_index(layer)?;
+        self.inner.brick_slots(i).map_err(err)
     }
 
     /// A layer's transform as an NGFF affine over its image's axes: n rows of n + 1
@@ -474,11 +606,10 @@ impl Viewer {
         let (w, h) = self.inner.size();
         let mut cam = self.inner.camera;
         cam.scale = scale;
-        cam.center = [0.0, 0.0];
-        let (dx, dy) = cam
-            .screen_to_world(w, h)
-            .linear(w as f64 / 2.0, h as f64 / 2.0);
-        self.inner.look_at([x + dx, y + dy], scale);
+        cam.center = [0.0, 0.0, 0.0];
+        // the top-left corner's offset from the centre
+        let o = cam.plane(w, h).origin;
+        self.inner.look_at([x - o[0], y - o[1]], scale);
         Ok(())
     }
 
@@ -607,9 +738,10 @@ impl Viewer {
     fn pick<'py>(&self, py: Python<'py>, x: f64, y: f64) -> PyResult<Bound<'py, PyDict>> {
         let p = self.inner.pick(x, y).map_err(err)?;
         let d = PyDict::new(py);
-        d.set_item("world", (p.world[0], p.world[1]))?;
+        d.set_item("world", (p.world[0], p.world[1], p.world[2]))?;
         let layers = PyList::empty(py);
         let mut current = (None, PyList::empty(py));
+        let mut current_voxel = None;
         for lp in p.layers {
             let values = PyList::empty(py);
             for v in &lp.values {
@@ -620,16 +752,20 @@ impl Viewer {
                 values.append(e)?;
             }
             let pixel = lp.pixel.map(|q| (q[0], q[1]));
+            let voxel = lp.voxel.map(|q| (q[0], q[1], q[2]));
             if lp.layer == self.inner.current() {
                 current = (pixel, values.clone());
+                current_voxel = voxel;
             }
             let l = PyDict::new(py);
             l.set_item("layer", lp.layer)?;
             l.set_item("pixel", pixel)?;
+            l.set_item("voxel", voxel)?;
             l.set_item("values", values)?;
             layers.append(l)?;
         }
         d.set_item("pixel", current.0)?;
+        d.set_item("voxel", current_voxel)?;
         d.set_item("values", current.1)?;
         d.set_item("layers", layers)?;
         Ok(d)

@@ -15,7 +15,7 @@ use dyna_zarr_arrays::SourceRef;
 use crate::blocks::Blocks;
 use crate::tiles::TileKey;
 
-/// One tile to read: the level's array and the region.
+/// One tile or brick to read: the level's array and the region.
 pub struct Request {
     pub key: TileKey,
     /// The image's generation (set by the loader).
@@ -23,6 +23,16 @@ pub struct Request {
     pub array: SourceRef,
     pub start: Vec<u64>,
     pub stop: Vec<u64>,
+}
+
+impl Request {
+    fn spatial(&self) -> usize {
+        if self.key.brick {
+            3
+        } else {
+            2
+        }
+    }
 }
 
 /// A tile read (or why it could not be).
@@ -90,10 +100,36 @@ fn work(shared: Arc<Shared>, tx: Sender<Loaded>, notify: Wakeup, slow: std::time
                 q = shared.ready.wait(q).expect("loader queue");
             }
         };
-        let w = (r.stop[r.stop.len() - 1] - r.start[r.start.len() - 1]) as u32;
-        let h = (r.stop[r.stop.len() - 2] - r.start[r.start.len() - 2]) as u32;
+        let n = r.start.len();
+        let mut w = (r.stop[n - 1] - r.start[n - 1]) as u32;
+        let mut h = (r.stop[n - 2] - r.start[n - 2]) as u32;
         let t0 = std::time::Instant::now();
-        let data = shared.blocks.read(r.gen, &r.array, &r.start, &r.stop);
+        // a panic while reading (a bug, or a backend's) becomes this tile's error: the
+        // thread lives on and the tile stays missing
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shared
+                .blocks
+                .read(r.gen, &r.array, &r.start, &r.stop, r.spatial())
+        }));
+        let mut data = read.unwrap_or_else(|p| {
+            let why = p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown".into());
+            Err(format!(
+                "reading {:?} .. {:?} failed: {why}",
+                r.start, r.stop
+            ))
+        });
+        if r.key.brick {
+            // laid out for the brick atlas: a strip of its planes side by side
+            let d = (r.stop[n - 3] - r.start[n - 3]) as usize;
+            let item = r.array.dtype().size();
+            data = data.map(|b| crate::bricks::strip(&b, d, h as usize, w as usize, item));
+            w = crate::bricks::STRIP_W;
+            h = crate::bricks::BRICK;
+        }
         if !slow.is_zero() {
             std::thread::sleep(slow);
         }

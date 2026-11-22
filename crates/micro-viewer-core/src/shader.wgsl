@@ -20,7 +20,8 @@ struct Params {
     // what the layer draws where it has nothing (the background for a lone opaque layer)
     outside: vec4<f32>,
     opacity: f32,
-    _p0: f32,
+    // (volumes only)
+    linear: u32,
     _p1: f32,
     _p2: f32,
 }

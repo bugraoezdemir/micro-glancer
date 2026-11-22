@@ -2,17 +2,27 @@
 //! cache, hosted by any toolkit that can hand over a native window, or read back
 //! off-screen. No Qt and no Python here: the bindings and the widget live outside.
 //!
-//! 2D viewer (tasks V7, V9): layers, each an image placed in a shared world by its own
-//! levels and a transform of its own (moved and turned by hand, saved to the image);
-//! every level of an image, the finest worth drawing chosen per frame from the zoom,
-//! coarser (or finer) cached tiles standing in while tiles load; tiles read in the
-//! background, centre first, a ring around and the next and previous plane when the
-//! cache has room, and from coarser levels while the view moves when reading is slow;
-//! channels with colour or colour map, contrast and gamma, added up; layers added up;
-//! the camera turned; the plane chosen on the axes before y and x; picking; the view as
-//! JSON.
+//! The view (tasks V7, V9, V4): layers, each an image placed in a shared 3-D world by
+//! its own levels and a transform of its own (moved and turned by hand, saved to the
+//! image); a camera with a centre, a scale and an orientation, so the view is a plane at
+//! any angle.
+//!
+//! - Flat: a 2-D image, or a volume seen along z (the plane cuts its z planes), is drawn
+//!   from 2-D tiles of the plane: every level, the finest worth drawing chosen per frame
+//!   from the zoom, coarser (or finer) cached tiles standing in while tiles load; tiles
+//!   read in the background, centre first, a ring around and the next and previous plane
+//!   when the cache has room.
+//! - Volume: a volume cut at an angle (or seen along x or y) is drawn from bricks (3-D
+//!   pieces, [`bricks`]) the plane cuts, nearest voxel or trilinear.
+//!
+//! Both read from coarser levels while the view moves when reading is slow. Channels with
+//! colour or colour map, contrast and gamma, added up; layers added up; picking; the view
+//! as JSON. z is a world coordinate shared by all layers (the camera's centre); a layer's
+//! z index is where the camera's plane cuts it.
 
 mod blocks;
+mod bricks;
+mod geom;
 mod gpu;
 mod loader;
 mod luts;
@@ -24,15 +34,17 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use geom::{add, cross, dot, mul, norm, sub, turn, unit};
+pub use geom::{Affine3, Plane3, V3};
 pub use gpu::GpuOptions;
-use gpu::{ChannelGpu, FrameParams, Gpu, LevelGpu, LUT_SIZE, MISSING};
+use gpu::{ChannelGpu, Draw, FrameParams, Gpu, LevelGpu, LevelGpu3, LUT_SIZE, MISSING};
 use loader::{Loaded, Loader, Request};
 pub use luts::NAMES as COLOUR_MAPS;
 pub use raw_window_handle;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 pub use source::{Affine2, ChannelInfo, Level, Source, Texel};
 use tiles::{Cache, TileKey, TILE};
-pub use view::ViewState;
+pub use view::{parse_transform, ViewState};
 
 /// The coordinate system a layer's transform is saved into (NGFF 0.6): an edge from the
 /// image's own coordinate system to this one. Opening an image that has such an edge
@@ -48,6 +60,9 @@ const MOVING_FRAMES: u64 = 4;
 /// The reading time (seconds, all reading threads together) a frame's missing tiles may
 /// take while the view moves before coarser levels are read instead.
 const MOVE_BUDGET: f64 = 0.15;
+/// The most bricks a level's page table holds (per channel); finer levels of larger
+/// volumes are not drawn as volumes (coarser ones stand in).
+const BRICK_PAGES_MAX: u64 = 1 << 22;
 
 /// Something the viewer cannot do as asked; the message says why.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,7 +83,7 @@ fn verr(msg: impl Into<String>) -> ViewerError {
 /// What a frame showed (all visible layers together; `level` is the current layer's).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FrameStats {
-    /// Tiles of the frame's levels in view (all active channels).
+    /// Tiles (or bricks) of the frame's levels in view (all active channels).
     pub visible: u32,
     /// Tiles uploaded for this frame.
     pub loaded: u32,
@@ -84,28 +99,93 @@ pub struct FrameStats {
     pub deferred: bool,
 }
 
-/// The camera: the world point (x, y) at the target's centre, the world units per
-/// screen pixel and the turn in degrees (the image appears turned clockwise by it).
+/// The camera: the world point at the target's centre, the world units per screen
+/// pixel, and the screen's right and down directions in the world (unit vectors; the
+/// camera looks along right x down).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Camera {
-    pub center: [f64; 2],
+    pub center: V3,
     pub scale: f64,
-    pub rotation: f64,
+    pub right: V3,
+    pub down: V3,
 }
 
 impl Camera {
-    /// Screen pixel (x, y) of a `w` x `h` target to world (x, y).
+    fn new() -> Self {
+        Camera {
+            center: [0.0; 3],
+            scale: 1.0,
+            right: [1.0, 0.0, 0.0],
+            down: [0.0, 1.0, 0.0],
+        }
+    }
+
+    /// The direction the camera looks along.
+    pub fn normal(&self) -> V3 {
+        cross(self.right, self.down)
+    }
+
+    /// The plane the screen shows: screen pixel (sx, sy) to world (x, y, z).
+    pub fn plane(&self, w: u32, h: u32) -> Plane3 {
+        let ux = mul(self.right, self.scale);
+        let uy = mul(self.down, self.scale);
+        Plane3 {
+            origin: sub(
+                self.center,
+                add(mul(ux, w as f64 / 2.0), mul(uy, h as f64 / 2.0)),
+            ),
+            ux,
+            uy,
+        }
+    }
+
+    /// Screen pixel (x, y) to world (x, y) (exact for a view along z).
     pub fn screen_to_world(&self, w: u32, h: u32) -> Affine2 {
-        let (s, c) = self.rotation.to_radians().sin_cos();
-        let k = self.scale;
-        // world = center + k * turn(-rotation) * (p - size / 2)
-        let (a, b, d, e) = (k * c, k * s, -k * s, k * c);
-        let (hx, hy) = (w as f64 / 2.0, h as f64 / 2.0);
-        Affine2 {
-            m: [
-                [a, b, self.center[0] - a * hx - b * hy],
-                [d, e, self.center[1] - d * hx - e * hy],
-            ],
+        self.plane(w, h).to_2d()
+    }
+
+    /// Whether the camera looks along z (any turn about z).
+    pub fn is_flat(&self) -> bool {
+        self.normal()[2].abs() > 1.0 - 1e-9
+    }
+
+    /// The turn about the view's normal, degrees (0 .. 360): the image appears turned
+    /// clockwise by it (measured as for a view along z).
+    pub fn rotation(&self) -> f64 {
+        (-self.right[1])
+            .atan2(self.right[0])
+            .to_degrees()
+            .rem_euclid(360.0)
+            .min(360.0 - 1e-12)
+    }
+
+    /// Turn the image clockwise by `degrees` about the view's normal.
+    fn roll(&mut self, degrees: f64) {
+        let n = self.normal();
+        self.right = turn(self.right, n, -degrees);
+        self.down = turn(self.down, n, -degrees);
+        self.tidy();
+    }
+
+    /// Turn the camera: `yaw` degrees about the screen's down axis, `pitch` degrees about
+    /// its right axis.
+    fn turn(&mut self, yaw: f64, pitch: f64) {
+        self.right = turn(self.right, self.down, yaw);
+        self.down = turn(self.down, self.right, pitch);
+        self.tidy();
+    }
+
+    /// Unit, perpendicular directions again (drift from many small turns).
+    fn tidy(&mut self) {
+        self.right = unit(self.right);
+        self.down = unit(sub(self.down, mul(self.right, dot(self.down, self.right))));
+        // snap tiny components (a view along z stays exactly along z)
+        for v in [&mut self.right, &mut self.down] {
+            for c in v.iter_mut() {
+                if c.abs() < 1e-12 {
+                    *c = 0.0;
+                }
+            }
         }
     }
 }
@@ -139,14 +219,38 @@ pub struct LayerPick {
     pub layer: usize,
     /// The level-0 pixel (x, y) whose centre is nearest, if inside the image.
     pub pixel: Option<[u64; 2]>,
+    /// For a volume: the level-0 voxel (x, y, z) whose centre is nearest, if inside.
+    pub voxel: Option<[u64; 3]>,
     pub values: Vec<PickedValue>,
 }
 
 /// What lies under a screen point: the world point and every layer's pixel and values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pick {
-    pub world: [f64; 2],
+    pub world: V3,
     pub layers: Vec<LayerPick>,
+}
+
+/// How a layer is drawn for the current camera.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// From 2-D tiles (a 2-D image, or a volume seen along z).
+    Flat,
+    /// From bricks (a volume cut at an angle).
+    Volume,
+    /// Not drawn: a 2-D image seen at an angle.
+    Off,
+}
+
+/// A volume's bricks: cache, page table and per-level layout.
+struct Bricks {
+    cache: Cache,
+    /// Per channel, per level, per brick: slot + 1 or 0.
+    pages: Vec<u32>,
+    dirty: Option<(usize, usize)>,
+    pages_all: bool,
+    /// Per level: the lead indices (without z) and their id.
+    leads: Vec<(Vec<u64>, u64)>,
 }
 
 /// One image in the view: its source, tile cache and page table, its channels, plane
@@ -170,17 +274,26 @@ pub struct Layer {
     error: Option<String>,
     channels: Vec<ChannelDisplay>,
     luts_dirty: bool,
-    /// Level-0 indices on the image's plane axes.
+    /// Level-0 indices on the image's plane axes (z among them for a volume: where the
+    /// camera's plane cuts it).
     position: Vec<f64>,
     /// World to world: where the layer sits on top of its levels' placement.
-    transform: Affine2,
-    inverse: Affine2,
+    transform: Affine3,
+    inverse: Affine3,
     /// Whether the layer is drawn.
     pub visible: bool,
     /// 0..1: how strongly the layer adds to the others.
     pub opacity: f32,
+    /// Volumes: trilinear sampling between voxel centres (else the nearest voxel).
+    pub linear: bool,
     /// Seconds per tile read, smoothed.
     read_s: f64,
+    /// A volume's brick layout per level: bricks along x, y, z, first page entry, and
+    /// whether the level has a page table.
+    bgrid: Vec<([u32; 3], u32, bool)>,
+    bstride: u32,
+    /// The bricks, once a plane at an angle needed them.
+    bricks: Option<Bricks>,
 }
 
 impl Layer {
@@ -196,8 +309,13 @@ impl Layer {
         &self.channels
     }
 
+    /// Whether the image is a volume (it has a z axis).
+    pub fn is_volume(&self) -> bool {
+        self.source.z_axis.is_some()
+    }
+
     /// The layer's transform (world to world, on top of its levels' placement).
-    pub fn transform(&self) -> Affine2 {
+    pub fn transform(&self) -> Affine3 {
         self.transform
     }
 
@@ -223,42 +341,73 @@ impl Layer {
             .collect()
     }
 
-    /// The world points of the finest level's outer corners, the transform applied.
-    fn corners(&self) -> [(f64, f64); 4] {
+    /// The position's index of the z axis, for a volume.
+    fn z_slot(&self) -> Option<usize> {
+        let z = self.source.z_axis?;
+        self.source.plane_axes.iter().position(|&a| a == z)
+    }
+
+    /// Level `l`'s index (x, y, z) of a world point: the layer's transform undone, then
+    /// the level's own placement.
+    fn to_index(&self, l: usize) -> Affine3 {
+        self.source.levels[l].to_index3.after(&self.inverse)
+    }
+
+    /// The world points of the finest level's outer corners, the transform applied (8 for
+    /// a volume, 4 for a 2-D image, at z 0).
+    fn corners(&self) -> Vec<V3> {
         let lv = &self.source.levels[0];
-        let (w, h) = (lv.width as f64 - 0.5, lv.height as f64 - 0.5);
-        [(-0.5, -0.5), (w, -0.5), (-0.5, h), (w, h)].map(|(ix, iy)| {
-            let (x, y) = lv.to_world.apply(ix, iy);
-            self.transform.apply(x, y)
-        })
+        let (w, h, d) = (
+            lv.width as f64 - 0.5,
+            lv.height as f64 - 0.5,
+            lv.depth as f64 - 0.5,
+        );
+        let zs: &[f64] = if self.is_volume() { &[-0.5, d] } else { &[0.0] };
+        let mut out = Vec::new();
+        for &z in zs {
+            for (x, y) in [(-0.5, -0.5), (w, -0.5), (-0.5, h), (w, h)] {
+                out.push(self.transform.apply(lv.to_world3.apply([x, y, z])));
+            }
+        }
+        out
     }
 
     /// The world box (x0, y0, x1, y1) the layer covers.
     pub fn bounds(&self) -> [f64; 4] {
         let mut b = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
-        for (x, y) in self.corners() {
-            b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+        for p in self.corners() {
+            b = [
+                b[0].min(p[0]),
+                b[1].min(p[1]),
+                b[2].max(p[0]),
+                b[3].max(p[1]),
+            ];
         }
         b
     }
 
-    /// The world point at the image's centre (the transform applied).
-    pub fn centre(&self) -> [f64; 2] {
+    /// The world point at the image's centre (the transform applied; z of the middle
+    /// plane for a volume, 0 for a 2-D image).
+    pub fn centre(&self) -> V3 {
         let lv = &self.source.levels[0];
-        let (x, y) = lv.to_world.apply(
+        let z = if self.is_volume() {
+            (lv.depth as f64 - 1.0) / 2.0
+        } else {
+            0.0
+        };
+        self.transform.apply(lv.to_world3.apply([
             (lv.width as f64 - 1.0) / 2.0,
             (lv.height as f64 - 1.0) / 2.0,
-        );
-        let (x, y) = self.transform.apply(x, y);
-        [x, y]
+            z,
+        ]))
     }
 
-    /// World units per pixel of level `l`, the transform's scaling included.
+    /// World units per pixel of level `l`, the transform's plane scaling included.
     fn pixel(&self, l: usize) -> f64 {
-        self.source.levels[l].pixel * self.transform.det().abs().sqrt()
+        self.source.levels[l].pixel * self.transform.to_2d().det().abs().sqrt()
     }
 
-    /// The level a frame at `scale` world units per screen pixel draws: the coarsest
+    /// The level a flat frame at `scale` world units per screen pixel draws: the coarsest
     /// whose pixels are no larger than a screen pixel (the finest when zoomed in further).
     pub fn level_for(&self, scale: f64) -> usize {
         let s = scale * (1.0 + 1e-9);
@@ -268,8 +417,46 @@ impl Layer {
             .unwrap_or(0)
     }
 
+    /// How the layer is drawn by `camera`.
+    pub fn mode(&self, camera: &Camera) -> Mode {
+        if !self.is_volume() {
+            return if camera.is_flat() {
+                Mode::Flat
+            } else {
+                Mode::Off
+            };
+        }
+        let a = self.to_index(0);
+        // the camera's plane is one of the volume's z planes
+        if camera.is_flat() && a.m[2][0].abs() < 1e-9 && a.m[2][1].abs() < 1e-9 {
+            Mode::Flat
+        } else {
+            Mode::Volume
+        }
+    }
+
+    /// The level a volume frame draws for the camera's plane `plane` (world): the
+    /// coarsest whose voxels along the screen are no larger than a screen pixel, among
+    /// the levels with a page table.
+    fn volume_level(&self, plane: &Plane3) -> usize {
+        let usable: Vec<usize> = (0..self.source.levels.len())
+            .filter(|&l| self.bgrid[l].2)
+            .collect();
+        let step = |l: usize| {
+            let p = plane.through(&self.to_index(l));
+            norm(p.ux).max(norm(p.uy))
+        };
+        usable
+            .iter()
+            .copied()
+            .filter(|&l| step(l) >= 1.0 - 1e-9)
+            .max_by(|&a, &b| step(b).total_cmp(&step(a)))
+            .or_else(|| usable.first().copied())
+            .unwrap_or(0)
+    }
+
     /// The transform as an NGFF affine over the image's axes: n rows of n + 1 (the last
-    /// column the translation), identity outside y and x.
+    /// column the translation), the identity outside x, y (and z for a volume).
     pub fn transform_matrix(&self) -> Vec<Vec<f64>> {
         let n = self.source.axes.len();
         let (y, x) = (n - 2, n - 1);
@@ -277,12 +464,16 @@ impl Layer {
             .map(|r| (0..=n).map(|c| (r == c) as u8 as f64).collect())
             .collect();
         let t = &self.transform.m;
-        m[x][x] = t[0][0];
-        m[x][y] = t[0][1];
-        m[x][n] = t[0][2];
-        m[y][x] = t[1][0];
-        m[y][y] = t[1][1];
-        m[y][n] = t[1][2];
+        let mut spatial = vec![(x, 0usize), (y, 1usize)];
+        if let Some(z) = self.source.z_axis {
+            spatial.push((z, 2));
+        }
+        for &(ra, ri) in &spatial {
+            for &(ca, ci) in &spatial {
+                m[ra][ca] = t[ri][ci];
+            }
+            m[ra][n] = t[ri][3];
+        }
         m
     }
 
@@ -321,19 +512,87 @@ impl Layer {
         self.pages_all = true;
     }
 
+    fn brick_entry(&self, k: &TileKey) -> usize {
+        let (g, base, _) = self.bgrid[k.level as usize];
+        k.channel as usize * self.bstride as usize
+            + base as usize
+            + ((k.z * g[1] + k.y) * g[0] + k.x) as usize
+    }
+
+    fn brick_current(&self, k: &TileKey) -> bool {
+        self.bricks
+            .as_ref()
+            .is_some_and(|b| b.leads[k.level as usize].1 == k.plane)
+    }
+
+    fn set_brick_page(&mut self, k: &TileKey, v: u32) {
+        let e = self.brick_entry(k);
+        if let Some(b) = &mut self.bricks {
+            b.pages[e] = v;
+            b.dirty = Some(match b.dirty {
+                Some((x, y)) => (x.min(e), y.max(e)),
+                None => (e, e),
+            });
+        }
+    }
+
+    /// Every brick page entry again from the brick cache (the lead indices changed).
+    fn rebuild_brick_pages(&mut self) {
+        let Some(b) = &self.bricks else { return };
+        let present: Vec<(TileKey, u32)> = b
+            .cache
+            .iter()
+            .filter(|(k, _)| b.leads[k.level as usize].1 == k.plane)
+            .map(|(k, s)| (*k, *s))
+            .collect();
+        let entries: Vec<(usize, u32)> = present
+            .iter()
+            .map(|(k, s)| (self.brick_entry(k), s + 1))
+            .collect();
+        if let Some(b) = &mut self.bricks {
+            b.pages.iter_mut().for_each(|p| *p = 0);
+            for (e, v) in entries {
+                b.pages[e] = v;
+            }
+            b.pages_all = true;
+        }
+    }
+
     fn key(&self, c: usize, l: usize, (x, y): (u32, u32)) -> TileKey {
         TileKey {
             layer: self.id,
+            brick: false,
             plane: self.planes[l].1,
             channel: c as u16,
             level: l as u8,
             x,
             y,
+            z: 0,
+        }
+    }
+
+    fn brick_key(&self, c: usize, l: usize, (x, y, z): (u32, u32, u32)) -> TileKey {
+        TileKey {
+            layer: self.id,
+            brick: true,
+            plane: self.bricks.as_ref().map_or(0, |b| b.leads[l].1),
+            channel: c as u16,
+            level: l as u8,
+            x,
+            y,
+            z,
         }
     }
 
     fn missing(&self, k: &TileKey) -> bool {
-        self.cache.peek(k).is_none() && !self.failed.contains(k)
+        let cached = if k.brick {
+            self.bricks
+                .as_ref()
+                .is_some_and(|b| b.cache.peek(k).is_some())
+        } else {
+            self.cache.peek(k).is_some()
+        };
+        !cached && !self.failed.contains(k)
     }
 
     fn request(&self, k: TileKey, plane: &[u64]) -> Request {
@@ -342,6 +601,25 @@ impl Layer {
         let h = (lv.height - ty).min(TILE as u64);
         let w = (lv.width - tx).min(TILE as u64);
         let (start, stop) = self.source.region(plane, k.channel as usize, ty, tx, h, w);
+        Request {
+            key: k,
+            gen: 0,
+            array: self.source.array(k.level as usize),
+            start,
+            stop,
+        }
+    }
+
+    fn brick_request(&self, k: TileKey) -> Request {
+        let lv = &self.source.levels[k.level as usize];
+        let lead = &self.bricks.as_ref().expect("bricks").leads[k.level as usize].0;
+        let (start, stop) = self.source.region3(
+            lead,
+            k.channel as usize,
+            bricks::span(k.z, lv.depth),
+            bricks::span(k.y, lv.height),
+            bricks::span(k.x, lv.width),
+        );
         Request {
             key: k,
             gen: 0,
@@ -374,6 +652,20 @@ impl Layer {
             }
         }
         rows
+    }
+
+    fn channel_gpu(&self) -> Vec<ChannelGpu> {
+        self.channels
+            .iter()
+            .map(|d| ChannelGpu {
+                color: d.color,
+                gamma: d.gamma as f32,
+                lo: d.lo as f32,
+                hi: d.hi as f32,
+                active: d.visible as u32,
+                lut: d.lut.is_some() as u32,
+            })
+            .collect()
     }
 }
 
@@ -453,26 +745,87 @@ struct FrameCtx {
     frame: u64,
     tw: u32,
     th: u32,
-    screen: Affine2,
-    scale: f64,
+    camera: Camera,
     moving: bool,
     threads: f64,
 }
 
-/// One layer's part of a frame: keep the cached tiles the view uses, place the tiles
-/// read since the last frame, update the page table, and ask for what is still missing.
-/// Returns the layer's parameters when it is drawn.
-fn prepare_layer(
+/// Place tiles and bricks read since the last frame into their caches and atlases.
+fn place_loaded(
     o: &mut Layer,
     gpu: &mut Gpu,
     loaded: Vec<Loaded>,
+    frame: u64,
+    stats: &mut FrameStats,
+) {
+    for t in loaded {
+        o.read_s = if o.read_s == 0.0 {
+            t.took
+        } else {
+            0.8 * o.read_s + 0.2 * t.took
+        };
+        let data = match t.data {
+            Err(e) => {
+                o.error.get_or_insert(e);
+                o.failed.insert(t.key);
+                continue;
+            }
+            Ok(d) => d,
+        };
+        if t.key.brick {
+            let Some(b) = &mut o.bricks else { continue };
+            let Some((slot, old)) = b.cache.place(t.key, frame) else {
+                continue;
+            };
+            if let Some(old) = old {
+                if o.brick_current(&old) {
+                    o.set_brick_page(&old, 0);
+                }
+            }
+            gpu.upload_brick(o.id, slot, &data);
+            if o.brick_current(&t.key) {
+                o.set_brick_page(&t.key, slot + 1);
+            }
+        } else {
+            let Some((slot, old)) = o.cache.place(t.key, frame) else {
+                continue; // every slot is in use by this frame
+            };
+            if let Some(old) = old {
+                if o.current(&old) {
+                    o.set_page(&old, 0);
+                }
+            }
+            gpu.upload_tile(o.id, slot, &data, t.w, t.h);
+            if o.current(&t.key) {
+                o.set_page(&t.key, slot + 1);
+            }
+        }
+        stats.loaded += 1;
+    }
+}
+
+/// The channels and colour maps for the shaders (shared by both kinds of drawing).
+fn write_display(o: &mut Layer, gpu: &mut Gpu) {
+    gpu.write_channels(o.id, &o.channel_gpu());
+    if o.luts_dirty {
+        gpu.write_luts(o.id, &o.lut_rows());
+        o.luts_dirty = false;
+    }
+}
+
+/// One layer's flat part of a frame: keep the cached tiles the view uses, update the
+/// page table, and ask for what is still missing. Returns the layer's parameters when it
+/// is drawn, and its level.
+fn prepare_flat(
+    o: &mut Layer,
+    gpu: &mut Gpu,
     cx: &FrameCtx,
     wants: &mut Wants,
     stats: &mut FrameStats,
 ) -> (Option<FrameParams>, usize) {
     let frame = cx.frame;
     let nl = o.source.levels.len();
-    let level = o.level_for(cx.scale);
+    let level = o.level_for(cx.camera.scale);
     // the plane on every level
     let mut moved = false;
     for l in 0..nl {
@@ -485,17 +838,23 @@ fn prepare_layer(
     if moved {
         o.rebuild_pages();
     }
-    // per level: screen pixel to level index
-    let to_index: Vec<Affine2> = o
-        .source
-        .levels
-        .iter()
-        .map(|lv| lv.to_index.after(&o.inverse).after(&cx.screen))
+    // per level: screen pixel to level index (x, y)
+    let plane = cx.camera.plane(cx.tw, cx.th);
+    let to_index: Vec<Affine2> = (0..nl)
+        .map(|l| plane.through(&o.to_index(l)).to_2d())
         .collect();
     let active: Vec<usize> = (0..o.channels.len())
         .filter(|&c| o.channels[c].visible)
         .collect();
-    let drawn = o.visible && !active.is_empty();
+    // a volume's z: the camera's plane must cut the volume
+    let inside = match o.z_slot() {
+        Some(k) => {
+            let z = o.position[k];
+            z >= -0.5 && z < o.source.levels[0].depth as f64 - 0.5
+        }
+        None => true,
+    };
+    let drawn = o.visible && !active.is_empty() && inside;
     // keep what the view uses: the frame's level and the coarser ones
     let mut views = vec![None; nl];
     let mut order = Vec::new();
@@ -522,35 +881,6 @@ fn prepare_layer(
                         o.cache.touch(&k, frame);
                     }
                 }
-            }
-        }
-    }
-    // place the tiles read since the last frame
-    for t in loaded {
-        o.read_s = if o.read_s == 0.0 {
-            t.took
-        } else {
-            0.8 * o.read_s + 0.2 * t.took
-        };
-        match t.data {
-            Err(e) => {
-                o.error.get_or_insert(e);
-                o.failed.insert(t.key);
-            }
-            Ok(data) => {
-                let Some((slot, old)) = o.cache.place(t.key, frame) else {
-                    continue; // every slot is in use by this frame
-                };
-                if let Some(old) = old {
-                    if o.current(&old) {
-                        o.set_page(&old, 0);
-                    }
-                }
-                gpu.upload_tile(o.id, slot, &data, t.w, t.h);
-                if o.current(&t.key) {
-                    o.set_page(&t.key, slot + 1);
-                }
-                stats.loaded += 1;
             }
         }
     }
@@ -626,7 +956,7 @@ fn prepare_layer(
                 for k_axis in 0..o.source.plane_axes.len() {
                     for step in [1.0, -1.0] {
                         let mut pos = o.position.clone();
-                        pos[k_axis] += step;
+                        pos[k_axis] = pos[k_axis].round() + step;
                         let a = o.source.plane_axes[k_axis];
                         if pos[k_axis] < 0.0
                             || pos[k_axis] > (o.source.levels[0].shape[a] - 1) as f64
@@ -640,12 +970,8 @@ fn prepare_layer(
                         for &t in &order {
                             for &c in &active {
                                 let k = TileKey {
-                                    layer: o.id,
                                     plane: id,
-                                    channel: c as u16,
-                                    level: level as u8,
-                                    x: t.0,
-                                    y: t.1,
+                                    ..o.key(c, level, t)
                                 };
                                 if o.missing(&k) {
                                     wants.planes.push(o.request(k, &idx));
@@ -699,53 +1025,219 @@ fn prepare_layer(
             }
         })
         .collect();
-    let channels: Vec<ChannelGpu> = o
-        .channels
-        .iter()
-        .map(|d| ChannelGpu {
-            color: d.color,
-            gamma: d.gamma as f32,
-            lo: d.lo as f32,
-            hi: d.hi as f32,
-            active: d.visible as u32,
-            lut: d.lut.is_some() as u32,
-        })
-        .collect();
     gpu.write_levels(o.id, &levels);
-    gpu.write_channels(o.id, &channels);
-    if o.luts_dirty {
-        gpu.write_luts(o.id, &o.lut_rows());
-        o.luts_dirty = false;
-    }
+    write_display(o, gpu);
     let params = FrameParams {
         n_levels: nl as u32,
-        n_channels: channels.len() as u32,
+        n_channels: o.channels.len() as u32,
         level: level as u32,
         channel_stride: o.stride,
         missing: MISSING,
         outside: [0.0; 4],
         opacity: o.opacity.clamp(0.0, 1.0),
-        _pad: [0.0; 3],
+        linear: 0,
+        _pad: [0.0; 2],
     };
     (Some(params), level)
 }
 
-/// A 2-D transform from an NGFF edge's matrix over `n` axes, if it stays in the y-x
-/// plane (only y and x mixed, the other axes left alone).
-fn plane_transform(m: &[Vec<f64>], n: usize) -> Option<Affine2> {
+/// One volume layer's part of a frame drawn from bricks: the bricks the camera's plane
+/// cuts, centre first, at the level the zoom wants (coarser when the brick atlas cannot
+/// hold them); coarser levels stand in. Returns the parameters and the level.
+fn prepare_volume(
+    o: &mut Layer,
+    gpu: &mut Gpu,
+    cx: &FrameCtx,
+    wants: &mut Wants,
+    stats: &mut FrameStats,
+) -> (Option<FrameParams>, usize) {
+    let frame = cx.frame;
+    let nl = o.source.levels.len();
+    let plane = cx.camera.plane(cx.tw, cx.th);
+    // the lead indices (t, ...) on every level
+    let leads: Vec<(Vec<u64>, u64)> = (0..nl).map(|l| o.source.lead(l, &o.position)).collect();
+    let changed = o
+        .bricks
+        .as_ref()
+        .is_some_and(|b| b.leads.iter().zip(&leads).any(|(a, b)| a.1 != b.1));
+    if let Some(b) = &mut o.bricks {
+        b.leads = leads;
+    }
+    if changed {
+        o.rebuild_brick_pages();
+    }
+    let planes: Vec<Plane3> = (0..nl).map(|l| plane.through(&o.to_index(l))).collect();
+    let size = |l: usize| {
+        let lv = &o.source.levels[l];
+        [lv.width, lv.height, lv.depth]
+    };
+    let active: Vec<usize> = (0..o.channels.len())
+        .filter(|&c| o.channels[c].visible)
+        .collect();
+    let capacity = o.bricks.as_ref().map_or(0, |b| b.cache.capacity()) as usize;
+    let mut level = o.volume_level(&plane);
+    let mut views: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); nl];
+    views[level] = bricks::visible(&planes[level], cx.tw, cx.th, size(level));
+    // coarser while the frame's bricks would not fit the atlas
+    while level + 1 < nl && views[level].len() * active.len().max(1) * 10 > capacity * 8 {
+        level += 1;
+        while level + 1 < nl && !o.bgrid[level].2 {
+            level += 1;
+        }
+        views[level] = bricks::visible(&planes[level], cx.tw, cx.th, size(level));
+    }
+    let drawn = o.visible && !active.is_empty() && o.bricks.is_some();
+    let mut missing_here = Vec::new();
+    if drawn {
+        for l in level + 1..nl {
+            if o.bgrid[l].2 {
+                views[l] = bricks::visible(&planes[l], cx.tw, cx.th, size(l));
+            }
+        }
+        for &b in &views[level] {
+            for &c in &active {
+                stats.visible += 1;
+                let k = o.brick_key(c, level, b);
+                let hit = o
+                    .bricks
+                    .as_mut()
+                    .and_then(|br| br.cache.touch(&k, frame))
+                    .is_some();
+                if !hit {
+                    missing_here.push(k);
+                }
+            }
+        }
+        for (l, view) in views.iter().enumerate().skip(level + 1) {
+            for &b in view {
+                for &c in &active {
+                    let k = o.brick_key(c, l, b);
+                    if let Some(br) = &mut o.bricks {
+                        br.cache.touch(&k, frame);
+                    }
+                }
+            }
+        }
+        let threads = cx.threads.max(1.0);
+        let cost = |n: usize| n as f64 * o.read_s / threads;
+        let todo = missing_here.iter().filter(|k| o.missing(k)).count();
+        if cx.moving && cost(todo) > MOVE_BUDGET {
+            stats.deferred = true;
+            let fetch = (level + 1..nl)
+                .filter(|&l| o.bgrid[l].2)
+                .find(|&l| cost(views[l].len() * active.len()) <= MOVE_BUDGET)
+                .unwrap_or(nl - 1);
+            for &b in &views[fetch] {
+                for &c in &active {
+                    let k = o.brick_key(c, fetch, b);
+                    if o.missing(&k) {
+                        wants.here.push(o.brick_request(k));
+                    }
+                }
+            }
+        } else {
+            let coarse = (level + 2).min(nl - 1);
+            if coarse != level && o.bgrid[coarse].2 {
+                for &b in &views[coarse] {
+                    for &c in &active {
+                        let k = o.brick_key(c, coarse, b);
+                        if o.missing(&k) {
+                            wants.coarse.push(o.brick_request(k));
+                        }
+                    }
+                }
+            }
+            for k in &missing_here {
+                if o.missing(k) {
+                    wants.here.push(o.brick_request(*k));
+                }
+            }
+        }
+        stats.missing += missing_here
+            .iter()
+            .filter(|k| o.bricks.as_ref().is_some_and(|b| b.cache.peek(k).is_none()))
+            .count() as u32;
+    }
+    // the brick page table, levels, channels and colour maps for the shader
+    let id = o.id;
+    let bstride = o.bstride;
+    if let Some(b) = &mut o.bricks {
+        if b.pages_all {
+            gpu.write_brick_pages(id, b.pages.len(), 0, &b.pages);
+            b.pages_all = false;
+            b.dirty = None;
+        } else if let Some((x, y)) = b.dirty.take() {
+            if gpu.write_brick_pages(id, b.pages.len(), x, &b.pages[x..=y]) {
+                gpu.write_brick_pages(id, b.pages.len(), 0, &b.pages);
+            }
+        }
+    }
+    if !drawn {
+        return (None, level);
+    }
+    let levels: Vec<LevelGpu3> = (0..nl)
+        .map(|l| {
+            let p = &planes[l];
+            let oi = p.origin.map(f64::floor);
+            let (g, base, usable) = o.bgrid[l];
+            let s = size(l);
+            LevelGpu3 {
+                origin_int: [oi[0] as i32, oi[1] as i32, oi[2] as i32, 0],
+                origin_frac: [
+                    (p.origin[0] - oi[0]) as f32,
+                    (p.origin[1] - oi[1]) as f32,
+                    (p.origin[2] - oi[2]) as f32,
+                    0.0,
+                ],
+                ux: [p.ux[0] as f32, p.ux[1] as f32, p.ux[2] as f32, 0.0],
+                uy: [p.uy[0] as f32, p.uy[1] as f32, p.uy[2] as f32, 0.0],
+                size: [s[0] as i32, s[1] as i32, s[2] as i32, base as i32],
+                grid: [g[0], g[1], g[2], usable as u32],
+            }
+        })
+        .collect();
+    gpu.write_brick_levels(id, &levels);
+    write_display(o, gpu);
+    let params = FrameParams {
+        n_levels: nl as u32,
+        n_channels: o.channels.len() as u32,
+        level: level as u32,
+        channel_stride: bstride,
+        missing: MISSING,
+        outside: [0.0; 4],
+        opacity: o.opacity.clamp(0.0, 1.0),
+        linear: o.linear as u32,
+        _pad: [0.0; 2],
+    };
+    (Some(params), level)
+}
+
+/// The spatial part of an NGFF edge's matrix over `n` axes as a 3-D transform, if it
+/// leaves the other axes alone (x and y only for a 2-D image, x, y and z for a volume).
+fn space_transform(m: &[Vec<f64>], n: usize, z_axis: Option<usize>) -> Option<Affine3> {
     let (y, x) = (n - 2, n - 1);
+    let spatial = |a: usize| a == x || a == y || Some(a) == z_axis;
     for (r, row) in m.iter().enumerate().take(n) {
         for (c, &v) in row.iter().enumerate().take(n + 1) {
-            let inside = (r == y || r == x) && (c == y || c == x || c == n);
+            let inside = spatial(r) && (c == n || spatial(c));
             let want = if r == c { 1.0 } else { 0.0 };
             if !inside && (v - want).abs() > 1e-9 {
                 return None;
             }
         }
     }
-    Some(Affine2 {
-        m: [[m[x][x], m[x][y], m[x][n]], [m[y][x], m[y][y], m[y][n]]],
-    })
+    let axes: Vec<Option<usize>> = vec![Some(x), Some(y), z_axis];
+    let mut t = Affine3::IDENTITY;
+    for (ri, ra) in axes.iter().enumerate() {
+        let Some(ra) = *ra else { continue };
+        for (ci, ca) in axes.iter().enumerate() {
+            if let Some(ca) = *ca {
+                t.m[ri][ci] = m[ra][ca];
+            }
+        }
+        t.m[ri][3] = m[ra][n];
+    }
+    Some(t)
 }
 
 /// A viewer: a GPU target, its layers, a camera.
@@ -798,11 +1290,7 @@ impl Viewer {
             layers: Vec::new(),
             current: 0,
             next_id: 0,
-            camera: Camera {
-                center: [0.0, 0.0],
-                scale: 1.0,
-                rotation: 0.0,
-            },
+            camera: Camera::new(),
             frame: 0,
             moved_at: None,
             moved_frame: 0,
@@ -826,28 +1314,52 @@ impl Viewer {
         (per as f64 * 1.34 * channels.max(1) as f64 * 1.5) as u32
     }
 
-    /// Layer `i`'s share of the atlas budget (MiB): by channels.
+    /// The brick slots a volume of `channels` channels wants for this target: the plane
+    /// cuts about two bricks deep per screen-sized patch of bricks, the coarser levels a
+    /// third more.
+    fn brick_slots_wanted(&self, channels: usize) -> u32 {
+        let (w, h) = self.gpu.size();
+        let step = bricks::STEP as u32;
+        let per = (w / step + 2) * (h / step + 2) * 2;
+        (per as f64 * 1.34 * channels.max(1) as f64 * 1.2) as u32
+    }
+
+    /// A layer's share of the atlas budget (MiB): by channels.
     fn budget_mib(&self, channels: usize) -> u32 {
         let total: usize = self.layers.iter().map(|l| l.channels.len()).sum::<usize>();
         let total = total.max(channels).max(1);
         ((self.gpu.atlas_mib() as u64 * channels.max(1) as u64 / total as u64) as u32).max(16)
     }
 
-    /// Give each layer the atlas its share allows: larger when the target grew or a
-    /// layer left, smaller when a layer came (its tiles are read again). A layer the GPU
-    /// cannot hold is removed.
+    /// Give each layer the atlases its share allows (a volume with bricks splits it
+    /// between tiles and bricks): larger when the target grew or a layer left, smaller
+    /// when a layer came (their contents are read again). A layer the GPU cannot hold is
+    /// removed.
     fn rebalance(&mut self) -> Result<(), ViewerError> {
         let mut i = 0;
         while i < self.layers.len() {
-            let (id, texel, nc, have) = {
+            let (id, texel, nc, have, bricks_have) = {
                 let l = &self.layers[i];
-                (l.id, l.source.texel, l.channels.len(), l.cache.capacity())
+                (
+                    l.id,
+                    l.source.texel,
+                    l.channels.len(),
+                    l.cache.capacity(),
+                    l.bricks.as_ref().map(|b| b.cache.capacity()),
+                )
             };
             let budget = self.budget_mib(nc);
-            let want = self.gpu.slots_for(texel, self.slots_wanted(nc), budget);
-            let cap = self.gpu.slots_for(texel, u32::MAX, budget);
+            let tiles_budget = if bricks_have.is_some() {
+                (budget / 2).max(16)
+            } else {
+                budget
+            };
+            let want = self
+                .gpu
+                .slots_for(texel, self.slots_wanted(nc), tiles_budget);
+            let cap = self.gpu.slots_for(texel, u32::MAX, tiles_budget);
             if want > have || have > cap {
-                match self.gpu.prepare_layer(id, texel, want, budget) {
+                match self.gpu.prepare_layer(id, texel, want, tiles_budget) {
                     Ok(slots) => {
                         let l = &mut self.layers[i];
                         l.cache = Cache::new(slots);
@@ -859,18 +1371,58 @@ impl Viewer {
                     }
                 }
             }
+            if let Some(bhave) = bricks_have {
+                let bbudget = budget.saturating_sub(tiles_budget).max(16);
+                let want = self
+                    .gpu
+                    .brick_slots_for(texel, self.brick_slots_wanted(nc), bbudget);
+                let cap = self.gpu.brick_slots_for(texel, u32::MAX, bbudget);
+                if want > bhave || bhave > cap {
+                    match self.gpu.prepare_bricks(id, want, bbudget) {
+                        Ok(slots) => {
+                            let l = &mut self.layers[i];
+                            if let Some(b) = &mut l.bricks {
+                                b.cache = Cache::new(slots);
+                            }
+                            l.rebuild_brick_pages();
+                        }
+                        Err(e) => {
+                            self.remove(i);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
             i += 1;
         }
         Ok(())
     }
 
+    /// Give layer `i` its bricks (the first time a plane at an angle needs them).
+    fn enable_bricks(&mut self, i: usize) -> Result<(), ViewerError> {
+        let l = &mut self.layers[i];
+        if l.bricks.is_some() || !l.is_volume() {
+            return Ok(());
+        }
+        let nc = l.channels.len();
+        let nl = l.source.levels.len();
+        l.bricks = Some(Bricks {
+            cache: Cache::new(0),
+            pages: vec![0; l.bstride as usize * nc],
+            dirty: None,
+            pages_all: true,
+            leads: (0..nl).map(|lv| l.source.lead(lv, &l.position)).collect(),
+        });
+        self.rebalance()
+    }
+
     /// Open the image at `path` (a folder, or a .zip / .ozx) as the only layer: fit it
-    /// into the target.
+    /// into the target, looking along z.
     pub fn open(&mut self, path: &Path) -> Result<(), ViewerError> {
         while !self.layers.is_empty() {
             self.remove(self.layers.len() - 1);
         }
-        self.camera.rotation = 0.0;
+        self.camera = Camera::new();
         self.add(path)?;
         self.fit();
         Ok(())
@@ -879,8 +1431,8 @@ impl Viewer {
     /// Add the image at `path` as a new layer on top (channels from its metadata:
     /// contrast from omero's window, else from the coarsest level's middle tile; the
     /// plane at omero's default z and t; the transform saved in its "aligned" coordinate
-    /// system, if any). The first layer is fitted into the target. It becomes the
-    /// current layer; returns its index.
+    /// system, if any). The first layer is fitted into the target (and the camera's
+    /// plane put at its default z). It becomes the current layer; returns its index.
     pub fn add(&mut self, path: &Path) -> Result<usize, ViewerError> {
         let source = Source::open(path)?;
         let (transform, note) = saved_transform(&source);
@@ -893,6 +1445,8 @@ impl Viewer {
         let mut level_base = Vec::new();
         let mut grid = Vec::new();
         let mut stride = 0u32;
+        let mut bgrid = Vec::new();
+        let mut bstride = 0u32;
         for lv in &source.levels {
             let g = (
                 lv.width.div_ceil(TILE as u64) as u32,
@@ -901,6 +1455,17 @@ impl Viewer {
             level_base.push(stride);
             stride += g.0 * g.1;
             grid.push(g);
+            let b = [
+                bricks::count(lv.width),
+                bricks::count(lv.height),
+                bricks::count(lv.depth),
+            ];
+            let n = b.iter().map(|&v| v as u64).product::<u64>();
+            let usable = source.z_axis.is_some() && n <= BRICK_PAGES_MAX;
+            bgrid.push((b, bstride, usable));
+            if usable {
+                bstride += n as u32;
+            }
         }
         let position = source.default_position.clone();
         let planes = (0..source.levels.len())
@@ -909,7 +1474,7 @@ impl Viewer {
         let channels = Self::initial_display(&source, &position);
         let pages = vec![0u32; stride as usize * nc];
         let first = self.layers.is_empty();
-        self.layers.push(Layer {
+        let layer = Layer {
             id,
             path: path.to_path_buf(),
             source,
@@ -927,17 +1492,33 @@ impl Viewer {
             luts_dirty: true,
             position,
             transform,
-            inverse: transform.inverse().unwrap_or(Affine2::IDENTITY),
+            inverse: transform.inverse().unwrap_or(Affine3::IDENTITY),
             visible: true,
             opacity: 1.0,
+            linear: false,
             read_s: 0.0,
-        });
+            bgrid,
+            bstride,
+            bricks: None,
+        };
+        if first {
+            // the camera's plane where the image opens (its default z)
+            let lv = &layer.source.levels[0];
+            let z = layer.z_slot().map_or(0.0, |k| layer.position[k]);
+            self.camera.center = layer.transform.apply(lv.to_world3.apply([
+                (lv.width as f64 - 1.0) / 2.0,
+                (lv.height as f64 - 1.0) / 2.0,
+                z,
+            ]));
+        }
+        self.layers.push(layer);
         self.current = self.layers.len() - 1;
         // the others give up atlas room for the new one
         self.rebalance()?;
         if first {
             self.fit();
         }
+        self.sync_z();
         Ok(self.layers.len() - 1)
     }
 
@@ -968,9 +1549,10 @@ impl Viewer {
 
     /// Read layer `i`'s image again (after its metadata changed, e.g. a saved
     /// transform): its placement and saved transform come from the file again; its
-    /// channels (when their number is the same), plane, visibility and opacity stay.
+    /// channels (when their number is the same), plane, visibility, opacity and sampling
+    /// stay.
     pub fn reload(&mut self, i: usize) -> Result<(), ViewerError> {
-        let (path, channels, position, visible, opacity) = {
+        let (path, channels, position, visible, opacity, linear) = {
             let l = self.layer(i)?;
             (
                 l.path.clone(),
@@ -978,6 +1560,7 @@ impl Viewer {
                 l.position(),
                 l.visible,
                 l.opacity,
+                l.linear,
             )
         };
         let current = self.current;
@@ -990,9 +1573,17 @@ impl Viewer {
             self.layers[i].channels = channels;
             self.layers[i].luts_dirty = true;
         }
+        let z = self.layers[i]
+            .source
+            .z_axis
+            .map(|a| self.layers[i].source.axes[a].clone());
         for (axis, p, _) in position {
-            let _ = self.set_position(i, &axis, p);
+            if Some(&axis) != z.as_ref() {
+                let _ = self.set_position(i, &axis, p);
+            }
         }
+        self.layers[i].linear = linear;
+        self.sync_z();
         self.set_layer(i, visible, opacity)
     }
 
@@ -1071,6 +1662,18 @@ impl Viewer {
         Ok(())
     }
 
+    /// Volumes: sample layer `i` trilinearly between voxel centres (`linear`), or take
+    /// the nearest voxel.
+    pub fn set_linear(&mut self, i: usize, linear: bool) -> Result<(), ViewerError> {
+        self.layer_mut(i)?.linear = linear;
+        Ok(())
+    }
+
+    /// How layer `i` is drawn for the current camera.
+    pub fn mode(&self, i: usize) -> Result<Mode, ViewerError> {
+        Ok(self.layer(i)?.mode(&self.camera))
+    }
+
     /// The current layer's image, if any.
     pub fn source(&self) -> Option<&Source> {
         self.layers.get(self.current).map(|l| &l.source)
@@ -1115,9 +1718,10 @@ impl Viewer {
         Ok(())
     }
 
-    /// Move layer `i`'s plane to level-0 index `index` on axis `axis` (z, t, ...).
+    /// Move layer `i`'s plane to level-0 index `index` on axis `axis` (z, t, ...). For a
+    /// volume's z, the camera's plane moves there (z is shared by all layers).
     pub fn set_position(&mut self, i: usize, axis: &str, index: f64) -> Result<(), ViewerError> {
-        let o = self.layer_mut(i)?;
+        let o = self.layer(i)?;
         let k = o
             .source
             .plane_axes
@@ -1138,18 +1742,60 @@ impl Viewer {
                 "{axis} = {index}: the image has {n} indices on {axis}"
             )));
         }
-        o.position[k] = index;
+        if o.z_slot() == Some(k) {
+            // the camera's centre goes to that plane, where it cuts the layer now
+            let to_index = o.to_index(0);
+            let mut p = to_index.apply(self.camera.center);
+            p[2] = index;
+            let world = o.transform.apply(o.source.levels[0].to_world3.apply(p));
+            self.camera.center = world;
+        } else {
+            self.layer_mut(i)?.position[k] = index;
+        }
         self.moved();
         Ok(())
     }
 
-    /// Set layer `i`'s transform (world to world, on top of its levels' placement).
-    pub fn set_transform(&mut self, i: usize, t: Affine2) -> Result<(), ViewerError> {
+    /// Every volume's z index from the camera's centre (z is a world coordinate).
+    fn sync_z(&mut self) {
+        let c = self.camera.center;
+        for l in &mut self.layers {
+            if let Some(k) = l.z_slot() {
+                let z = l.to_index(0).apply(c)[2];
+                // a hair off an index (from turning maps both ways) is that index
+                let r = z.round();
+                l.position[k] = if (z - r).abs() < 1e-9 { r } else { z };
+            }
+        }
+    }
+
+    /// Move the camera's plane by `steps` voxels of the current layer's finest level
+    /// along the view's normal (in a view along z: one z plane per step).
+    pub fn step_depth(&mut self, steps: f64) -> Result<(), ViewerError> {
+        let l = self.layer(self.current)?;
+        let v = l.to_index(0).linear(self.camera.normal());
+        let most = v.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+        if most == 0.0 {
+            return Ok(());
+        }
+        self.camera.center = add(self.camera.center, mul(self.camera.normal(), steps / most));
+        self.moved();
+        Ok(())
+    }
+
+    /// Set layer `i`'s transform (world to world, on top of its levels' placement). A
+    /// 2-D image moves and turns in its plane only.
+    pub fn set_transform(&mut self, i: usize, t: Affine3) -> Result<(), ViewerError> {
         let inverse = t
             .inverse()
             .filter(|_| t.is_finite())
             .ok_or_else(|| verr(format!("a transform that cannot be inverted: {:?}", t.m)))?;
         let l = self.layer_mut(i)?;
+        if !l.is_volume() && !t.keeps_planes(1e-9) {
+            return Err(verr(
+                "a 2-D image moves and turns in its plane only (this transform tilts it)",
+            ));
+        }
         l.transform = t;
         l.inverse = inverse;
         self.moved();
@@ -1158,23 +1804,46 @@ impl Viewer {
 
     /// Move layer `i` by `dx`, `dy` screen pixels (it follows the pointer).
     pub fn move_layer(&mut self, i: usize, dx: f64, dy: f64) -> Result<(), ViewerError> {
-        let (tw, th) = self.gpu.size();
-        let (wx, wy) = self.camera.screen_to_world(tw, th).linear(dx, dy);
-        let t = Affine2::translation(wx, wy).after(&self.layer(i)?.transform);
+        let c = &self.camera;
+        let mut d = mul(add(mul(c.right, dx), mul(c.down, dy)), c.scale);
+        let l = self.layer(i)?;
+        if !l.is_volume() {
+            d[2] = 0.0;
+        }
+        let t = Affine3::translation(d).after(&l.transform);
         self.set_transform(i, t)
     }
 
-    /// Turn layer `i` by `degrees` (clockwise on an unturned view) about world point
-    /// `about`, by default the image's centre.
+    /// Turn layer `i` by `degrees` about the view's normal (clockwise on screen) through
+    /// world point `about`, by default the image's centre. A 2-D image turns about z.
     pub fn rotate_layer(
         &mut self,
         i: usize,
         degrees: f64,
-        about: Option<[f64; 2]>,
+        about: Option<V3>,
     ) -> Result<(), ViewerError> {
         let l = self.layer(i)?;
         let c = about.unwrap_or_else(|| l.centre());
-        let t = Affine2::rotation(degrees, c[0], c[1]).after(&l.transform);
+        let axis = if l.is_volume() {
+            self.camera.normal()
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        let t = Affine3::rotation(axis, degrees, c).after(&l.transform);
+        self.set_transform(i, t)
+    }
+
+    /// Tilt volume layer `i`: `yaw` degrees about the screen's down axis and `pitch`
+    /// degrees about its right axis, through the image's centre.
+    pub fn turn_layer(&mut self, i: usize, yaw: f64, pitch: f64) -> Result<(), ViewerError> {
+        let l = self.layer(i)?;
+        if !l.is_volume() {
+            return Err(verr("a 2-D image turns in its plane only (rotate_layer)"));
+        }
+        let c = l.centre();
+        let t = Affine3::rotation(self.camera.right, pitch, c)
+            .after(&Affine3::rotation(self.camera.down, yaw, c))
+            .after(&l.transform);
         self.set_transform(i, t)
     }
 
@@ -1196,14 +1865,19 @@ impl Viewer {
         out
     }
 
-    /// Show every visible layer whole, centred (the camera's turn stays).
+    /// Show every visible layer the camera draws whole, centred (the orientation and the
+    /// plane's depth stay).
     pub fn fit(&mut self) {
         let (tw, th) = self.gpu.size();
-        let turn = Affine2::rotation(self.camera.rotation, 0.0, 0.0);
+        let c = self.camera;
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for l in self.layers.iter().filter(|l| l.visible) {
-            for (x, y) in l.corners() {
-                let (u, v) = turn.apply(x, y); // as the screen's axes see it
+            if l.mode(&c) == Mode::Off {
+                continue;
+            }
+            for p in l.corners() {
+                let d = sub(p, c.center);
+                let (u, v) = (dot(d, c.right), dot(d, c.down)); // as the screen sees it
                 x0 = x0.min(u);
                 y0 = y0.min(v);
                 x1 = x1.max(u);
@@ -1216,37 +1890,53 @@ impl Viewer {
         let scale = ((x1 - x0) / tw as f64)
             .max((y1 - y0) / th as f64)
             .max(1e-12);
-        let back = Affine2::rotation(-self.camera.rotation, 0.0, 0.0);
-        let (cx, cy) = back.apply((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-        self.camera.center = [cx, cy];
+        self.camera.center = add(
+            c.center,
+            add(mul(c.right, (x0 + x1) / 2.0), mul(c.down, (y0 + y1) / 2.0)),
+        );
         self.camera.scale = scale;
         self.moved();
     }
 
-    /// The world point at the target's centre.
+    /// The world point (x, y) at the target's centre.
     pub fn center(&self) -> [f64; 2] {
-        self.camera.center
+        [self.camera.center[0], self.camera.center[1]]
     }
 
-    /// Put world point `center` at the target's centre, `scale` world units per pixel.
+    /// Put world point `center` (x, y) at the target's centre, `scale` world units per
+    /// pixel (the plane's depth stays).
     pub fn look_at(&mut self, center: [f64; 2], scale: f64) {
+        self.camera.center[0] = center[0];
+        self.camera.center[1] = center[1];
+        self.camera.scale = scale;
+        self.moved();
+    }
+
+    /// Put world point `center` (x, y, z) at the target's centre, `scale` world units per
+    /// pixel.
+    pub fn look_at_3d(&mut self, center: V3, scale: f64) {
         self.camera.center = center;
         self.camera.scale = scale;
         self.moved();
     }
 
-    /// The world point at screen pixel (`x`, `y`).
+    /// The world point (x, y) at screen pixel (`x`, `y`).
     pub fn screen_to_world(&self, x: f64, y: f64) -> [f64; 2] {
+        let p = self.screen_to_world_3d(x, y);
+        [p[0], p[1]]
+    }
+
+    /// The world point (x, y, z) at screen pixel (`x`, `y`).
+    pub fn screen_to_world_3d(&self, x: f64, y: f64) -> V3 {
         let (tw, th) = self.gpu.size();
-        let (u, v) = self.camera.screen_to_world(tw, th).apply(x, y);
-        [u, v]
+        self.camera.plane(tw, th).at(x, y)
     }
 
     /// Move the view by `dx`, `dy` screen pixels (the image follows the pointer).
     pub fn pan(&mut self, dx: f64, dy: f64) {
-        let (tw, th) = self.gpu.size();
-        let (wx, wy) = self.camera.screen_to_world(tw, th).linear(dx, dy);
-        self.camera.center = [self.camera.center[0] - wx, self.camera.center[1] - wy];
+        let c = &self.camera;
+        let d = mul(add(mul(c.right, dx), mul(c.down, dy)), c.scale);
+        self.camera.center = sub(self.camera.center, d);
         self.moved();
     }
 
@@ -1262,23 +1952,62 @@ impl Viewer {
             Some(b) if finest < f64::MAX => (finest / 64.0, 64.0 * (b[2] - b[0]).max(b[3] - b[1])),
             _ => (1e-12, 1e12),
         };
-        let before = self.screen_to_world(x, y);
+        let before = self.screen_to_world_3d(x, y);
         self.camera.scale = (self.camera.scale / factor).clamp(lo, hi.max(lo));
-        let after = self.screen_to_world(x, y);
-        self.camera.center[0] += before[0] - after[0];
-        self.camera.center[1] += before[1] - after[1];
+        let after = self.screen_to_world_3d(x, y);
+        self.camera.center = add(self.camera.center, sub(before, after));
         self.moved();
     }
 
-    /// Turn the view by `degrees` (the image turns clockwise) keeping the world point
-    /// under screen (`x`, `y`).
+    /// Turn the view by `degrees` about its normal (the image turns clockwise) keeping
+    /// the world point under screen (`x`, `y`).
     pub fn rotate(&mut self, degrees: f64, x: f64, y: f64) {
-        let before = self.screen_to_world(x, y);
-        self.camera.rotation = (self.camera.rotation + degrees).rem_euclid(360.0);
-        let after = self.screen_to_world(x, y);
-        self.camera.center[0] += before[0] - after[0];
-        self.camera.center[1] += before[1] - after[1];
+        let before = self.screen_to_world_3d(x, y);
+        self.camera.roll(degrees);
+        let after = self.screen_to_world_3d(x, y);
+        self.camera.center = add(self.camera.center, sub(before, after));
         self.moved();
+    }
+
+    /// Turn the view's plane: `yaw` degrees about the screen's down axis and `pitch`
+    /// degrees about its right axis, keeping the world point under screen (`x`, `y`).
+    pub fn turn(&mut self, yaw: f64, pitch: f64, x: f64, y: f64) {
+        let before = self.screen_to_world_3d(x, y);
+        self.camera.turn(yaw, pitch);
+        let after = self.screen_to_world_3d(x, y);
+        self.camera.center = add(self.camera.center, sub(before, after));
+        self.moved();
+    }
+
+    /// Set the view's orientation: the screen's right and down directions in the world
+    /// (made unit and perpendicular); the world point at the centre stays.
+    pub fn set_orientation(&mut self, right: V3, down: V3) -> Result<(), ViewerError> {
+        if norm(cross(right, down)) < 1e-9 || !right.iter().chain(&down).all(|v| v.is_finite()) {
+            return Err(verr(format!(
+                "an orientation needs two directions that are not parallel: {right:?}, {down:?}"
+            )));
+        }
+        self.camera.right = right;
+        self.camera.down = down;
+        self.camera.tidy();
+        self.moved();
+        Ok(())
+    }
+
+    /// Look along a named axis: "xy" (along z), "xz" (x right, z down) or "yz" (z right,
+    /// y down); the world point at the centre stays.
+    pub fn look_along(&mut self, name: &str) -> Result<(), ViewerError> {
+        let (r, d) = match name {
+            "xy" => ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            "xz" => ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+            "yz" => ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
+            _ => {
+                return Err(verr(format!(
+                    "view {name:?}: there are \"xy\", \"xz\" and \"yz\""
+                )))
+            }
+        };
+        self.set_orientation(r, d)
     }
 
     fn moved(&mut self) {
@@ -1288,6 +2017,7 @@ impl Viewer {
             self.moved_frame = self.frame;
         }
         self.moved_at = Some(Instant::now());
+        self.sync_z();
     }
 
     /// Whether the view is moving (see [`MOVING`]): it changed in two frames close
@@ -1307,11 +2037,17 @@ impl Viewer {
         self.rebalance()
     }
 
-    /// The current layer's level at the current zoom.
+    /// The current layer's level at the current zoom (and orientation).
     pub fn level(&self) -> usize {
-        self.layers
-            .get(self.current)
-            .map_or(0, |l| l.level_for(self.camera.scale))
+        let Some(l) = self.layers.get(self.current) else {
+            return 0;
+        };
+        if l.mode(&self.camera) == Mode::Volume {
+            let (tw, th) = self.gpu.size();
+            l.volume_level(&self.camera.plane(tw, th))
+        } else {
+            l.level_for(self.camera.scale)
+        }
     }
 
     /// The first error (tile read, or a note from opening) of any layer.
@@ -1341,17 +2077,27 @@ impl Viewer {
         self.loader.set_notify(f);
     }
 
-    /// Every layer's part of the frame (see [`prepare_layer`]); the requests of all
-    /// layers go to the readers in priority classes.
-    fn prepare(&mut self) -> (Vec<(u16, FrameParams)>, FrameStats) {
+    /// Every layer's part of the frame (flat or volume); the requests of all layers go
+    /// to the readers in priority classes.
+    fn prepare(&mut self) -> (Vec<Draw>, FrameStats) {
         self.frame += 1;
+        // volumes cut at an angle need their bricks
+        for i in 0..self.layers.len() {
+            let l = &self.layers[i];
+            if l.visible && l.bricks.is_none() && l.mode(&self.camera) == Mode::Volume {
+                if let Err(e) = self.enable_bricks(i) {
+                    if let Some(l) = self.layers.get_mut(i) {
+                        l.error.get_or_insert(e.0);
+                    }
+                }
+            }
+        }
         let (tw, th) = self.gpu.size();
         let cx = FrameCtx {
             frame: self.frame,
             tw,
             th,
-            screen: self.camera.screen_to_world(tw, th),
-            scale: self.camera.scale,
+            camera: self.camera,
             moving: self.moving(),
             threads: self.threads as f64,
         };
@@ -1363,13 +2109,21 @@ impl Viewer {
             let (mine, rest): (Vec<Loaded>, Vec<Loaded>) =
                 results.into_iter().partition(|t| t.key.layer == l.id);
             results = rest;
-            let (params, level) =
-                prepare_layer(l, &mut self.gpu, mine, &cx, &mut wants, &mut stats);
+            place_loaded(l, &mut self.gpu, mine, cx.frame, &mut stats);
+            let mode = l.mode(&cx.camera);
+            let (params, level) = match mode {
+                Mode::Flat => prepare_flat(l, &mut self.gpu, &cx, &mut wants, &mut stats),
+                Mode::Volume => prepare_volume(l, &mut self.gpu, &cx, &mut wants, &mut stats),
+                Mode::Off => (None, 0),
+            };
             if i == self.current {
                 stats.level = level as u32;
             }
             if let Some(p) = params {
-                frames.push((l.id, p));
+                frames.push(match mode {
+                    Mode::Volume => Draw::Volume(l.id, p),
+                    _ => Draw::Flat(l.id, p),
+                });
             }
         }
         let mut all = wants.coarse;
@@ -1440,9 +2194,10 @@ impl Viewer {
     }
 
     /// Set the contrast of layer `i`'s channel `channel` (every visible channel when
-    /// None) from what is in view: the `lo` and `hi` quantiles (0..1) of the current
-    /// plane over the view's box, read at the finest level that keeps it within about a
-    /// million pixels.
+    /// None) from what is in view: the `lo` and `hi` quantiles (0..1) over the view, read
+    /// at the finest level that keeps it within about a million pixels (for a volume cut
+    /// at an angle: the voxels within half a voxel of the plane, of a box of at most
+    /// about four million voxels).
     pub fn auto_contrast(
         &mut self,
         i: usize,
@@ -1454,28 +2209,8 @@ impl Viewer {
             return Err(verr(format!("quantiles {lo} and {hi}: 0 <= lo < hi <= 1")));
         }
         let (tw, th) = self.gpu.size();
-        let screen = self.camera.screen_to_world(tw, th);
+        let plane = self.camera.plane(tw, th);
         let l = self.layer(i)?;
-        let nl = l.source.levels.len();
-        let mut pick = None;
-        for lv in 0..nl {
-            let level = &l.source.levels[lv];
-            let m = level.to_index.after(&l.inverse).after(&screen);
-            let (x0, y0, x1, y1) = index_box(&m, tw, th);
-            let cx0 = (x0 + 0.5).floor().max(0.0) as u64;
-            let cy0 = (y0 + 0.5).floor().max(0.0) as u64;
-            let cx1 = ((x1 + 0.5).floor() + 1.0).min(level.width as f64).max(0.0) as u64;
-            let cy1 = ((y1 + 0.5).floor() + 1.0).min(level.height as f64).max(0.0) as u64;
-            if cx1 <= cx0 || cy1 <= cy0 {
-                return Err(verr("the image is not in view"));
-            }
-            pick = Some((lv, cy0, cx0, cy1 - cy0, cx1 - cx0));
-            if (cx1 - cx0) * (cy1 - cy0) <= 1 << 20 {
-                break;
-            }
-        }
-        let (lv, ty, tx, h, w) = pick.ok_or_else(|| verr("the image has no levels"))?;
-        let (plane, _) = l.source.plane(lv, &l.position);
         let chans: Vec<usize> = match channel {
             Some(c) if c < l.channels.len() => vec![c],
             Some(c) => {
@@ -1488,15 +2223,11 @@ impl Viewer {
                 .filter(|&c| l.channels[c].visible)
                 .collect(),
         };
-        let mut found = Vec::new();
-        for c in chans {
-            let (start, stop) = l.source.region(&plane, c, ty, tx, h, w);
-            let data = l.source.read(lv, &start, &stop)?;
-            if let Some((a, b)) = source::quantiles(l.source.texel, &data, lo, hi) {
-                let b = if b > a { b } else { a + 1.0 };
-                found.push((c, a, b));
-            }
-        }
+        let found = if l.mode(&self.camera) == Mode::Volume {
+            volume_quantiles(l, &plane, tw, th, &chans, lo, hi)?
+        } else {
+            flat_quantiles(l, &plane, tw, th, &chans, lo, hi)?
+        };
         for (c, a, b) in found {
             let mut d = self.layers[i].channels[c].clone();
             d.lo = a;
@@ -1507,22 +2238,35 @@ impl Viewer {
     }
 
     /// What lies under screen point (`x`, `y`): the world point, and per layer the
-    /// level-0 pixel and every channel's value from the finest cached tile holding it
-    /// (read back from the GPU; the frame's level first, then coarser, then finer).
+    /// level-0 pixel (and voxel) and every channel's value from the finest cached tile or
+    /// brick holding it (read back from the GPU; the frame's level first, then coarser,
+    /// then finer).
     pub fn pick(&self, x: f64, y: f64) -> Result<Pick, ViewerError> {
-        let world = self.screen_to_world(x, y);
+        let world = self.screen_to_world_3d(x, y);
+        let (tw, th) = self.gpu.size();
+        let plane = self.camera.plane(tw, th);
         let mut layers = Vec::new();
         for (li, o) in self.layers.iter().enumerate() {
-            let (wx, wy) = o.inverse.apply(world[0], world[1]);
-            let nearest = |l: usize| -> Option<(u64, u64)> {
+            let mode = o.mode(&self.camera);
+            let nearest = |l: usize| -> Option<[u64; 3]> {
                 let lv = &o.source.levels[l];
-                let (ix, iy) = lv.to_index.apply(wx, wy);
-                let (ix, iy) = ((ix + 0.5).floor(), (iy + 0.5).floor());
-                (ix >= 0.0 && iy >= 0.0 && ix < lv.width as f64 && iy < lv.height as f64)
-                    .then_some((ix as u64, iy as u64))
+                let p = o.to_index(l).apply(world);
+                let v = p.map(|c| (c + 0.5).floor());
+                let depth_ok = !o.is_volume() || (v[2] >= 0.0 && v[2] < lv.depth as f64);
+                (v[0] >= 0.0
+                    && v[1] >= 0.0
+                    && v[0] < lv.width as f64
+                    && v[1] < lv.height as f64
+                    && depth_ok)
+                    .then_some([v[0] as u64, v[1] as u64, v[2].max(0.0) as u64])
             };
-            let pixel = nearest(0).map(|(x, y)| [x, y]);
-            let level = o.level_for(self.camera.scale);
+            let at0 = if mode == Mode::Off { None } else { nearest(0) };
+            let pixel = at0.map(|v| [v[0], v[1]]);
+            let voxel = at0.filter(|_| o.is_volume());
+            let level = match mode {
+                Mode::Volume => o.volume_level(&plane),
+                _ => o.level_for(self.camera.scale),
+            };
             let nl = o.source.levels.len();
             let order: Vec<usize> = (level..nl).chain((0..level).rev()).collect();
             let mut values = Vec::new();
@@ -1532,25 +2276,50 @@ impl Viewer {
                     value: None,
                     level: None,
                 };
-                if pixel.is_some() {
+                if at0.is_some() {
                     for &l in &order {
-                        let Some((ix, iy)) = nearest(l) else { continue };
-                        let k = o.key(
-                            ch,
-                            l,
-                            ((ix / TILE as u64) as u32, (iy / TILE as u64) as u32),
-                        );
-                        if let Some(slot) = o.cache.peek(&k) {
-                            let bytes = self.gpu.read_texel(
+                        let Some(v) = nearest(l) else { continue };
+                        let bytes = if mode == Mode::Volume {
+                            if !o.bgrid[l].2 {
+                                continue;
+                            }
+                            let step = bricks::STEP;
+                            let b = (
+                                (v[0] / step) as u32,
+                                (v[1] / step) as u32,
+                                (v[2] / step) as u32,
+                            );
+                            let k = o.brick_key(ch, l, b);
+                            let Some(slot) = o.bricks.as_ref().and_then(|br| br.cache.peek(&k))
+                            else {
+                                continue;
+                            };
+                            self.gpu.read_brick_texel(
                                 o.id,
                                 slot,
-                                (ix % TILE as u64) as u32,
-                                (iy % TILE as u64) as u32,
-                            )?;
-                            found.value = Some(o.source.texel.value(&bytes, 0));
-                            found.level = Some(l);
-                            break;
-                        }
+                                (v[0] % step) as u32,
+                                (v[1] % step) as u32,
+                                (v[2] % step) as u32,
+                            )?
+                        } else {
+                            let k = o.key(
+                                ch,
+                                l,
+                                ((v[0] / TILE as u64) as u32, (v[1] / TILE as u64) as u32),
+                            );
+                            let Some(slot) = o.cache.peek(&k) else {
+                                continue;
+                            };
+                            self.gpu.read_texel(
+                                o.id,
+                                slot,
+                                (v[0] % TILE as u64) as u32,
+                                (v[1] % TILE as u64) as u32,
+                            )?
+                        };
+                        found.value = Some(o.source.texel.value(&bytes, 0));
+                        found.level = Some(l);
+                        break;
                     }
                 }
                 values.push(found);
@@ -1558,6 +2327,7 @@ impl Viewer {
             layers.push(LayerPick {
                 layer: li,
                 pixel,
+                voxel,
                 values,
             });
         }
@@ -1588,23 +2358,148 @@ impl Viewer {
     pub fn atlas_slots(&self) -> u32 {
         self.gpu.all_slots()
     }
+
+    /// Brick slots of layer `i` (0 before a plane at an angle needed bricks).
+    pub fn brick_slots(&self, i: usize) -> Result<u32, ViewerError> {
+        Ok(self.gpu.brick_slots(self.layer(i)?.id))
+    }
+}
+
+type Found = Vec<(usize, f64, f64)>;
+
+/// Quantiles over a flat view: the view's box of the current plane at the finest level
+/// within about a million pixels.
+fn flat_quantiles(
+    l: &Layer,
+    plane: &Plane3,
+    tw: u32,
+    th: u32,
+    chans: &[usize],
+    lo: f64,
+    hi: f64,
+) -> Result<Found, ViewerError> {
+    let nl = l.source.levels.len();
+    let mut pick = None;
+    for lv in 0..nl {
+        let level = &l.source.levels[lv];
+        let m = plane.through(&l.to_index(lv)).to_2d();
+        let (x0, y0, x1, y1) = index_box(&m, tw, th);
+        let cx0 = (x0 + 0.5).floor().max(0.0) as u64;
+        let cy0 = (y0 + 0.5).floor().max(0.0) as u64;
+        let cx1 = ((x1 + 0.5).floor() + 1.0).min(level.width as f64).max(0.0) as u64;
+        let cy1 = ((y1 + 0.5).floor() + 1.0).min(level.height as f64).max(0.0) as u64;
+        if cx1 <= cx0 || cy1 <= cy0 {
+            return Err(verr("the image is not in view"));
+        }
+        pick = Some((lv, cy0, cx0, cy1 - cy0, cx1 - cx0));
+        if (cx1 - cx0) * (cy1 - cy0) <= 1 << 20 {
+            break;
+        }
+    }
+    let (lv, ty, tx, h, w) = pick.ok_or_else(|| verr("the image has no levels"))?;
+    let (plane_idx, _) = l.source.plane(lv, &l.position);
+    let mut found = Vec::new();
+    for &c in chans {
+        let (start, stop) = l.source.region(&plane_idx, c, ty, tx, h, w);
+        let data = l.source.read(lv, &start, &stop)?;
+        if let Some((a, b)) = source::quantiles(l.source.texel, &data, lo, hi) {
+            found.push((c, a, if b > a { b } else { a + 1.0 }));
+        }
+    }
+    Ok(found)
+}
+
+/// Quantiles over a volume cut at an angle: the voxels within half a voxel of the plane
+/// in the box the view spans, at the finest level whose box holds about four million
+/// voxels at most.
+fn volume_quantiles(
+    l: &Layer,
+    plane: &Plane3,
+    tw: u32,
+    th: u32,
+    chans: &[usize],
+    lo: f64,
+    hi: f64,
+) -> Result<Found, ViewerError> {
+    let nl = l.source.levels.len();
+    let mut pick = None;
+    for lv in 0..nl {
+        let level = &l.source.levels[lv];
+        let p = plane.through(&l.to_index(lv));
+        let corners = [
+            p.at(0.0, 0.0),
+            p.at(tw as f64, 0.0),
+            p.at(0.0, th as f64),
+            p.at(tw as f64, th as f64),
+        ];
+        let size = [level.width, level.height, level.depth];
+        let mut b = [(0u64, 0u64); 3];
+        for a in 0..3 {
+            let mn = corners.iter().map(|c| c[a]).fold(f64::MAX, f64::min);
+            let mx = corners.iter().map(|c| c[a]).fold(f64::MIN, f64::max);
+            let s = (mn + 0.5).floor().max(0.0) as u64;
+            let e = (((mx + 0.5).floor() + 1.0).max(0.0) as u64).min(size[a]);
+            if e <= s {
+                return Err(verr("the image is not in view"));
+            }
+            b[a] = (s, e);
+        }
+        let voxels: u64 = b.iter().map(|(s, e)| e - s).product();
+        pick = Some((lv, b, p));
+        if voxels <= 1 << 22 {
+            break;
+        }
+    }
+    let (lv, b, p) = pick.ok_or_else(|| verr("the image has no levels"))?;
+    let n = cross(p.ux, p.uy);
+    let nn = norm(n).max(1e-300);
+    let (lead, _) = l.source.lead(lv, &l.position);
+    let item = l.source.texel.bytes();
+    let mut found = Vec::new();
+    for &c in chans {
+        let (start, stop) = l.source.region3(&lead, c, b[2], b[1], b[0]);
+        let data = l.source.read(lv, &start, &stop)?;
+        let (w, h) = (b[0].1 - b[0].0, b[1].1 - b[1].0);
+        let mut near = Vec::new();
+        let total = data.len() / item;
+        for i in 0..total {
+            let (x, y, z) = (
+                b[0].0 + (i as u64 % w),
+                b[1].0 + (i as u64 / w % h),
+                b[2].0 + (i as u64 / (w * h)),
+            );
+            let d = sub([x as f64, y as f64, z as f64], p.origin);
+            if (dot(d, n) / nn).abs() <= 0.5 {
+                near.extend_from_slice(&data[i * item..(i + 1) * item]);
+            }
+        }
+        if let Some((a, bb)) = source::quantiles(l.source.texel, &near, lo, hi) {
+            found.push((c, a, if bb > a { bb } else { a + 1.0 }));
+        }
+    }
+    Ok(found)
 }
 
 /// The transform an image's "aligned" coordinate system gives it (an NGFF 0.6 edge
 /// from its own coordinate system to "aligned"), and a note when one is there but cannot
-/// be shown in a plane.
-fn saved_transform(source: &Source) -> (Affine2, Option<String>) {
+/// be shown (it touches other axes than the spatial ones, or cannot be inverted).
+fn saved_transform(source: &Source) -> (Affine3, Option<String>) {
     match &source.aligned {
-        None => (Affine2::IDENTITY, None),
-        Some(m) => match plane_transform(m, source.axes.len()).filter(|t| t.inverse().is_some()) {
-            Some(t) => (t, None),
-            None => (
-                Affine2::IDENTITY,
-                Some(format!(
-                    "the image's {ALIGNED:?} transform leaves the y-x plane (or cannot be \
-                     inverted); the image is shown without it"
-                )),
-            ),
-        },
+        None => (Affine3::IDENTITY, None),
+        Some(m) => {
+            let t = space_transform(m, source.axes.len(), source.z_axis)
+                .filter(|t| t.inverse().is_some())
+                .filter(|t| source.z_axis.is_some() || t.keeps_planes(1e-9));
+            match t {
+                Some(t) => (t, None),
+                None => (
+                    Affine3::IDENTITY,
+                    Some(format!(
+                        "the image's {ALIGNED:?} transform touches more than its spatial axes \
+                         (or cannot be inverted); the image is shown without it"
+                    )),
+                ),
+            }
+        }
     }
 }

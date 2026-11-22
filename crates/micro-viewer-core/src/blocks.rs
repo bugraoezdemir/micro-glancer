@@ -14,6 +14,9 @@
 //! sharpen instead of 0.58 s. The planes next to the current one are read ahead tile by
 //! tile instead (the scheduler).
 //!
+//! A brick (a 3-D piece of a volume, for planes at any angle) has its block over its
+//! last three axes: the chunk-aligned region around it in z, y and x.
+//!
 //! Two threads wanting the same block wait for one decode (a `OnceLock` per block).
 
 use std::collections::HashMap;
@@ -30,8 +33,9 @@ pub const BUDGET: u64 = 512 << 20;
 
 type Decoded = Result<Arc<Vec<u8>>, String>;
 
-/// A block: the image's generation, its level's array (pointer), the block's start.
-type Key = (u64, usize, Vec<u64>);
+/// A block: the image generation, its level array (pointer), the block's start and end
+/// (a tile's block and a brick's may start at the same corner).
+type Key = (u64, usize, Vec<u64>, Vec<u64>);
 
 struct Entry {
     slot: Arc<OnceLock<Decoded>>,
@@ -51,18 +55,24 @@ pub struct Blocks {
     state: Mutex<State>,
 }
 
-/// The chunk-aligned region around `start .. stop` (None: read the tile on its own).
-fn block_of(array: &SourceRef, start: &[u64], stop: &[u64]) -> Option<(Vec<u64>, Vec<u64>)> {
+/// The chunk-aligned region around `start .. stop` over the last `spatial` axes (None:
+/// read the region on its own).
+fn block_of(
+    array: &SourceRef,
+    start: &[u64],
+    stop: &[u64],
+    spatial: usize,
+) -> Option<(Vec<u64>, Vec<u64>)> {
     let grid = array.grid()?;
     let shape = array.shape();
     let n = shape.len();
-    if grid.len() != n || n < 2 {
+    if grid.len() != n || n < spatial {
         return None;
     }
     let item = array.dtype().size() as u64;
     let mut b0 = start.to_vec();
     let mut b1 = stop.to_vec();
-    for i in n - 2..n {
+    for i in n - spatial..n {
         let g = grid[i].max(1);
         b0[i] = start[i] / g * g;
         b1[i] = (stop[i].div_ceil(g) * g).min(shape[i]);
@@ -71,8 +81,7 @@ fn block_of(array: &SourceRef, start: &[u64], stop: &[u64]) -> Option<(Vec<u64>,
     (bytes <= BLOCK_MAX && (b0 != start || b1 != stop)).then_some((b0, b1))
 }
 
-/// The tile `start .. stop` (one index on every axis before the last two) out of the
-/// decoded block `b0 .. b1`.
+/// The region `start .. stop` out of the decoded block `b0 .. b1` (row-major bytes).
 fn cut(block: &[u8], b0: &[u64], b1: &[u64], start: &[u64], stop: &[u64], item: usize) -> Vec<u8> {
     let n = b0.len();
     let shape: Vec<usize> = b0.iter().zip(b1).map(|(a, b)| (b - a) as usize).collect();
@@ -80,35 +89,53 @@ fn cut(block: &[u8], b0: &[u64], b1: &[u64], start: &[u64], stop: &[u64], item: 
     for i in (0..n - 1).rev() {
         strides[i] = strides[i + 1] * shape[i + 1];
     }
-    let base: usize = (0..n)
-        .map(|i| (start[i] - b0[i]) as usize * strides[i])
-        .sum();
-    let (h, w) = (
-        (stop[n - 2] - start[n - 2]) as usize,
-        (stop[n - 1] - start[n - 1]) as usize,
-    );
-    let mut out = Vec::with_capacity(h * w * item);
-    for r in 0..h {
-        let at = (base + r * strides[n - 2]) * item;
-        out.extend_from_slice(&block[at..at + w * item]);
+    let size: Vec<usize> = start
+        .iter()
+        .zip(stop)
+        .map(|(a, b)| (b - a) as usize)
+        .collect();
+    let w = size[n - 1];
+    let rows: usize = size[..n - 1].iter().product();
+    let mut out = Vec::with_capacity(rows * w * item);
+    let mut at = vec![0usize; n - 1]; // position within the region, all axes but the last
+    for _ in 0..rows {
+        let base: usize = (0..n - 1)
+            .map(|i| (start[i] - b0[i]) as usize * strides[i] + at[i] * strides[i])
+            .sum::<usize>()
+            + (start[n - 1] - b0[n - 1]) as usize;
+        out.extend_from_slice(&block[base * item..(base + w) * item]);
+        for i in (0..n - 1).rev() {
+            at[i] += 1;
+            if at[i] < size[i] {
+                break;
+            }
+            at[i] = 0;
+        }
     }
     out
 }
 
 impl Blocks {
-    /// The tile `start .. stop` of `array` (image generation `gen`), as bytes.
+    /// The region `start .. stop` of `array` (image generation `gen`), as bytes; its
+    /// block spans the last `spatial` axes (2 for a tile, 3 for a brick).
     pub fn read(
         &self,
         gen: u64,
         array: &SourceRef,
         start: &[u64],
         stop: &[u64],
+        spatial: usize,
     ) -> Result<Vec<u8>, String> {
-        let Some((b0, b1)) = block_of(array, start, stop) else {
+        let Some((b0, b1)) = block_of(array, start, stop, spatial) else {
             return read_region(array.as_ref(), start, stop).map_err(|e| e.0);
         };
         let item = array.dtype().size();
-        let key: Key = (gen, Arc::as_ptr(array) as *const () as usize, b0.clone());
+        let key: Key = (
+            gen,
+            Arc::as_ptr(array) as *const () as usize,
+            b0.clone(),
+            b1.clone(),
+        );
         let slot = {
             let mut s = self.state.lock().expect("block cache");
             s.clock += 1;
@@ -186,5 +213,12 @@ mod tests {
             .map(|c| u16::from_ne_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(v, vec![112, 113, 114, 122, 123, 124]);
+        // a brick: both planes
+        let t = cut(&block, &b0, &b1, &[10, 6, 9], &[12, 8, 11], 2);
+        let v: Vec<u16> = t
+            .chunks(2)
+            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(v, vec![23, 24, 33, 34, 123, 124, 133, 134]);
     }
 }

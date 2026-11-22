@@ -16,13 +16,17 @@ Input (the view, and the current layer of several):
 - drag: pan; wheel: zoom at the pointer; F: fit;
 - Shift + wheel: turn the view about the pointer (5 degrees a notch); [ and ]: turn the
   view by 90 degrees; 0: turn it back;
+- volumes: Alt + drag turns the view's plane through the volume (left-right about the
+  screen's vertical, up-down about its horizontal); 1, 2, 3: look along z (XY), y (XZ)
+  or x (YZ); Page Up / Page Down move the plane by one voxel along the view; I switches
+  trilinear sampling on and off; Ctrl + Alt + drag tilts the current layer;
 - Ctrl + drag: move the current layer; Ctrl + wheel: turn it about its centre (1 degree
   a notch, with Shift 0.1); Ctrl + arrow keys: move it by one screen pixel; Ctrl + 0:
   put it back where its image places it; Ctrl + S: save its transform into its image
   (``micro_viewer.save``);
 - Tab: the next layer becomes the current one;
-- Page Up / Page Down: the current layer's first plane axis (z), with Shift the second
-  (t).
+- Page Up / Page Down: the current layer's first plane axis (z; for a volume the
+  plane moves along the view), with Shift the next one (t).
 
 HiDPI scaling is passed to the core in physical pixels.
 
@@ -48,6 +52,8 @@ from ._core import Viewer
 ZOOM_STEP = 1.25
 #: degrees per wheel notch: the view, a layer, a layer finely
 TURN_VIEW, TURN_LAYER, TURN_FINE = 5.0, 1.0, 0.1
+#: degrees per screen pixel of an Alt + drag
+TURN_DRAG = 0.3
 #: repaint interval while tiles are on their way (ms)
 POLL_MS = 15
 
@@ -79,6 +85,7 @@ class ViewerWidget(QWidget):
         self._viewer: Viewer | None = None
         self._pending: list[str] = []
         self._drag_layer = False
+        self._drag_turn = False
         self._drag = None
         self._frame: bytearray | None = None
         self.last_stats = (0, 0, 0, 0, 0)
@@ -217,8 +224,12 @@ class ViewerWidget(QWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag = event.position()
-            ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
-            self._drag_layer = ctrl and bool(self._viewer is not None and self._viewer.layers)
+            mods = event.modifiers()
+            ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+            alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+            has = bool(self._viewer is not None and self._viewer.layers)
+            self._drag_layer = ctrl and has
+            self._drag_turn = alt and has
 
     def mouseMoveEvent(self, event):
         p = event.position()
@@ -226,7 +237,11 @@ class ViewerWidget(QWidget):
         if self._drag is not None:
             dx, dy = (p.x() - self._drag.x()) * r, (p.y() - self._drag.y()) * r
             self._drag = p
-            if self._drag_layer:
+            if self._drag_turn and self._drag_layer:
+                self._guard(lambda: self.viewer.turn_layer(dx * TURN_DRAG, -dy * TURN_DRAG))
+            elif self._drag_turn:
+                self._guard(lambda: self.viewer.turn(dx * TURN_DRAG, -dy * TURN_DRAG))
+            elif self._drag_layer:
                 self._guard(lambda: self.viewer.move_layer(dx, dy))
             else:
                 self.viewer.pan(dx, dy)
@@ -288,7 +303,23 @@ class ViewerWidget(QWidget):
             v.fit()
             self._changed()
         elif key in (K.Key_PageUp, K.Key_PageDown):
-            self.step(1 if shift else 0, 1 if key == K.Key_PageUp else -1)
+            delta = 1 if key == K.Key_PageUp else -1
+            volume = bool(v.layers) and v.layers[v.current]["volume"]
+            if volume and not shift:
+                self._guard(lambda: v.step_depth(delta))
+            elif volume:
+                # the first plane axis other than z (t)
+                others = [k for k, (n, _, _) in enumerate(v.position) if n != "z"]
+                if others:
+                    self.step(others[0], delta)
+            else:
+                self.step(1 if shift else 0, delta)
+        elif key in (K.Key_1, K.Key_2, K.Key_3) and not ctrl:
+            name = {K.Key_1: "xy", K.Key_2: "xz", K.Key_3: "yz"}[key]
+            self._guard(lambda: v.set_orientation(name))
+        elif key == K.Key_I and v.layers:
+            cur = v.layers[v.current]["interpolation"]
+            self._guard(lambda: v.set_interpolation("nearest" if cur == "linear" else "linear"))
         elif key == K.Key_Tab and v.layers:
             v.current = (v.current + 1) % len(v.layers)
             self._changed()

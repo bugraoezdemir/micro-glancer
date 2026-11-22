@@ -365,7 +365,7 @@ def test_pick_reads_values_from_the_cache(stores, two):
     assert p["pixel"] == (110, 70) and p["values"][0]["value"] is None   # nothing cached
     _settled(v)
     p = v.pick(10.0, 20.0)
-    assert p["world"] == (110.0, 70.0)
+    assert p["world"] == (110.0, 70.0, 0.0)
     assert [e["value"] for e in p["values"]] == [float(two[0, 70, 110]), float(two[1, 70, 110])]
     assert all(e["level"] == 0 for e in p["values"])
     assert v.pick(-500.0, 0.0)["pixel"] is None
@@ -379,8 +379,9 @@ def test_the_view_state_round_trips(stores):
     a.set_channel(0, visible=False)
     state = a.view_state()
     doc = json.loads(state)
-    assert doc["version"] == 2
-    assert doc["camera"] == {"center": [300.0, 200.0], "scale": 0.75, "rotation": 0.0}
+    assert doc["version"] == 3
+    assert doc["camera"] == {"center": [300.0, 200.0, 0.0], "scale": 0.75, "rotation": 0.0,
+                             "orientation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]}
     assert doc["layers"][0]["channels"][1]["color"] == "#0000ff"
     b = Viewer.offscreen(300, 200)
     b.set_view_state(state)                               # opens the image too

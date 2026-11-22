@@ -4,44 +4,53 @@
 //! annotation sets join later (V9, V10).
 //!
 //! ```json
-//! {"version": 2,
-//!  "camera": {"center": [512.0, 384.0], "scale": 0.5, "rotation": 0.0},
+//! {"version": 3,
+//!  "camera": {"center": [512.0, 384.0, 20.0], "scale": 0.5, "rotation": 0.0,
+//!             "orientation": [[1, 0, 0], [0, 1, 0]]},
 //!  "current": 0,
 //!  "layers": [{"image": "C:/data/img.ome.zarr", "visible": true, "opacity": 1.0,
-//!              "transform": [[1, 0, 0], [0, 1, 0]],
-//!              "position": {"z": 118},
+//!              "interpolation": "nearest",
+//!              "transform": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]],
+//!              "position": {"z": 20, "t": 3},
 //!              "channels": [{"label": "DAPI", "color": "#0000ff", "lo": 0, "hi": 1500,
 //!                            "gamma": 1.0, "visible": true}]}]}
 //! ```
 //!
-//! `transform` is the layer's 2-D affine over (x, y) in world units: rows
-//! `[a, b, tx]`, `[c, d, ty]`. A channel's `lut` names a colour map instead of its
-//! colour.
+//! The camera's `center` is a world point (x, y, z); `orientation` holds the screen's
+//! right and down directions in the world; `rotation` is the turn about the view's
+//! normal (degrees, as for a view along z), used when there is no `orientation`. A
+//! layer's `transform` is its 3-D affine over (x, y, z) in world units: rows
+//! `[a, b, c, tx]`, `[d, e, f, ty]`, `[g, h, i, tz]` (2 rows of 3 over (x, y) are read
+//! too). A channel's `lut` names a colour map instead of its colour.
 //!
 //! Applying a state changes what it names and leaves the rest: a state with only a
 //! camera moves the camera. A state whose layers name other images than the view shows
-//! opens them (in its order); the same images are changed in place. Version 1 (one
-//! image: `image`, `position`, `channels` at the top) is read as one layer.
+//! opens them (in its order); the same images are changed in place. Versions 1 (one
+//! image: `image`, `position`, `channels` at the top) and 2 (a camera in the plane) are
+//! read too.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Affine2, ChannelDisplay, Viewer, ViewerError};
+use crate::{Affine2, Affine3, ChannelDisplay, Viewer, ViewerError};
 
 /// The current version of the view state's layout.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CameraState {
-    /// The world point (x, y) at the view's centre.
-    pub center: [f64; 2],
+    /// The world point at the view's centre: (x, y, z), or (x, y) keeping z.
+    pub center: Vec<f64>,
     /// World units per screen pixel.
     pub scale: f64,
-    /// Degrees the image appears turned clockwise.
+    /// Degrees the image appears turned clockwise (when there is no orientation).
     #[serde(default)]
     pub rotation: f64,
+    /// The screen's right and down directions in the world.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<[[f64; 3]; 2]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -72,9 +81,12 @@ pub struct LayerState {
     pub visible: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opacity: Option<f32>,
-    /// The 2-D affine over (x, y): [[a, b, tx], [c, d, ty]].
+    /// "nearest" or "linear" (volumes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transform: Option<[[f64; 3]; 2]>,
+    pub interpolation: Option<String>,
+    /// The affine over (x, y, z): 3 rows of 4 (or over (x, y): 2 rows of 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<Vec<Vec<f64>>>,
     /// Level-0 index per plane axis (z, t, ...).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub position: BTreeMap<String, f64>,
@@ -126,16 +138,45 @@ fn parse_hex(s: &str) -> Result<[f32; 3], ViewerError> {
     }
 }
 
+/// A transform from its JSON rows: 3 of 4, or 2 of 3 (over x and y).
+pub fn parse_transform(rows: &[Vec<f64>]) -> Result<Affine3, ViewerError> {
+    match (
+        rows.len(),
+        rows.iter().map(Vec::len).collect::<Vec<_>>().as_slice(),
+    ) {
+        (3, [4, 4, 4]) => Ok(Affine3 {
+            m: [
+                [rows[0][0], rows[0][1], rows[0][2], rows[0][3]],
+                [rows[1][0], rows[1][1], rows[1][2], rows[1][3]],
+                [rows[2][0], rows[2][1], rows[2][2], rows[2][3]],
+            ],
+        }),
+        (2, [3, 3]) => Ok(Affine3::from_2d(&Affine2 {
+            m: [
+                [rows[0][0], rows[0][1], rows[0][2]],
+                [rows[1][0], rows[1][1], rows[1][2]],
+            ],
+        })),
+        _ => Err(ViewerError(
+            "a transform is 3 rows of 4 ([[a, b, c, tx], [d, e, f, ty], [g, h, i, tz]]) or \
+             2 rows of 3 ([[a, b, tx], [c, d, ty]])"
+                .into(),
+        )),
+    }
+}
+
 impl ViewState {
     /// The viewer's current view.
     pub fn of(v: &Viewer) -> Self {
         let open = !v.layers().is_empty();
+        let c = &v.camera;
         ViewState {
             version: VERSION,
             camera: open.then(|| CameraState {
-                center: v.center(),
-                scale: v.camera.scale,
-                rotation: v.camera.rotation,
+                center: c.center.to_vec(),
+                scale: c.scale,
+                rotation: c.rotation(),
+                orientation: Some([c.right, c.down]),
             }),
             current: open.then(|| v.current()),
             layers: v
@@ -145,7 +186,10 @@ impl ViewState {
                     image: l.path().to_string_lossy().into_owned(),
                     visible: Some(l.visible),
                     opacity: Some(l.opacity),
-                    transform: Some(l.transform().m),
+                    interpolation: l
+                        .is_volume()
+                        .then(|| if l.linear { "linear" } else { "nearest" }.to_string()),
+                    transform: Some(l.transform().m.iter().map(|r| r.to_vec()).collect()),
                     position: l.position().into_iter().map(|(n, i, _)| (n, i)).collect(),
                     channels: l
                         .channels()
@@ -213,11 +257,12 @@ impl ViewState {
     /// changed, so a bad field leaves that layer as it was (images named are opened).
     pub fn apply(&self, v: &mut Viewer) -> Result<(), ViewerError> {
         if let Some(c) = &self.camera {
-            if !(c.scale > 0.0
+            let ok = c.scale > 0.0
                 && c.scale.is_finite()
                 && c.rotation.is_finite()
-                && c.center.iter().all(|x| x.is_finite()))
-            {
+                && (c.center.len() == 2 || c.center.len() == 3)
+                && c.center.iter().all(|x| x.is_finite());
+            if !ok {
                 return Err(ViewerError(format!(
                     "view state camera at {:?} with scale {} and rotation {}",
                     c.center, c.scale, c.rotation
@@ -252,22 +297,38 @@ impl ViewState {
                 v.add(Path::new(path))?;
             }
         }
+        // the camera first: a layer's z position then moves the camera's plane
+        if let Some(c) = &self.camera {
+            match c.orientation {
+                Some([r, d]) => v.set_orientation(r, d)?,
+                None => {
+                    let (s, k) = c.rotation.to_radians().sin_cos();
+                    v.set_orientation([k, -s, 0.0], [s, k, 0.0])?;
+                }
+            }
+            let z = c.center.get(2).copied().unwrap_or(v.camera.center[2]);
+            v.look_at_3d([c.center[0], c.center[1], z], c.scale);
+        }
+        let camera_z = self.camera.as_ref().is_some_and(|c| c.center.len() == 3);
         for (k, s) in states.iter().enumerate() {
             let i = if s.image.is_empty() { v.current() } else { k };
-            apply_layer(v, i, s)?;
+            apply_layer(v, i, s, camera_z)?;
         }
         if let Some(c) = self.current {
             v.set_current(c)?;
-        }
-        if let Some(c) = &self.camera {
-            v.camera.rotation = c.rotation.rem_euclid(360.0);
-            v.look_at(c.center, c.scale);
         }
         Ok(())
     }
 }
 
-fn apply_layer(v: &mut Viewer, i: usize, s: &LayerState) -> Result<(), ViewerError> {
+/// Apply one layer's state. With `camera_z` (the camera named its depth) a volume's z
+/// position is left to the camera.
+fn apply_layer(
+    v: &mut Viewer,
+    i: usize,
+    s: &LayerState,
+    camera_z: bool,
+) -> Result<(), ViewerError> {
     let l = v.layer(i)?;
     let n = l.channels().len();
     if s.channels.len() > n {
@@ -292,27 +353,43 @@ fn apply_layer(v: &mut Viewer, i: usize, s: &LayerState) -> Result<(), ViewerErr
         d.gamma = c.gamma.unwrap_or(d.gamma);
         d.visible = c.visible.unwrap_or(d.visible);
     }
+    let linear = match s.interpolation.as_deref() {
+        None => l.linear,
+        Some("linear") => true,
+        Some("nearest") => false,
+        Some(other) => {
+            return Err(ViewerError(format!(
+                "interpolation {other:?}: \"nearest\" or \"linear\""
+            )))
+        }
+    };
+    let transform = s.transform.as_deref().map(parse_transform).transpose()?;
+    let z_name = l.source().z_axis.map(|a| l.source().axes[a].clone());
     let old_position = l.position();
     let (visible, opacity) = (
         s.visible.unwrap_or(l.visible),
         s.opacity.unwrap_or(l.opacity),
     );
     let old_transform = l.transform();
+    if let Some(t) = transform {
+        v.set_transform(i, t)?;
+    }
     for (axis, &p) in &s.position {
+        if camera_z && Some(axis) == z_name.as_ref() {
+            continue;
+        }
         if let Err(e) = v.set_position(i, axis, p) {
             for (a, p, _) in &old_position {
-                let _ = v.set_position(i, a, *p);
+                if Some(a) != z_name.as_ref() {
+                    let _ = v.set_position(i, a, *p);
+                }
             }
-            return Err(e);
-        }
-    }
-    if let Some(m) = s.transform {
-        if let Err(e) = v.set_transform(i, Affine2 { m }) {
             let _ = v.set_transform(i, old_transform);
             return Err(e);
         }
     }
     v.set_layer(i, visible, opacity)?;
+    v.set_linear(i, linear)?;
     for (c, d) in displays.into_iter().enumerate() {
         v.set_channel(i, c, d)?;
     }
@@ -335,6 +412,10 @@ mod tests {
         assert_eq!(parse_hex("#ff8000").unwrap(), [1.0, 128.0 / 255.0, 0.0]);
         assert!(parse_hex("red").is_err());
         assert_eq!(hex([0.0, 1.0, 0.5]), "#00ff80");
+        let t = parse_transform(&[vec![1.0, 0.0, 5.0], vec![0.0, 1.0, -2.0]]).unwrap();
+        assert_eq!(t.m[0][3], 5.0);
+        assert_eq!(t.m[2], [0.0, 0.0, 1.0, 0.0]);
+        assert!(parse_transform(&[vec![1.0]]).is_err());
     }
 
     #[test]

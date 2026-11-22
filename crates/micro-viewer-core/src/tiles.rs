@@ -14,15 +14,17 @@ pub const SLOTS_PER_LAYER: u32 = SLOTS_PER_ROW * SLOTS_PER_ROW;
 
 /// One tile: the layer (its id), the plane (a hash of its indices on the axes before y
 /// and x, the channel axis left out, at its level), the channel, the level and the tile's
-/// column and row.
+/// column and row. A brick (`brick`) also has its index in z, and its plane leaves z out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileKey {
     pub layer: u16,
+    pub brick: bool,
     pub plane: u64,
     pub channel: u16,
     pub level: u8,
     pub x: u32,
     pub y: u32,
+    pub z: u32,
 }
 
 /// Which tile sits in which slot, and the frame each was last used in.
@@ -96,11 +98,13 @@ mod tests {
     fn key(x: u32) -> TileKey {
         TileKey {
             layer: 0,
+            brick: false,
             plane: 0,
             channel: 0,
             level: 0,
             x,
             y: 0,
+            z: 0,
         }
     }
 

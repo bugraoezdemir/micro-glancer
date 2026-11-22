@@ -11,7 +11,10 @@ cached frames):
 - plane: one step on the first plane axis (z or t), time until sharp (the planes next
   to the current one are read ahead when the cache has room);
 - cached: frames per second for pan and zoom over cached tiles (off-screen frames are
-  read back to memory; native frames go to the window).
+  read back to memory; native frames go to the window);
+- volumes: the whole volume, then the plane turned by 30 and 20 degrees through it
+  (drawn from bricks): time until sharp, cached frames per second, frames per second
+  while turning on (bricks coming in), and the time until sharp after that.
 
 usage: python bench/harness.py SCRATCH_DIR [IMAGE ...]
 The synthetic 16384 x 16384 uint16 pyramid is written once into SCRATCH_DIR.
@@ -119,6 +122,24 @@ def offscreen(path):
         out["plane_step_s"] = sharp(v)
     out["cached_offscreen_fps"] = cached_fps(v, lambda: v.render_into(frame_for(v)))
     out["atlas_slots"] = v.atlas_slots
+    if v.layers[0]["volume"]:
+        # the whole volume, then the plane turned through it (bricks)
+        v.fit()
+        sharp(v)
+        v.turn(30.0, 20.0)
+        out["oblique_sharp_s"] = sharp(v)
+        out["oblique_level"] = v.level
+        out["oblique_cached_fps"] = cached_fps(v, lambda: v.render_into(frame_for(v)))
+        # turning on: new bricks come in while frames go on
+        t0 = time.perf_counter()
+        for _ in range(60):
+            v.turn(0.5, 0.25)
+            v.render_into(frame_for(v))
+        v.finish()
+        out["turning_fps"] = 60 / (time.perf_counter() - t0)
+        out["turning_sharp_s"] = sharp(v)
+        out["brick_slots"] = v.brick_slots()
+        v.set_orientation("xy")
     out["adapter"] = v.adapter
     if v.error:
         out["error"] = v.error

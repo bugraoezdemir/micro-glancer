@@ -2,6 +2,9 @@
 //! per layer the tile atlas (a texture array in the image's own texel format), the
 //! buffers the shader reads (page table, levels, channels) and the channels' colour maps.
 //!
+//! A volume layer also has a brick atlas (bricks of its voxels for planes at any angle,
+//! see [`crate::bricks`]), drawn by the volume pipeline of its texel type.
+//!
 //! A frame clears to nothing, adds the layers up one by one (each drawn by the pipeline
 //! of its texel type, colours and coverage added), then fills the background where no
 //! layer drew.
@@ -11,6 +14,7 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
+use crate::bricks;
 use crate::source::Texel;
 use crate::tiles::{SLOTS_PER_LAYER, SLOTS_PER_ROW, TILE};
 use crate::ViewerError;
@@ -28,7 +32,41 @@ pub struct FrameParams {
     pub missing: [f32; 4],
     pub outside: [f32; 4],
     pub opacity: f32,
-    pub _pad: [f32; 3],
+    /// Volumes: 1 samples trilinearly between voxel centres, 0 takes the nearest voxel.
+    pub linear: u32,
+    pub _pad: [f32; 2],
+}
+
+/// One level's placement for a volume's plane (storage, 96 bytes): the voxel at screen
+/// position p is origin + p.x * ux + p.y * uy (voxel centres at integers).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct LevelGpu3 {
+    pub origin_int: [i32; 4],
+    pub origin_frac: [f32; 4],
+    pub ux: [f32; 4],
+    pub uy: [f32; 4],
+    /// Voxels along x, y, z, and the level's first page entry.
+    pub size: [i32; 4],
+    /// Bricks along x, y, z, and 1 when the level has a page table (0: never drawn).
+    pub grid: [u32; 4],
+}
+
+/// What a frame draws for one layer.
+#[derive(Clone, Copy, Debug)]
+pub enum Draw {
+    /// From the tile atlas (a plane of an image, as the image's levels lie).
+    Flat(u16, FrameParams),
+    /// From the brick atlas (a volume cut by a plane at any angle).
+    Volume(u16, FrameParams),
+}
+
+impl Draw {
+    fn params(&self) -> &FrameParams {
+        match self {
+            Draw::Flat(_, p) | Draw::Volume(_, p) => p,
+        }
+    }
 }
 
 /// One level's placement on screen for the frame (storage, 48 bytes).
@@ -101,6 +139,19 @@ struct Plane {
     /// LUT_SIZE x channels, RGBA8: row c is channel c's colour map.
     luts: wgpu::Texture,
     bind: Option<wgpu::BindGroup>,
+    /// A volume's bricks, once a plane at an angle needed them.
+    bricks: Option<BrickAtlas>,
+}
+
+/// A volume's brick atlas and the buffers its pipeline reads (channels and colour maps
+/// are the layer's).
+struct BrickAtlas {
+    params: wgpu::Buffer,
+    atlas: wgpu::Texture,
+    slots: u32,
+    pages: wgpu::Buffer,
+    levels: wgpu::Buffer,
+    bind: Option<wgpu::BindGroup>,
 }
 
 pub struct Gpu {
@@ -110,8 +161,9 @@ pub struct Gpu {
     format: wgpu::TextureFormat,
     /// Per layer id.
     planes: HashMap<u16, Plane>,
-    /// Per texel type: the layer pipeline and its bind group layout.
-    pipelines: HashMap<Texel, (wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    /// Per texel type and kind (false: tiles, true: bricks): the pipeline and its bind
+    /// group layout.
+    pipelines: HashMap<(Texel, bool), (wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
     /// Fills the background where no layer drew.
     background: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
@@ -344,14 +396,7 @@ impl Gpu {
         slots: u32,
         budget_mib: u32,
     ) -> Result<u32, ViewerError> {
-        if !self.pipelines.contains_key(&texel) {
-            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let made = self.pipeline(texel);
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                return Err(err(format!("the GPU refused the drawing pipeline: {e}")));
-            }
-            self.pipelines.insert(texel, made);
-        }
+        self.ensure_pipeline(texel, false)?;
         // the old atlas goes first, so its memory is free for the new one
         let old = self.planes.remove(&id).filter(|p| p.texel == texel);
         let mut layers = self.slots_for(texel, slots, budget_mib) / SLOTS_PER_LAYER;
@@ -382,8 +427,8 @@ impl Gpu {
                 Some(_) => layers = layers.div_ceil(2),
             }
         };
-        let (params, pages, levels, channels, luts) = match old {
-            Some(p) => (p.params, p.pages, p.levels, p.channels, p.luts),
+        let (params, pages, levels, channels, luts, mut bricks) = match old {
+            Some(p) => (p.params, p.pages, p.levels, p.channels, p.luts, p.bricks),
             None => (
                 self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("params"),
@@ -395,8 +440,12 @@ impl Gpu {
                 storage(&self.device, "levels", 48),
                 storage(&self.device, "channels", 32),
                 lut_texture(&self.device, 1),
+                None,
             ),
         };
+        if let Some(b) = &mut bricks {
+            b.bind = None;
+        }
         self.planes.insert(
             id,
             Plane {
@@ -409,9 +458,173 @@ impl Gpu {
                 channels,
                 luts,
                 bind: None,
+                bricks,
             },
         );
         Ok(layers * SLOTS_PER_LAYER)
+    }
+
+    /// The pipeline for `texel`s of one kind (false: tiles, true: bricks), made once.
+    fn ensure_pipeline(&mut self, texel: Texel, volume: bool) -> Result<(), ViewerError> {
+        if !self.pipelines.contains_key(&(texel, volume)) {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let made = self.pipeline(texel, volume);
+            if let Some(e) = pollster::block_on(scope.pop()) {
+                return Err(err(format!("the GPU refused the drawing pipeline: {e}")));
+            }
+            self.pipelines.insert((texel, volume), made);
+        }
+        Ok(())
+    }
+
+    /// The brick slots a volume can have: `wanted`, within `budget_mib` and the device's
+    /// limits (whole atlas layers of bricks::PER_LAYER bricks).
+    pub fn brick_slots_for(&self, texel: Texel, wanted: u32, budget_mib: u32) -> u32 {
+        let layer_bytes = 4096u64 * 4096 * texel.bytes() as u64;
+        let budget = (budget_mib as u64 * 1024 * 1024 / layer_bytes).max(1) as u32;
+        let limit = self.device.limits().max_texture_array_layers.max(1);
+        wanted
+            .div_ceil(bricks::PER_LAYER)
+            .clamp(1, budget.min(limit))
+            * bricks::PER_LAYER
+    }
+
+    /// Set up layer `id`'s brick atlas for `slots` bricks within `budget_mib` (a new
+    /// atlas: the old one's bricks are gone). Returns the slots made.
+    pub fn prepare_bricks(
+        &mut self,
+        id: u16,
+        slots: u32,
+        budget_mib: u32,
+    ) -> Result<u32, ViewerError> {
+        let texel = self
+            .planes
+            .get(&id)
+            .ok_or_else(|| err("no such layer"))?
+            .texel;
+        self.ensure_pipeline(texel, true)?;
+        if let Some(p) = self.planes.get_mut(&id) {
+            p.bricks = None; // its memory first
+        }
+        let mut layers = self.brick_slots_for(texel, slots, budget_mib) / bricks::PER_LAYER;
+        let (format, _, _) = texel_format(texel);
+        let atlas = loop {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let atlas = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("bricks"),
+                size: wgpu::Extent3d {
+                    width: 4096,
+                    height: 4096,
+                    depth_or_array_layers: layers,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            match pollster::block_on(scope.pop()) {
+                None => break atlas,
+                Some(e) if layers == 1 => {
+                    return Err(err(format!("no GPU memory for the brick atlas: {e}")))
+                }
+                Some(_) => layers = layers.div_ceil(2),
+            }
+        };
+        let made = BrickAtlas {
+            params: self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("brick params"),
+                size: std::mem::size_of::<FrameParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            atlas,
+            slots: layers * bricks::PER_LAYER,
+            pages: storage(&self.device, "brick pages", 4),
+            levels: storage(&self.device, "brick levels", 96),
+            bind: None,
+        };
+        let slots = made.slots;
+        if let Some(p) = self.planes.get_mut(&id) {
+            p.bricks = Some(made);
+        }
+        Ok(slots)
+    }
+
+    /// Brick slots of layer `id` (0 without a brick atlas).
+    pub fn brick_slots(&self, id: u16) -> u32 {
+        self.planes
+            .get(&id)
+            .and_then(|p| p.bricks.as_ref())
+            .map_or(0, |b| b.slots)
+    }
+
+    /// A brick's strip (bricks::STRIP_W x bricks::BRICK texels) into brick slot `slot`
+    /// of layer `id`.
+    pub fn upload_brick(&self, id: u16, slot: u32, data: &[u8]) {
+        let Some(p) = self.planes.get(&id) else {
+            return;
+        };
+        let Some(b) = &p.bricks else {
+            return;
+        };
+        let (layer, x, y) = bricks::place(slot);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &b.atlas,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: layer },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bricks::STRIP_W * p.texel.bytes() as u32),
+                rows_per_image: Some(bricks::BRICK),
+            },
+            wgpu::Extent3d {
+                width: bricks::STRIP_W,
+                height: bricks::BRICK,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Layer `id`'s brick page table (as [`Gpu::write_pages`]).
+    pub fn write_brick_pages(&mut self, id: u16, len: usize, offset: usize, data: &[u32]) -> bool {
+        let Some(b) = self.planes.get_mut(&id).and_then(|p| p.bricks.as_mut()) else {
+            return false;
+        };
+        let need = (len.max(1) * 4) as u64;
+        let mut grown = false;
+        if b.pages.size() < need {
+            b.pages = storage(&self.device, "brick pages", need.next_power_of_two());
+            b.bind = None;
+            grown = true;
+        }
+        if !data.is_empty() {
+            self.queue
+                .write_buffer(&b.pages, (offset * 4) as u64, bytemuck::cast_slice(data));
+        }
+        grown
+    }
+
+    pub fn write_brick_levels(&mut self, id: u16, data: &[LevelGpu3]) {
+        let Some(b) = self.planes.get_mut(&id).and_then(|p| p.bricks.as_mut()) else {
+            return;
+        };
+        let need = (data.len().max(1) * std::mem::size_of::<LevelGpu3>()) as u64;
+        if b.levels.size() < need {
+            b.levels = storage(&self.device, "brick levels", need.next_power_of_two());
+            b.bind = None;
+        }
+        if !data.is_empty() {
+            self.queue
+                .write_buffer(&b.levels, 0, bytemuck::cast_slice(data));
+        }
     }
 
     /// Forget layer `id` (its atlas and buffers are freed).
@@ -429,9 +642,18 @@ impl Gpu {
         self.planes.values().map(|p| p.slots).sum()
     }
 
-    fn pipeline(&self, texel: Texel) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    fn pipeline(
+        &self,
+        texel: Texel,
+        volume: bool,
+    ) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
         let (_, sample_type, wgsl_type) = texel_format(texel);
-        let source = include_str!("shader.wgsl").replace("TEXEL", wgsl_type);
+        let code = if volume {
+            include_str!("shader_bricks.wgsl")
+        } else {
+            include_str!("shader.wgsl")
+        };
+        let source = code.replace("TEXEL", wgsl_type);
         let shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -591,6 +813,9 @@ impl Gpu {
         if buf.size() < need {
             *buf = storage(device, "storage", need.next_power_of_two());
             p.bind = None;
+            if let Some(b) = &mut p.bricks {
+                b.bind = None;
+            }
             grown = true;
         }
         if !data.is_empty() {
@@ -629,6 +854,9 @@ impl Gpu {
         if p.luts.height() != n {
             p.luts = lut_texture(&self.device, n);
             p.bind = None;
+            if let Some(b) = &mut p.bricks {
+                b.bind = None;
+            }
         }
         if rows.is_empty() {
             return;
@@ -704,31 +932,103 @@ impl Gpu {
         p.bind.clone().expect("made above")
     }
 
+    fn brick_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        p: &mut Plane,
+    ) -> Option<wgpu::BindGroup> {
+        let b = p.bricks.as_mut()?;
+        if b.bind.is_none() {
+            let view = b.atlas.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+            let luts = p.luts.create_view(&Default::default());
+            b.bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bricks"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: b.params.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: b.pages.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: b.levels.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: p.channels.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&luts),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            }));
+        }
+        b.bind.clone()
+    }
+
     /// One frame into `view`: the layers in `frames` (id and parameters) in order, then
     /// the background where none drew (one opaque layer draws it itself).
-    fn draw(&mut self, view: &wgpu::TextureView, frames: &[(u16, FrameParams)]) {
+    fn draw(&mut self, view: &wgpu::TextureView, frames: &[Draw]) {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        let solo = frames.len() == 1 && frames[0].1.opacity >= 1.0;
+        let solo = frames.len() == 1 && frames[0].params().opacity >= 1.0;
         let mut drawn = Vec::new();
-        for (id, fp) in frames {
-            let Some(p) = self.planes.get_mut(id) else {
-                continue;
-            };
-            let Some((pipeline, layout)) = self.pipelines.get(&p.texel) else {
-                continue;
-            };
-            let mut fp = *fp;
+        for d in frames {
+            let mut fp = *d.params();
             if solo {
                 fp.outside = BACKGROUND;
             }
-            self.queue
-                .write_buffer(&p.params, 0, bytemuck::bytes_of(&fp));
-            let bind = Self::bind_group(&self.device, layout, &self.sampler, p);
-            drawn.push((pipeline.clone(), bind));
+            match *d {
+                Draw::Flat(id, _) => {
+                    let Some(p) = self.planes.get_mut(&id) else {
+                        continue;
+                    };
+                    let Some((pipeline, layout)) = self.pipelines.get(&(p.texel, false)) else {
+                        continue;
+                    };
+                    self.queue
+                        .write_buffer(&p.params, 0, bytemuck::bytes_of(&fp));
+                    let bind = Self::bind_group(&self.device, layout, &self.sampler, p);
+                    drawn.push((pipeline.clone(), bind));
+                }
+                Draw::Volume(id, _) => {
+                    let Some(p) = self.planes.get_mut(&id) else {
+                        continue;
+                    };
+                    let Some((pipeline, layout)) = self.pipelines.get(&(p.texel, true)) else {
+                        continue;
+                    };
+                    let Some(bind) = Self::brick_bind_group(&self.device, layout, &self.sampler, p)
+                    else {
+                        continue;
+                    };
+                    if let Some(b) = &p.bricks {
+                        self.queue
+                            .write_buffer(&b.params, 0, bytemuck::bytes_of(&fp));
+                    }
+                    drawn.push((pipeline.clone(), bind));
+                }
+            }
         }
         let clear = if drawn.is_empty() {
             let [r, g, b, a] = BACKGROUND.map(f64::from);
@@ -767,7 +1067,7 @@ impl Gpu {
     }
 
     /// One frame to the window.
-    pub fn present(&mut self, frames: &[(u16, FrameParams)]) -> Result<(), ViewerError> {
+    pub fn present(&mut self, frames: &[Draw]) -> Result<(), ViewerError> {
         let frame = match &self.target {
             Target::Surface { surface, config } => match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t)
@@ -793,11 +1093,7 @@ impl Gpu {
 
     /// One frame off-screen, read back into `out` (RGBA8 rows, width x height x 4
     /// bytes) through a readback buffer kept between frames.
-    pub fn render_into(
-        &mut self,
-        frames: &[(u16, FrameParams)],
-        out: &mut [u8],
-    ) -> Result<(), ViewerError> {
+    pub fn render_into(&mut self, frames: &[Draw], out: &mut [u8]) -> Result<(), ViewerError> {
         let (texture, w, h) = match &self.target {
             Target::Offscreen {
                 texture,
@@ -878,6 +1174,38 @@ impl Gpu {
     pub fn read_texel(&self, id: u16, slot: u32, x: u32, y: u32) -> Result<Vec<u8>, ViewerError> {
         let p = self.planes.get(&id).ok_or_else(|| err("no such layer"))?;
         let within = slot % SLOTS_PER_LAYER;
+        self.read_at(
+            &p.atlas,
+            p.texel,
+            (within % SLOTS_PER_ROW) * TILE + x,
+            (within / SLOTS_PER_ROW) * TILE + y,
+            slot / SLOTS_PER_LAYER,
+        )
+    }
+
+    /// One voxel of layer `id`'s brick slot `slot` at (`x`, `y`, `z`) within the brick.
+    pub fn read_brick_texel(
+        &self,
+        id: u16,
+        slot: u32,
+        x: u32,
+        y: u32,
+        z: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
+        let p = self.planes.get(&id).ok_or_else(|| err("no such layer"))?;
+        let b = p.bricks.as_ref().ok_or_else(|| err("no bricks"))?;
+        let (layer, sx, sy) = bricks::place(slot);
+        self.read_at(&b.atlas, p.texel, sx + z * bricks::BRICK + x, sy + y, layer)
+    }
+
+    fn read_at(
+        &self,
+        texture: &wgpu::Texture,
+        texel: Texel,
+        x: u32,
+        y: u32,
+        layer: u32,
+    ) -> Result<Vec<u8>, ViewerError> {
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("texel"),
             size: 256,
@@ -891,13 +1219,9 @@ impl Gpu {
             });
         enc.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &p.atlas,
+                texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: (within % SLOTS_PER_ROW) * TILE + x,
-                    y: (within / SLOTS_PER_ROW) * TILE + y,
-                    z: slot / SLOTS_PER_LAYER,
-                },
+                origin: wgpu::Origin3d { x, y, z: layer },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
@@ -920,7 +1244,7 @@ impl Gpu {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(err)?;
-        let out = slice.get_mapped_range().map_err(err)?[..p.texel.bytes()].to_vec();
+        let out = slice.get_mapped_range().map_err(err)?[..texel.bytes()].to_vec();
         buf.unmap();
         Ok(out)
     }
