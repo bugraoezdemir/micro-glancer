@@ -140,6 +140,19 @@ def offscreen(path):
         out["turning_sharp_s"] = sharp(v)
         out["brick_slots"] = v.brick_slots()
         v.set_orientation("xy")
+        v.fit()
+        sharp(v)
+        # the projection (maximum intensity) of the whole volume along z
+        v.mip = True
+        out["mip_sharp_s"] = sharp(v)
+        out["mip_level"] = v.render_into(frame_for(v))[3]
+        out["mip_cached_fps"] = cached_fps(v, lambda: v.render_into(frame_for(v)))
+        v.mip = False
+        # linked views: three planes and the projection in quarters
+        v.linked = True
+        out["linked_sharp_s"] = sharp(v)
+        out["linked_cached_fps"] = cached_fps(v, lambda: v.render_into(frame_for(v)))
+        v.linked = False
     out["adapter"] = v.adapter
     if v.error:
         out["error"] = v.error

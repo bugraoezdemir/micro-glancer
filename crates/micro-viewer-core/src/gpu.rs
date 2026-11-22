@@ -37,7 +37,7 @@ pub struct FrameParams {
     pub _pad: [f32; 2],
 }
 
-/// One level's placement for a volume's plane (storage, 96 bytes): the voxel at screen
+/// One level's placement for a volume's plane (storage, 112 bytes): the voxel at screen
 /// position p is origin + p.x * ux + p.y * uy (voxel centres at integers).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
@@ -50,6 +50,8 @@ pub struct LevelGpu3 {
     pub size: [i32; 4],
     /// Bricks along x, y, z, and 1 when the level has a page table (0: never drawn).
     pub grid: [u32; 4],
+    /// Projections: the voxel index change per world unit along the view's normal.
+    pub dir: [f32; 4],
 }
 
 /// What a frame draws for one layer.
@@ -59,15 +61,40 @@ pub enum Draw {
     Flat(u16, FrameParams),
     /// From the brick atlas (a volume cut by a plane at any angle).
     Volume(u16, FrameParams),
+    /// From the brick atlas: the volume projected along the view (maximum intensity).
+    Mip(u16, FrameParams),
 }
+
+/// Pipeline kinds.
+const KIND_FLAT: u8 = 0;
+const KIND_BRICKS: u8 = 1;
+const KIND_MIP: u8 = 2;
 
 impl Draw {
     fn params(&self) -> &FrameParams {
         match self {
-            Draw::Flat(_, p) | Draw::Volume(_, p) => p,
+            Draw::Flat(_, p) | Draw::Volume(_, p) | Draw::Mip(_, p) => p,
+        }
+    }
+
+    /// The layer and the pipeline kind.
+    fn target(&self) -> (u16, u8) {
+        match *self {
+            Draw::Flat(id, _) => (id, KIND_FLAT),
+            Draw::Volume(id, _) => (id, KIND_BRICKS),
+            Draw::Mip(id, _) => (id, KIND_MIP),
         }
     }
 }
+
+/// A frame being drawn: the target's view (and the window's texture, to present).
+pub struct Frame {
+    view: wgpu::TextureView,
+    surface: Option<wgpu::SurfaceTexture>,
+}
+
+/// The colour between views and of an empty view's surroundings.
+pub const GAP: [f32; 4] = [0.03, 0.03, 0.035, 1.0];
 
 /// One level's placement on screen for the frame (storage, 48 bytes).
 #[repr(C)]
@@ -161,11 +188,22 @@ pub struct Gpu {
     format: wgpu::TextureFormat,
     /// Per layer id.
     planes: HashMap<u16, Plane>,
-    /// Per texel type and kind (false: tiles, true: bricks): the pipeline and its bind
+    /// Per texel type and kind (tiles, bricks, projection): the pipeline and its bind
     /// group layout.
-    pipelines: HashMap<(Texel, bool), (wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    pipelines: HashMap<(Texel, u8), (wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
     /// Fills the background where no layer drew.
     background: wgpu::RenderPipeline,
+    /// Fills what no view covered.
+    gaps: wgpu::RenderPipeline,
+    /// The crosshair of linked views, its centre and bind group.
+    cross: wgpu::RenderPipeline,
+    cross_params: wgpu::Buffer,
+    cross_bind: wgpu::BindGroup,
+    /// A view drawn smaller (the projection) is drawn here, then scaled into its place.
+    scratch: Option<(wgpu::Texture, u32, u32)>,
+    blit: wgpu::RenderPipeline,
+    blit_layout: wgpu::BindGroupLayout,
+    blit_params: wgpu::Buffer,
     sampler: wgpu::Sampler,
     /// The off-screen frames' readback buffer, kept between frames.
     readback: Option<wgpu::Buffer>,
@@ -316,7 +354,10 @@ impl Gpu {
                 slot.get_or_insert_with(|| e.to_string());
             }
         }));
-        let background = background_pipeline(&device, format);
+        let background = background_pipeline(&device, format, BACKGROUND);
+        let gaps = background_pipeline(&device, format, GAP);
+        let (cross, cross_params, cross_bind) = cross_pipeline(&device, format);
+        let (blit, blit_layout, blit_params) = blit_pipeline(&device, format);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("colour maps"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -332,6 +373,14 @@ impl Gpu {
             planes: HashMap::new(),
             pipelines: HashMap::new(),
             background,
+            gaps,
+            cross,
+            cross_params,
+            cross_bind,
+            scratch: None,
+            blit,
+            blit_layout,
+            blit_params,
             sampler,
             readback: None,
             atlas_mib: if options.atlas_mib == 0 {
@@ -396,7 +445,7 @@ impl Gpu {
         slots: u32,
         budget_mib: u32,
     ) -> Result<u32, ViewerError> {
-        self.ensure_pipeline(texel, false)?;
+        self.ensure_pipeline(texel, KIND_FLAT)?;
         // the old atlas goes first, so its memory is free for the new one
         let old = self.planes.remove(&id).filter(|p| p.texel == texel);
         let mut layers = self.slots_for(texel, slots, budget_mib) / SLOTS_PER_LAYER;
@@ -464,15 +513,15 @@ impl Gpu {
         Ok(layers * SLOTS_PER_LAYER)
     }
 
-    /// The pipeline for `texel`s of one kind (false: tiles, true: bricks), made once.
-    fn ensure_pipeline(&mut self, texel: Texel, volume: bool) -> Result<(), ViewerError> {
-        if !self.pipelines.contains_key(&(texel, volume)) {
+    /// The pipeline for `texel`s of one kind, made once.
+    fn ensure_pipeline(&mut self, texel: Texel, kind: u8) -> Result<(), ViewerError> {
+        if !self.pipelines.contains_key(&(texel, kind)) {
             let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let made = self.pipeline(texel, volume);
+            let made = self.pipeline(texel, kind);
             if let Some(e) = pollster::block_on(scope.pop()) {
                 return Err(err(format!("the GPU refused the drawing pipeline: {e}")));
             }
-            self.pipelines.insert((texel, volume), made);
+            self.pipelines.insert((texel, kind), made);
         }
         Ok(())
     }
@@ -502,7 +551,8 @@ impl Gpu {
             .get(&id)
             .ok_or_else(|| err("no such layer"))?
             .texel;
-        self.ensure_pipeline(texel, true)?;
+        self.ensure_pipeline(texel, KIND_BRICKS)?;
+        self.ensure_pipeline(texel, KIND_MIP)?;
         if let Some(p) = self.planes.get_mut(&id) {
             p.bricks = None; // its memory first
         }
@@ -642,16 +692,18 @@ impl Gpu {
         self.planes.values().map(|p| p.slots).sum()
     }
 
-    fn pipeline(
-        &self,
-        texel: Texel,
-        volume: bool,
-    ) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    fn pipeline(&self, texel: Texel, kind: u8) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
         let (_, sample_type, wgsl_type) = texel_format(texel);
-        let code = if volume {
-            include_str!("shader_bricks.wgsl")
-        } else {
-            include_str!("shader.wgsl")
+        let code = match kind {
+            KIND_FLAT => include_str!("shader.wgsl").to_string(),
+            KIND_BRICKS => include_str!("shader_bricks.wgsl").to_string(),
+            // the projection: the brick shader's bindings and sampling (all before its
+            // fragment entry), then its own fragment entry
+            _ => {
+                let bricks = include_str!("shader_bricks.wgsl");
+                let shared = bricks.find("@fragment").map_or(bricks, |at| &bricks[..at]);
+                shared.to_string() + include_str!("shader_mip.wgsl")
+            }
         };
         let source = code.replace("TEXEL", wgsl_type);
         let shader = self
@@ -983,68 +1035,108 @@ impl Gpu {
         b.bind.clone()
     }
 
-    /// One frame into `view`: the layers in `frames` (id and parameters) in order, then
-    /// the background where none drew (one opaque layer draws it itself).
-    fn draw(&mut self, view: &wgpu::TextureView, frames: &[Draw]) {
+    /// Start a frame: the target to draw into (None: the window cannot take a frame now;
+    /// skip it).
+    pub fn begin(&mut self) -> Result<Option<Frame>, ViewerError> {
+        match &self.target {
+            Target::Surface { surface, config } => match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => Ok(Some(Frame {
+                    view: t.texture.create_view(&Default::default()),
+                    surface: Some(t),
+                })),
+                // the window changed: configure again, draw at the next frame
+                wgpu::CurrentSurfaceTexture::Outdated => {
+                    surface.configure(&self.device, config);
+                    Ok(None)
+                }
+                // hidden or busy: skip this frame
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    Ok(None)
+                }
+                _ => Err(err("the window's surface was lost")),
+            },
+            Target::Offscreen { texture, .. } => Ok(Some(Frame {
+                view: texture.create_view(&Default::default()),
+                surface: None,
+            })),
+        }
+    }
+
+    /// One view of a frame: the layers in `frames` in order, then the background where
+    /// none drew, within `rect` (x, y, width, height; None: the whole target, where one
+    /// opaque layer draws the background itself), and the crosshair at `cross` (target
+    /// pixels). The first view of a frame clears the target. Each view goes to the GPU on
+    /// its own, so views may share a layer's buffers (written before each view).
+    pub fn draw_view(
+        &mut self,
+        f: &Frame,
+        frames: &[Draw],
+        rect: Option<[u32; 4]>,
+        first: bool,
+        cross: Option<[f32; 2]>,
+    ) {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("frame"),
+                label: Some("view"),
             });
-        let solo = frames.len() == 1 && frames[0].params().opacity >= 1.0;
+        let solo = rect.is_none() && frames.len() == 1 && frames[0].params().opacity >= 1.0;
         let mut drawn = Vec::new();
         for d in frames {
             let mut fp = *d.params();
             if solo {
                 fp.outside = BACKGROUND;
             }
-            match *d {
-                Draw::Flat(id, _) => {
-                    let Some(p) = self.planes.get_mut(&id) else {
-                        continue;
-                    };
-                    let Some((pipeline, layout)) = self.pipelines.get(&(p.texel, false)) else {
-                        continue;
-                    };
+            let (id, kind) = d.target();
+            let Some(p) = self.planes.get_mut(&id) else {
+                continue;
+            };
+            let Some((pipeline, layout)) = self.pipelines.get(&(p.texel, kind)) else {
+                continue;
+            };
+            if kind == KIND_FLAT {
+                self.queue
+                    .write_buffer(&p.params, 0, bytemuck::bytes_of(&fp));
+                let bind = Self::bind_group(&self.device, layout, &self.sampler, p);
+                drawn.push((pipeline.clone(), bind));
+            } else {
+                let Some(bind) = Self::brick_bind_group(&self.device, layout, &self.sampler, p)
+                else {
+                    continue;
+                };
+                if let Some(b) = &p.bricks {
                     self.queue
-                        .write_buffer(&p.params, 0, bytemuck::bytes_of(&fp));
-                    let bind = Self::bind_group(&self.device, layout, &self.sampler, p);
-                    drawn.push((pipeline.clone(), bind));
+                        .write_buffer(&b.params, 0, bytemuck::bytes_of(&fp));
                 }
-                Draw::Volume(id, _) => {
-                    let Some(p) = self.planes.get_mut(&id) else {
-                        continue;
-                    };
-                    let Some((pipeline, layout)) = self.pipelines.get(&(p.texel, true)) else {
-                        continue;
-                    };
-                    let Some(bind) = Self::brick_bind_group(&self.device, layout, &self.sampler, p)
-                    else {
-                        continue;
-                    };
-                    if let Some(b) = &p.bricks {
-                        self.queue
-                            .write_buffer(&b.params, 0, bytemuck::bytes_of(&fp));
-                    }
-                    drawn.push((pipeline.clone(), bind));
-                }
+                drawn.push((pipeline.clone(), bind));
             }
         }
-        let clear = if drawn.is_empty() {
-            let [r, g, b, a] = BACKGROUND.map(f64::from);
-            wgpu::Color { r, g, b, a }
+        if let Some(c) = cross {
+            let data = [c[0], c[1], 0.0, 0.0];
+            self.queue
+                .write_buffer(&self.cross_params, 0, bytemuck::cast_slice(&data));
+        }
+        let load = if first {
+            let clear = if drawn.is_empty() && rect.is_none() {
+                let [r, g, b, a] = BACKGROUND.map(f64::from);
+                wgpu::Color { r, g, b, a }
+            } else {
+                wgpu::Color::TRANSPARENT
+            };
+            wgpu::LoadOp::Clear(clear)
         } else {
-            wgpu::Color::TRANSPARENT
+            wgpu::LoadOp::Load
         };
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("frame"),
+                label: Some("view"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
+                    view: &f.view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
+                        load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1053,47 +1145,166 @@ impl Gpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if let Some([x, y, w, h]) = rect {
+                pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, y, w, h);
+            }
             for (pipeline, bind) in &drawn {
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, bind, &[]);
                 pass.draw(0..3, 0..1);
             }
-            if !drawn.is_empty() && !solo {
+            if (!drawn.is_empty() || rect.is_some()) && !solo {
                 pass.set_pipeline(&self.background);
+                pass.draw(0..3, 0..1);
+            }
+            if cross.is_some() {
+                pass.set_pipeline(&self.cross);
+                pass.set_bind_group(0, &self.cross_bind, &[]);
                 pass.draw(0..3, 0..1);
             }
         }
         self.queue.submit([enc.finish()]);
     }
 
-    /// One frame to the window.
-    pub fn present(&mut self, frames: &[Draw]) -> Result<(), ViewerError> {
-        let frame = match &self.target {
-            Target::Surface { surface, config } => match surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-                // the window changed: configure again, draw at the next frame
-                wgpu::CurrentSurfaceTexture::Outdated => {
-                    surface.configure(&self.device, config);
-                    return Ok(());
-                }
-                // hidden or busy: skip this frame
-                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                    return Ok(())
-                }
-                _ => return Err(err("the window's surface was lost")),
-            },
-            Target::Offscreen { .. } => return Err(err("this viewer draws off-screen")),
-        };
-        let view = frame.texture.create_view(&Default::default());
-        self.draw(&view, frames);
-        self.queue.present(frame);
-        Ok(())
+    /// A target of `w` x `h` pixels for a view drawn smaller than its place (then
+    /// [`Gpu::blit`] scales it in).
+    pub fn scratch_frame(&mut self, w: u32, h: u32) -> Frame {
+        let fits = self
+            .scratch
+            .as_ref()
+            .is_some_and(|(_, sw, sh)| *sw == w && *sh == h);
+        if !fits {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("scratch"),
+                size: wgpu::Extent3d {
+                    width: w.max(1),
+                    height: h.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.scratch = Some((texture, w, h));
+        }
+        let (texture, _, _) = self.scratch.as_ref().expect("made above");
+        Frame {
+            view: texture.create_view(&Default::default()),
+            surface: None,
+        }
     }
 
-    /// One frame off-screen, read back into `out` (RGBA8 rows, width x height x 4
-    /// bytes) through a readback buffer kept between frames.
-    pub fn render_into(&mut self, frames: &[Draw], out: &mut [u8]) -> Result<(), ViewerError> {
+    /// Scale the scratch target into `rect` (x, y, width, height) of the frame, smoothly.
+    pub fn blit(&mut self, f: &Frame, rect: [u32; 4], first: bool) {
+        let Some((texture, _, _)) = &self.scratch else {
+            return;
+        };
+        let view = texture.create_view(&Default::default());
+        let [x, y, w, h] = rect;
+        let data = [x as f32, y as f32, w as f32, h as f32];
+        self.queue
+            .write_buffer(&self.blit_params, 0, bytemuck::cast_slice(&data));
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit"),
+            layout: &self.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.blit_params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("blit"),
+            });
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &f.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: if first {
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+            pass.set_scissor_rect(x, y, w, h);
+            pass.set_pipeline(&self.blit);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([enc.finish()]);
+    }
+
+    /// Fill what no view covered (the gaps between views) with the frame colour.
+    pub fn fill_gaps(&mut self, f: &Frame) {
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("gaps"),
+            });
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("gaps"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &f.view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.gaps);
+            pass.draw(0..3, 0..1);
+        }
+        self.queue.submit([enc.finish()]);
+    }
+
+    /// End a frame: present it to the window, or read it back into `out` (RGBA8 rows,
+    /// width x height x 4 bytes) through a readback buffer kept between frames.
+    pub fn end(&mut self, f: Frame, out: Option<&mut [u8]>) -> Result<(), ViewerError> {
+        if let Some(t) = f.surface {
+            if out.is_some() {
+                return Err(err("this viewer draws into a window"));
+            }
+            self.queue.present(t);
+            return Ok(());
+        }
+        let Some(out) = out else {
+            return Err(err("this viewer draws off-screen"));
+        };
         let (texture, w, h) = match &self.target {
             Target::Offscreen {
                 texture,
@@ -1109,8 +1320,6 @@ impl Gpu {
                 out.len()
             )));
         }
-        let view = texture.create_view(&Default::default());
-        self.draw(&view, frames);
         let row = (4 * w).div_ceil(256) * 256;
         let size = (row * h) as u64;
         if self.readback.as_ref().is_none_or(|b| b.size() != size) {
@@ -1299,8 +1508,12 @@ fn lut_texture(device: &wgpu::Device, rows: u32) -> wgpu::Texture {
 
 /// The background where no layer drew: the colour weighted by what coverage is left
 /// (1 - the target's alpha), alpha made 1.
-fn background_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
-    let [r, g, b, _] = BACKGROUND;
+fn background_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    colour: [f32; 4],
+) -> wgpu::RenderPipeline {
+    let [r, g, b, _] = colour;
     let source = format!(
         "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
              let x = f32((i << 1u) & 2u) * 2.0 - 1.0;
@@ -1348,6 +1561,194 @@ fn background_pipeline(device: &wgpu::Device, format: wgpu::TextureFormat) -> wg
         multiview_mask: None,
         cache: None,
     })
+}
+
+/// The crosshair of linked views: a line of one target pixel through the view's centre
+/// across and down, laid over what is drawn.
+fn cross_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::Buffer, wgpu::BindGroup) {
+    let source = "struct P { c: vec4<f32> }
+         @group(0) @binding(0) var<uniform> p: P;
+         @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+             let x = f32((i << 1u) & 2u) * 2.0 - 1.0;
+             let y = f32(i & 2u) * 2.0 - 1.0;
+             return vec4<f32>(x, y, 0.0, 1.0);
+         }
+         @fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+             let d = abs(pos.xy - p.c.xy);
+             if (min(d.x, d.y) > 0.5) {
+                 discard;
+             }
+             return vec4<f32>(1.0, 0.85, 0.3, 0.5);
+         }";
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("crosshair"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("crosshair"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let params = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("crosshair"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("crosshair"),
+        layout: &layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: params.as_entire_binding(),
+        }],
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("crosshair"),
+        bind_group_layouts: &[Some(&layout)],
+        ..Default::default()
+    });
+    let over = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::SrcAlpha,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Zero,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("crosshair"),
+        layout: Some(&pl),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(over),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multiview_mask: None,
+        multisample: wgpu::MultisampleState::default(),
+        cache: None,
+    });
+    (pipeline, params, bind)
+}
+
+/// Scales the scratch target into a view's place (linear filtering, written as it is).
+fn blit_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Buffer) {
+    let source = "struct P { rect: vec4<f32> }
+         @group(0) @binding(0) var<uniform> p: P;
+         @group(0) @binding(1) var t: texture_2d<f32>;
+         @group(0) @binding(2) var smp: sampler;
+         @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+             let x = f32((i << 1u) & 2u) * 2.0 - 1.0;
+             let y = f32(i & 2u) * 2.0 - 1.0;
+             return vec4<f32>(x, y, 0.0, 1.0);
+         }
+         @fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+             let uv = (pos.xy - p.rect.xy) / p.rect.zw;
+             return textureSampleLevel(t, smp, uv, 0.0);
+         }";
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("blit"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("blit"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let params = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("blit"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("blit"),
+        bind_group_layouts: &[Some(&layout)],
+        ..Default::default()
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("blit"),
+        layout: Some(&pl),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multiview_mask: None,
+        multisample: wgpu::MultisampleState::default(),
+        cache: None,
+    });
+    (pipeline, layout, params)
 }
 
 fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), ViewerError> {

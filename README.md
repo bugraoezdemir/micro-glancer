@@ -22,6 +22,11 @@ reading are Rust (the crate `micro-viewer-core`); Python gets a small API and a 
   one), or smoothly between voxel centres (trilinear), per layer. Anisotropic voxels
   are placed by their physical size. z is shared by all layers: the plane cuts every
   volume where it is in the world.
+- Linked views, switched on and off: the main view, its YZ and XZ companions (all three
+  centred on the same point, a crosshair where the planes cross) and a projection of the
+  whole volume, in quarters of the window.
+- See a volume whole: the maximum intensity projection along the view, turned freely
+  like the plane.
 - Open several images as layers in one view. They add up, each can be hidden or made
   fainter, and each can be moved and turned by hand, for example to line two images up
   before a registration tool refines it.
@@ -50,7 +55,9 @@ by 90 degrees, 0 turns it back.
 
 For a volume, Alt + drag turns the plane through it, and 1, 2 and 3 look along z, y and
 x. Page Up and Page Down move the plane one voxel along the view, and I switches
-trilinear sampling on and off.
+trilinear sampling on and off. M shows the projection instead of the plane, and L
+switches linked views on and off (dragging, the wheel and Page Up / Page Down then act in
+the view under the pointer).
 
 With several images, Tab picks the current layer. Ctrl + drag moves it, Ctrl + scroll
 turns it (1 degree a notch, with Shift 0.1), Ctrl + arrow keys nudge it by a pixel,
@@ -88,6 +95,8 @@ v.turn(30, 20)                  # turn the plane through the volume (degrees)
 v.set_interpolation("linear")   # trilinear between voxel centres
 v.step_depth(5)                 # move the plane 5 voxels along the view
 print(v.pick(512, 384)["voxel"])  # the voxel (x, y, z) under the centre
+v.mip = True                    # the maximum intensity projection along the view
+v.linked = True                 # the plane, YZ, XZ and the projection in quarters
 ```
 
 In Qt, `micro_viewer.qt.ViewerWidget` shows the layers. It emits `viewChanged` when the

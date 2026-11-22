@@ -294,6 +294,8 @@ pub struct Layer {
     bstride: u32,
     /// The bricks, once a plane at an angle needed them.
     bricks: Option<Bricks>,
+    /// Bricks could not be made (the error says why): not tried again.
+    no_bricks: bool,
 }
 
 impl Layer {
@@ -743,11 +745,46 @@ struct Wants {
 /// One frame's setting, shared by the layers.
 struct FrameCtx {
     frame: u64,
+    /// The view's size and its top-left corner in the target.
     tw: u32,
     th: u32,
+    ox: f64,
+    oy: f64,
     camera: Camera,
     moving: bool,
     threads: f64,
+}
+
+/// The most bricks a level may have to be projected (every brick is listed per frame).
+const MIP_BRICKS: u64 = 1 << 16;
+
+/// One level's placement for the brick shaders: the plane `p` (the view's own pixels)
+/// moved to target pixels by the view's corner (`ox`, `oy`), the level's size, brick
+/// layout, and the voxel change per world unit along the view's normal `dir`.
+fn level_gpu3(
+    p: &Plane3,
+    ox: f64,
+    oy: f64,
+    s: [u64; 3],
+    (g, base, usable): ([u32; 3], u32, bool),
+    dir: V3,
+) -> LevelGpu3 {
+    let origin = p.at(-ox, -oy);
+    let oi = origin.map(f64::floor);
+    LevelGpu3 {
+        origin_int: [oi[0] as i32, oi[1] as i32, oi[2] as i32, 0],
+        origin_frac: [
+            (origin[0] - oi[0]) as f32,
+            (origin[1] - oi[1]) as f32,
+            (origin[2] - oi[2]) as f32,
+            0.0,
+        ],
+        ux: [p.ux[0] as f32, p.ux[1] as f32, p.ux[2] as f32, 0.0],
+        uy: [p.uy[0] as f32, p.uy[1] as f32, p.uy[2] as f32, 0.0],
+        size: [s[0] as i32, s[1] as i32, s[2] as i32, base as i32],
+        grid: [g[0], g[1], g[2], usable as u32],
+        dir: [dir[0] as f32, dir[1] as f32, dir[2] as f32, 0.0],
+    }
 }
 
 /// Place tiles and bricks read since the last frame into their caches and atlases.
@@ -1009,7 +1046,7 @@ fn prepare_flat(
         .enumerate()
         .map(|(l, lv)| {
             let m = &to_index[l];
-            let (ox, oy) = m.apply(0.0, 0.0);
+            let (ox, oy) = m.apply(-cx.ox, -cx.oy); // the view's corner in the target
             let (ox, oy) = (ox + 0.5, oy + 0.5); // nearest centre: floor(i + 0.5)
             let (fx, fy) = (ox.floor(), oy.floor());
             let ux = m.linear(1.0, 0.0);
@@ -1042,14 +1079,16 @@ fn prepare_flat(
 }
 
 /// One volume layer's part of a frame drawn from bricks: the bricks the camera's plane
-/// cuts, centre first, at the level the zoom wants (coarser when the brick atlas cannot
-/// hold them); coarser levels stand in. Returns the parameters and the level.
+/// cuts (or, for a projection `mip`, every brick whose centre projects into the view),
+/// centre first, at the level the zoom wants (coarser when the brick atlas cannot hold
+/// them); coarser levels stand in. Returns the parameters and the level.
 fn prepare_volume(
     o: &mut Layer,
     gpu: &mut Gpu,
     cx: &FrameCtx,
     wants: &mut Wants,
     stats: &mut FrameStats,
+    mip: bool,
 ) -> (Option<FrameParams>, usize) {
     let frame = cx.frame;
     let nl = o.source.levels.len();
@@ -1075,23 +1114,45 @@ fn prepare_volume(
         .filter(|&c| o.channels[c].visible)
         .collect();
     let capacity = o.bricks.as_ref().map_or(0, |b| b.cache.capacity()) as usize;
+    // a projection lists every brick of a level: levels with few enough bricks
+    let mip_fits = |l: usize| {
+        o.bgrid[l].2 && o.bgrid[l].0.iter().map(|&v| v as u64).product::<u64>() <= MIP_BRICKS
+    };
+    let find = |l: usize| {
+        if !mip {
+            bricks::visible(&planes[l], cx.tw, cx.th, size(l))
+        } else if mip_fits(l) {
+            bricks::projected(&planes[l], cx.tw, cx.th, size(l))
+        } else {
+            Vec::new()
+        }
+    };
     let mut level = o.volume_level(&plane);
+    while mip && level + 1 < nl && !mip_fits(level) {
+        level += 1;
+    }
     let mut views: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); nl];
-    views[level] = bricks::visible(&planes[level], cx.tw, cx.th, size(level));
+    views[level] = find(level);
     // coarser while the frame's bricks would not fit the atlas
     while level + 1 < nl && views[level].len() * active.len().max(1) * 10 > capacity * 8 {
         level += 1;
-        while level + 1 < nl && !o.bgrid[level].2 {
+        while level + 1 < nl
+            && !(if mip {
+                mip_fits(level)
+            } else {
+                o.bgrid[level].2
+            })
+        {
             level += 1;
         }
-        views[level] = bricks::visible(&planes[level], cx.tw, cx.th, size(level));
+        views[level] = find(level);
     }
     let drawn = o.visible && !active.is_empty() && o.bricks.is_some();
     let mut missing_here = Vec::new();
     if drawn {
-        for l in level + 1..nl {
+        for (l, view) in views.iter_mut().enumerate().skip(level + 1) {
             if o.bgrid[l].2 {
-                views[l] = bricks::visible(&planes[l], cx.tw, cx.th, size(l));
+                *view = find(l);
             }
         }
         for &b in &views[level] {
@@ -1175,25 +1236,11 @@ fn prepare_volume(
     if !drawn {
         return (None, level);
     }
+    let normal = cx.camera.normal();
     let levels: Vec<LevelGpu3> = (0..nl)
         .map(|l| {
-            let p = &planes[l];
-            let oi = p.origin.map(f64::floor);
-            let (g, base, usable) = o.bgrid[l];
-            let s = size(l);
-            LevelGpu3 {
-                origin_int: [oi[0] as i32, oi[1] as i32, oi[2] as i32, 0],
-                origin_frac: [
-                    (p.origin[0] - oi[0]) as f32,
-                    (p.origin[1] - oi[1]) as f32,
-                    (p.origin[2] - oi[2]) as f32,
-                    0.0,
-                ],
-                ux: [p.ux[0] as f32, p.ux[1] as f32, p.ux[2] as f32, 0.0],
-                uy: [p.uy[0] as f32, p.uy[1] as f32, p.uy[2] as f32, 0.0],
-                size: [s[0] as i32, s[1] as i32, s[2] as i32, base as i32],
-                grid: [g[0], g[1], g[2], usable as u32],
-            }
+            let dir = o.to_index(l).linear(normal);
+            level_gpu3(&planes[l], cx.ox, cx.oy, size(l), o.bgrid[l], dir)
         })
         .collect();
     gpu.write_brick_levels(id, &levels);
@@ -1257,6 +1304,60 @@ pub struct Viewer {
     moved_before: Option<Instant>,
     moved_before_frame: u64,
     deferred: bool,
+    /// Linked views: the main view, its YZ and XZ companions and the projection, in
+    /// quarters of the target.
+    linked: bool,
+    /// The main view shows the projection (maximum intensity) instead of the plane.
+    mip: bool,
+}
+
+/// One view of the target: where it sits (None: the whole target), its size, camera, and
+/// whether it shows the projection.
+#[derive(Debug, Clone, Copy)]
+struct View {
+    rect: Option<[u32; 4]>,
+    w: u32,
+    h: u32,
+    camera: Camera,
+    mip: bool,
+    /// Drawn smaller than its place: the place (x, y, width, height) it is scaled into.
+    place: Option<[u32; 4]>,
+}
+
+/// The pixels a projection is drawn with at most (then scaled into its place), still and
+/// while the view moves: its rays are long.
+const MIP_PIXELS: f64 = (1 << 20) as f64;
+const MIP_PIXELS_MOVING: f64 = (1 << 18) as f64;
+
+impl View {
+    fn corner(&self) -> (f64, f64) {
+        self.rect.map_or((0.0, 0.0), |r| (r[0] as f64, r[1] as f64))
+    }
+
+    fn contains(&self, x: f64, y: f64) -> bool {
+        match self.rect {
+            None => true,
+            Some([rx, ry, rw, rh]) => {
+                x >= rx as f64 && y >= ry as f64 && x < (rx + rw) as f64 && y < (ry + rh) as f64
+            }
+        }
+    }
+}
+
+/// The gap between linked views, in target pixels.
+const GAP_PX: u32 = 2;
+
+/// The companions of a view (linked views): `which` 0 turns it to look across its
+/// screen's down axis (XZ for a view along z), 1 across its right axis (YZ).
+fn companion(c: &Camera, which: u8) -> Camera {
+    let mut out = *c;
+    if which == 0 {
+        out.down = turn(c.down, c.right, 90.0);
+    } else {
+        out.right = turn(c.right, c.down, -90.0);
+    }
+    out.tidy();
+    out
 }
 
 impl Viewer {
@@ -1297,6 +1398,8 @@ impl Viewer {
             moved_before: None,
             moved_before_frame: 0,
             deferred: false,
+            linked: false,
+            mip: false,
         }
     }
 
@@ -1387,8 +1490,14 @@ impl Viewer {
                             l.rebuild_brick_pages();
                         }
                         Err(e) => {
-                            self.remove(i);
-                            return Err(e);
+                            // the layer stays: without bricks it is drawn along z only
+                            let l = &mut self.layers[i];
+                            l.bricks = None;
+                            l.no_bricks = true;
+                            l.error.get_or_insert(format!(
+                                "no bricks for planes at an angle: {}",
+                                e.0
+                            ));
                         }
                     }
                 }
@@ -1500,6 +1609,7 @@ impl Viewer {
             bgrid,
             bstride,
             bricks: None,
+            no_bricks: false,
         };
         if first {
             // the camera's plane where the image opens (its default z)
@@ -1772,13 +1882,18 @@ impl Viewer {
     /// Move the camera's plane by `steps` voxels of the current layer's finest level
     /// along the view's normal (in a view along z: one z plane per step).
     pub fn step_depth(&mut self, steps: f64) -> Result<(), ViewerError> {
+        self.step_along(self.camera.normal(), steps)
+    }
+
+    /// Move the camera's centre by `steps` voxels of the current layer along `normal`.
+    fn step_along(&mut self, normal: V3, steps: f64) -> Result<(), ViewerError> {
         let l = self.layer(self.current)?;
-        let v = l.to_index(0).linear(self.camera.normal());
+        let v = l.to_index(0).linear(normal);
         let most = v.iter().fold(0.0f64, |m, c| m.max(c.abs()));
         if most == 0.0 {
             return Ok(());
         }
-        self.camera.center = add(self.camera.center, mul(self.camera.normal(), steps / most));
+        self.camera.center = add(self.camera.center, mul(normal, steps / most));
         self.moved();
         Ok(())
     }
@@ -1868,6 +1983,9 @@ impl Viewer {
     /// Show every visible layer the camera draws whole, centred (the orientation and the
     /// plane's depth stay).
     pub fn fit(&mut self) {
+        if self.linked {
+            return self.fit_linked();
+        }
         let (tw, th) = self.gpu.size();
         let c = self.camera;
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
@@ -1894,6 +2012,51 @@ impl Viewer {
             c.center,
             add(mul(c.right, (x0 + x1) / 2.0), mul(c.down, (y0 + y1) / 2.0)),
         );
+        self.camera.scale = scale;
+        self.moved();
+    }
+
+    /// Linked views: centre on the visible layers' middle and choose the scale that
+    /// shows them whole in every view.
+    fn fit_linked(&mut self) {
+        let corners: Vec<V3> = self
+            .layers
+            .iter()
+            .filter(|l| l.visible)
+            .flat_map(|l| l.corners())
+            .collect();
+        if corners.is_empty() {
+            return;
+        }
+        let mut lo = [f64::MAX; 3];
+        let mut hi = [f64::MIN; 3];
+        for p in &corners {
+            for a in 0..3 {
+                lo[a] = lo[a].min(p[a]);
+                hi[a] = hi[a].max(p[a]);
+            }
+        }
+        let centre = [
+            (lo[0] + hi[0]) / 2.0,
+            (lo[1] + hi[1]) / 2.0,
+            (lo[2] + hi[2]) / 2.0,
+        ];
+        self.camera.center = centre;
+        let mut scale: f64 = 1e-12;
+        for v in self.views().iter().filter(|v| !v.mip) {
+            let (mut u0, mut v0, mut u1, mut v1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+            for p in &corners {
+                let d = sub(*p, centre);
+                let (u, w) = (dot(d, v.camera.right), dot(d, v.camera.down));
+                u0 = u0.min(u);
+                v0 = v0.min(w);
+                u1 = u1.max(u);
+                v1 = v1.max(w);
+            }
+            scale = scale
+                .max(2.0 * u0.abs().max(u1.abs()) / v.w as f64)
+                .max(2.0 * v0.abs().max(v1.abs()) / v.h as f64);
+        }
         self.camera.scale = scale;
         self.moved();
     }
@@ -1928,8 +2091,46 @@ impl Viewer {
 
     /// The world point (x, y, z) at screen pixel (`x`, `y`).
     pub fn screen_to_world_3d(&self, x: f64, y: f64) -> V3 {
-        let (tw, th) = self.gpu.size();
-        self.camera.plane(tw, th).at(x, y)
+        let (v, lx, ly) = self.view_at(x, y);
+        v.camera.plane(v.w, v.h).at(lx, ly)
+    }
+
+    /// Move the view under target pixel (`x`, `y`) by `dx`, `dy` screen pixels (in
+    /// linked views every view follows: they share their centre).
+    pub fn pan_at(&mut self, x: f64, y: f64, dx: f64, dy: f64) {
+        let (v, _, _) = self.view_at(x, y);
+        let c = &v.camera;
+        let d = mul(add(mul(c.right, dx), mul(c.down, dy)), c.scale);
+        self.camera.center = sub(self.camera.center, d);
+        self.moved();
+    }
+
+    /// Move the plane of the view under target pixel (`x`, `y`) by `steps` voxels of the
+    /// current layer along that view's normal.
+    pub fn step_depth_at(&mut self, x: f64, y: f64, steps: f64) -> Result<(), ViewerError> {
+        let (v, _, _) = self.view_at(x, y);
+        self.step_along(v.camera.normal(), steps)
+    }
+
+    /// Move layer `i` by `dx`, `dy` screen pixels of the view under target pixel (`x`,
+    /// `y`).
+    pub fn move_layer_at(
+        &mut self,
+        i: usize,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    ) -> Result<(), ViewerError> {
+        let (v, _, _) = self.view_at(x, y);
+        let c = &v.camera;
+        let mut d = mul(add(mul(c.right, dx), mul(c.down, dy)), c.scale);
+        let l = self.layer(i)?;
+        if !l.is_volume() {
+            d[2] = 0.0;
+        }
+        let t = Affine3::translation(d).after(&l.transform);
+        self.set_transform(i, t)
     }
 
     /// Move the view by `dx`, `dy` screen pixels (the image follows the pointer).
@@ -2077,14 +2278,132 @@ impl Viewer {
         self.loader.set_notify(f);
     }
 
-    /// Every layer's part of the frame (flat or volume); the requests of all layers go
-    /// to the readers in priority classes.
-    fn prepare(&mut self) -> (Vec<Draw>, FrameStats) {
+    /// The views of the target: the main view alone, or linked views (the main view top
+    /// left, its YZ companion top right, its XZ companion bottom left, the projection
+    /// bottom right).
+    fn views(&self) -> Vec<View> {
+        let (w, h) = self.gpu.size();
+        if !self.linked || w < 2 * GAP_PX + 2 || h < 2 * GAP_PX + 2 {
+            return vec![View {
+                rect: None,
+                w,
+                h,
+                camera: self.camera,
+                mip: self.mip,
+                place: None,
+            }];
+        }
+        let (qw, qh) = ((w - GAP_PX) / 2, (h - GAP_PX) / 2);
+        let (rw, rh) = (w - qw - GAP_PX, h - qh - GAP_PX);
+        let view = |x: u32, y: u32, vw: u32, vh: u32, camera: Camera, mip: bool| View {
+            rect: Some([x, y, vw, vh]),
+            w: vw,
+            h: vh,
+            camera,
+            mip,
+            place: None,
+        };
+        vec![
+            view(0, 0, qw, qh, self.camera, false),
+            view(qw + GAP_PX, 0, rw, qh, companion(&self.camera, 1), false),
+            view(0, qh + GAP_PX, qw, rh, companion(&self.camera, 0), false),
+            view(qw + GAP_PX, qh + GAP_PX, rw, rh, self.camera, true),
+        ]
+    }
+
+    /// The views as drawn: a projection with more pixels than it may have is drawn
+    /// smaller (fewer while the view moves) and scaled into its place.
+    fn drawn_views(&self) -> Vec<View> {
+        let budget = if self.moving() {
+            MIP_PIXELS_MOVING
+        } else {
+            MIP_PIXELS
+        };
+        self.views()
+            .into_iter()
+            .map(|v| {
+                let f = ((v.w as f64 * v.h as f64) / budget).sqrt();
+                if !v.mip || f <= 1.0 {
+                    return v;
+                }
+                let (w, h) = (
+                    ((v.w as f64 / f).ceil() as u32).max(1),
+                    ((v.h as f64 / f).ceil() as u32).max(1),
+                );
+                let mut camera = v.camera;
+                camera.scale *= v.w as f64 / w as f64;
+                View {
+                    rect: None,
+                    w,
+                    h,
+                    camera,
+                    mip: true,
+                    place: Some(v.rect.unwrap_or([0, 0, v.w, v.h])),
+                }
+            })
+            .collect()
+    }
+
+    /// The view under target pixel (`x`, `y`), and the point in its own pixels.
+    fn view_at(&self, x: f64, y: f64) -> (View, f64, f64) {
+        let views = self.views();
+        let v = views
+            .iter()
+            .copied()
+            .find(|v| v.contains(x, y))
+            .unwrap_or(views[0]);
+        let (ox, oy) = v.corner();
+        (v, x - ox, y - oy)
+    }
+
+    /// Whether the views are linked (see [`Viewer::set_linked`]).
+    pub fn linked(&self) -> bool {
+        self.linked
+    }
+
+    /// Linked views: the main view, its YZ and XZ companions (all three centred on the
+    /// same world point, with a crosshair) and the projection, in quarters of the target.
+    pub fn set_linked(&mut self, linked: bool) {
+        self.linked = linked;
+        self.moved();
+    }
+
+    /// Whether the main view shows the projection (maximum intensity along the view).
+    pub fn mip(&self) -> bool {
+        self.mip
+    }
+
+    /// Show the projection (maximum intensity along the view through each volume) in the
+    /// main view instead of the plane.
+    pub fn set_mip(&mut self, mip: bool) {
+        self.mip = mip;
+        self.moved();
+    }
+
+    /// How layer `l` is drawn in view `v`.
+    fn mode_in(l: &Layer, v: &View) -> Mode {
+        if v.mip {
+            if l.is_volume() {
+                Mode::Volume
+            } else {
+                Mode::Off
+            }
+        } else {
+            l.mode(&v.camera)
+        }
+    }
+
+    /// The start of a frame: bricks for the volumes the views cut at an angle, then the
+    /// tiles and bricks read since the last frame into their atlases.
+    fn begin_frame(&mut self, views: &[View], stats: &mut FrameStats) {
         self.frame += 1;
-        // volumes cut at an angle need their bricks
         for i in 0..self.layers.len() {
             let l = &self.layers[i];
-            if l.visible && l.bricks.is_none() && l.mode(&self.camera) == Mode::Volume {
+            let needs = l.visible
+                && l.bricks.is_none()
+                && !l.no_bricks
+                && views.iter().any(|v| Self::mode_in(l, v) == Mode::Volume);
+            if needs {
                 if let Err(e) = self.enable_bricks(i) {
                     if let Some(l) = self.layers.get_mut(i) {
                         l.error.get_or_insert(e.0);
@@ -2092,40 +2411,61 @@ impl Viewer {
                 }
             }
         }
-        let (tw, th) = self.gpu.size();
-        let cx = FrameCtx {
-            frame: self.frame,
-            tw,
-            th,
-            camera: self.camera,
-            moving: self.moving(),
-            threads: self.threads as f64,
-        };
         let mut results = self.loader.take();
-        let mut stats = FrameStats::default();
-        let mut wants = Wants::default();
-        let mut frames = Vec::new();
-        for (i, l) in self.layers.iter_mut().enumerate() {
+        let frame = self.frame;
+        for l in self.layers.iter_mut() {
             let (mine, rest): (Vec<Loaded>, Vec<Loaded>) =
                 results.into_iter().partition(|t| t.key.layer == l.id);
             results = rest;
-            place_loaded(l, &mut self.gpu, mine, cx.frame, &mut stats);
-            let mode = l.mode(&cx.camera);
+            place_loaded(l, &mut self.gpu, mine, frame, stats);
+        }
+    }
+
+    /// Every layer's part of view `v` (flat, plane from bricks, or projection); its
+    /// requests join `wants`. The main view (`main`) gives the frame's level.
+    fn prepare_view(
+        &mut self,
+        v: &View,
+        main: bool,
+        wants: &mut Wants,
+        stats: &mut FrameStats,
+    ) -> Vec<Draw> {
+        let (ox, oy) = v.corner();
+        let cx = FrameCtx {
+            frame: self.frame,
+            tw: v.w,
+            th: v.h,
+            ox,
+            oy,
+            camera: v.camera,
+            moving: self.moving(),
+            threads: self.threads as f64,
+        };
+        let mut draws = Vec::new();
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            let mode = Self::mode_in(l, v);
             let (params, level) = match mode {
-                Mode::Flat => prepare_flat(l, &mut self.gpu, &cx, &mut wants, &mut stats),
-                Mode::Volume => prepare_volume(l, &mut self.gpu, &cx, &mut wants, &mut stats),
+                Mode::Flat => prepare_flat(l, &mut self.gpu, &cx, wants, stats),
+                Mode::Volume => prepare_volume(l, &mut self.gpu, &cx, wants, stats, v.mip),
                 Mode::Off => (None, 0),
             };
-            if i == self.current {
+            if main && i == self.current {
                 stats.level = level as u32;
             }
             if let Some(p) = params {
-                frames.push(match mode {
+                draws.push(match mode {
+                    Mode::Volume if v.mip => Draw::Mip(l.id, p),
                     Mode::Volume => Draw::Volume(l.id, p),
                     _ => Draw::Flat(l.id, p),
                 });
             }
         }
+        draws
+    }
+
+    /// The end of a frame's preparation: every view's requests to the readers, in
+    /// priority classes.
+    fn end_frame(&mut self, wants: Wants, stats: &mut FrameStats) {
         let mut all = wants.coarse;
         all.extend(wants.here);
         all.extend(wants.ring);
@@ -2133,7 +2473,56 @@ impl Viewer {
         self.loader.want(all);
         stats.pending = self.loader.pending() as u32;
         self.deferred = stats.deferred;
-        (frames, stats)
+    }
+
+    /// A frame's preparation without drawing (for settle).
+    fn prepare(&mut self) -> FrameStats {
+        let views = self.drawn_views();
+        let mut stats = FrameStats::default();
+        let mut wants = Wants::default();
+        self.begin_frame(&views, &mut stats);
+        for (k, v) in views.iter().enumerate() {
+            self.prepare_view(v, k == 0, &mut wants, &mut stats);
+        }
+        self.end_frame(wants, &mut stats);
+        stats
+    }
+
+    /// Prepare and draw a frame, view by view; present it, or read it back into `out`.
+    fn draw_frame(&mut self, out: Option<&mut [u8]>) -> Result<FrameStats, ViewerError> {
+        let views = self.drawn_views();
+        let mut stats = FrameStats::default();
+        let mut wants = Wants::default();
+        self.begin_frame(&views, &mut stats);
+        let target = self.gpu.begin()?;
+        for (k, v) in views.iter().enumerate() {
+            let draws = self.prepare_view(v, k == 0, &mut wants, &mut stats);
+            if let Some(f) = &target {
+                let cross = (self.linked && !v.mip).then(|| {
+                    let (ox, oy) = v.corner();
+                    [
+                        (ox + v.w as f64 / 2.0) as f32,
+                        (oy + v.h as f64 / 2.0) as f32,
+                    ]
+                });
+                match v.place {
+                    Some(place) => {
+                        let small = self.gpu.scratch_frame(v.w, v.h);
+                        self.gpu.draw_view(&small, &draws, None, true, None);
+                        self.gpu.blit(f, place, k == 0);
+                    }
+                    None => self.gpu.draw_view(f, &draws, v.rect, k == 0, cross),
+                }
+            }
+        }
+        self.end_frame(wants, &mut stats);
+        if let Some(f) = target {
+            if views.len() > 1 {
+                self.gpu.fill_gaps(&f);
+            }
+            self.gpu.end(f, out)?;
+        }
+        Ok(stats)
     }
 
     /// A GPU error from the last frame, as an error.
@@ -2146,16 +2535,14 @@ impl Viewer {
 
     /// Draw one frame into the window.
     pub fn render(&mut self) -> Result<FrameStats, ViewerError> {
-        let (frames, stats) = self.prepare();
-        self.gpu.present(&frames)?;
+        let stats = self.draw_frame(None)?;
         self.gpu_error()?;
         Ok(stats)
     }
 
     /// Draw one frame off-screen into `out` (RGBA8 rows, width x height x 4 bytes).
     pub fn render_into(&mut self, out: &mut [u8]) -> Result<FrameStats, ViewerError> {
-        let (frames, stats) = self.prepare();
-        self.gpu.render_into(&frames, out)?;
+        let stats = self.draw_frame(Some(out))?;
         self.gpu_error()?;
         Ok(stats)
     }
@@ -2179,7 +2566,7 @@ impl Viewer {
     ) -> Result<FrameStats, ViewerError> {
         let t0 = Instant::now();
         loop {
-            let (_, stats) = self.prepare();
+            let stats = self.prepare();
             let failed = self.layers.iter().map(|l| l.failed.len()).sum::<usize>();
             let done = if read_ahead {
                 stats.pending == 0 && !self.loader.has_results() && !stats.deferred
@@ -2242,12 +2629,13 @@ impl Viewer {
     /// brick holding it (read back from the GPU; the frame's level first, then coarser,
     /// then finer).
     pub fn pick(&self, x: f64, y: f64) -> Result<Pick, ViewerError> {
-        let world = self.screen_to_world_3d(x, y);
-        let (tw, th) = self.gpu.size();
-        let plane = self.camera.plane(tw, th);
+        let (view, lx, ly) = self.view_at(x, y);
+        let cam = view.camera;
+        let plane = cam.plane(view.w, view.h);
+        let world = plane.at(lx, ly);
         let mut layers = Vec::new();
         for (li, o) in self.layers.iter().enumerate() {
-            let mode = o.mode(&self.camera);
+            let mode = o.mode(&cam);
             let nearest = |l: usize| -> Option<[u64; 3]> {
                 let lv = &o.source.levels[l];
                 let p = o.to_index(l).apply(world);

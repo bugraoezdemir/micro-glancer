@@ -19,7 +19,11 @@ Input (the view, and the current layer of several):
 - volumes: Alt + drag turns the view's plane through the volume (left-right about the
   screen's vertical, up-down about its horizontal); 1, 2, 3: look along z (XY), y (XZ)
   or x (YZ); Page Up / Page Down move the plane by one voxel along the view; I switches
-  trilinear sampling on and off; Ctrl + Alt + drag tilts the current layer;
+  trilinear sampling on and off; Ctrl + Alt + drag tilts the current layer; M shows
+  the projection (maximum intensity along the view) instead of the plane;
+- L: linked views (the main view, its YZ and XZ companions and the projection in
+  quarters, a crosshair where the planes cross); dragging, the wheel and Page Up /
+  Page Down act in the view under the pointer;
 - Ctrl + drag: move the current layer; Ctrl + wheel: turn it about its centre (1 degree
   a notch, with Shift 0.1); Ctrl + arrow keys: move it by one screen pixel; Ctrl + 0:
   put it back where its image places it; Ctrl + S: save its transform into its image
@@ -86,6 +90,7 @@ class ViewerWidget(QWidget):
         self._pending: list[str] = []
         self._drag_layer = False
         self._drag_turn = False
+        self._mouse = (0.0, 0.0)
         self._drag = None
         self._frame: bytearray | None = None
         self.last_stats = (0, 0, 0, 0, 0)
@@ -234,17 +239,19 @@ class ViewerWidget(QWidget):
     def mouseMoveEvent(self, event):
         p = event.position()
         r = self.devicePixelRatioF()
+        self._mouse = (p.x() * r, p.y() * r)
         if self._drag is not None:
             dx, dy = (p.x() - self._drag.x()) * r, (p.y() - self._drag.y()) * r
             self._drag = p
+            px, py = p.x() * r, p.y() * r
             if self._drag_turn and self._drag_layer:
                 self._guard(lambda: self.viewer.turn_layer(dx * TURN_DRAG, -dy * TURN_DRAG))
             elif self._drag_turn:
                 self._guard(lambda: self.viewer.turn(dx * TURN_DRAG, -dy * TURN_DRAG))
             elif self._drag_layer:
-                self._guard(lambda: self.viewer.move_layer(dx, dy))
+                self._guard(lambda: self.viewer.move_layer(dx, dy, x=px, y=py))
             else:
-                self.viewer.pan(dx, dy)
+                self.viewer.pan(dx, dy, px, py)
                 self._changed()
         elif self._viewer is not None and self.receivers(self.picked) > 0:
             try:
@@ -306,7 +313,8 @@ class ViewerWidget(QWidget):
             delta = 1 if key == K.Key_PageUp else -1
             volume = bool(v.layers) and v.layers[v.current]["volume"]
             if volume and not shift:
-                self._guard(lambda: v.step_depth(delta))
+                mx, my = self._mouse
+                self._guard(lambda: v.step_depth(delta, mx, my))
             elif volume:
                 # the first plane axis other than z (t)
                 others = [k for k, (n, _, _) in enumerate(v.position) if n != "z"]
@@ -317,6 +325,12 @@ class ViewerWidget(QWidget):
         elif key in (K.Key_1, K.Key_2, K.Key_3) and not ctrl:
             name = {K.Key_1: "xy", K.Key_2: "xz", K.Key_3: "yz"}[key]
             self._guard(lambda: v.set_orientation(name))
+        elif key == K.Key_L:
+            v.linked = not v.linked
+            self._changed()
+        elif key == K.Key_M:
+            v.mip = not v.mip
+            self._changed()
         elif key == K.Key_I and v.layers:
             cur = v.layers[v.current]["interpolation"]
             self._guard(lambda: v.set_interpolation("nearest" if cur == "linear" else "linear"))

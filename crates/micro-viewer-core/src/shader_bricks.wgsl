@@ -34,6 +34,8 @@ struct Level {
     size: vec4<i32>,
     // bricks along x, y, z; w: 1 when the level has a page table
     grid: vec4<u32>,
+    // projections: the voxel index change per world unit along the view's normal
+    dir: vec4<f32>,
 }
 
 struct Channel {

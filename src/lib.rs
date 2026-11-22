@@ -267,8 +267,39 @@ impl Viewer {
         self.inner.fit();
     }
 
-    fn pan(&mut self, dx: f64, dy: f64) {
-        self.inner.pan(dx, dy);
+    /// Move the view by `dx`, `dy` screen pixels; with linked views, the view under
+    /// target pixel (`x`, `y`) (all follow: they share their centre).
+    #[pyo3(signature = (dx, dy, x = None, y = None))]
+    fn pan(&mut self, dx: f64, dy: f64, x: Option<f64>, y: Option<f64>) {
+        match (x, y) {
+            (Some(x), Some(y)) => self.inner.pan_at(x, y, dx, dy),
+            _ => self.inner.pan(dx, dy),
+        }
+    }
+
+    /// Linked views: the main view top left, its YZ companion top right, its XZ
+    /// companion bottom left (all three centred on the same world point, a crosshair
+    /// through it), the projection bottom right.
+    #[getter]
+    fn linked(&self) -> bool {
+        self.inner.linked()
+    }
+
+    #[setter]
+    fn set_linked(&mut self, linked: bool) {
+        self.inner.set_linked(linked);
+    }
+
+    /// Whether the main view shows the projection (maximum intensity along the view
+    /// through each volume) instead of the plane.
+    #[getter]
+    fn mip(&self) -> bool {
+        self.inner.mip()
+    }
+
+    #[setter]
+    fn set_mip(&mut self, mip: bool) {
+        self.inner.set_mip(mip);
     }
 
     fn zoom(&mut self, factor: f64, x: f64, y: f64) {
@@ -436,12 +467,23 @@ impl Viewer {
             .map_err(err)
     }
 
-    /// Move a layer by `dx`, `dy` screen pixels.
-    #[pyo3(signature = (dx, dy, layer = None))]
-    fn move_layer(&mut self, dx: f64, dy: f64, layer: Option<usize>) -> PyResult<()> {
+    /// Move a layer by `dx`, `dy` screen pixels (of the view under target pixel (`x`,
+    /// `y`) when given: linked views).
+    #[pyo3(signature = (dx, dy, layer = None, x = None, y = None))]
+    fn move_layer(
+        &mut self,
+        dx: f64,
+        dy: f64,
+        layer: Option<usize>,
+        x: Option<f64>,
+        y: Option<f64>,
+    ) -> PyResult<()> {
         finite(&[dx, dy])?;
         let i = self.layer_index(layer)?;
-        self.inner.move_layer(i, dx, dy).map_err(err)
+        match (x, y) {
+            (Some(x), Some(y)) => self.inner.move_layer_at(i, x, y, dx, dy).map_err(err),
+            _ => self.inner.move_layer(i, dx, dy).map_err(err),
+        }
     }
 
     /// Turn a layer by `degrees` about the view's normal (clockwise on screen; a 2-D
@@ -540,10 +582,13 @@ impl Viewer {
 
     /// Move the view's plane by `steps` voxels of the current layer along the view's
     /// normal (along z: one plane per step).
-    #[pyo3(signature = (steps = 1.0))]
-    fn step_depth(&mut self, steps: f64) -> PyResult<()> {
+    #[pyo3(signature = (steps = 1.0, x = None, y = None))]
+    fn step_depth(&mut self, steps: f64, x: Option<f64>, y: Option<f64>) -> PyResult<()> {
         finite(&[steps])?;
-        self.inner.step_depth(steps).map_err(err)
+        match (x, y) {
+            (Some(x), Some(y)) => self.inner.step_depth_at(x, y, steps).map_err(err),
+            _ => self.inner.step_depth(steps).map_err(err),
+        }
     }
 
     /// The world point (x, y, z) at the view's centre.

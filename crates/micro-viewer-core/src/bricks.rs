@@ -169,6 +169,34 @@ pub fn visible(plane: &Plane3, tw: u32, th: u32, size: [u64; 3]) -> Vec<(u32, u3
     out.into_iter().map(|(_, i)| i).collect()
 }
 
+/// Every brick of a volume of `size` (x, y, z) voxels whose centre projects (along the
+/// plane's normal) into a `tw` x `th` target with a brick's reach around it: what a
+/// projection through the whole volume needs; those nearest the target's centre first.
+pub fn projected(plane: &Plane3, tw: u32, th: u32, size: [u64; 3]) -> Vec<(u32, u32, u32)> {
+    let (w, h) = (tw as f64, th as f64);
+    let step_px = norm(plane.ux).min(norm(plane.uy)).max(1e-12);
+    let reach = (BRICK as f64 * 0.87) / step_px + 1.0;
+    let (gx, gy, gz) = (count(size[0]), count(size[1]), count(size[2]));
+    let mut out = Vec::new();
+    for bz in 0..gz {
+        for by in 0..gy {
+            for bx in 0..gx {
+                let centre =
+                    [bx, by, bz].map(|b| b as f64 * STEP as f64 + BRICK as f64 / 2.0 - 0.5);
+                let (sx, sy) = to_screen(plane, centre);
+                if sx >= -reach && sx <= w + reach && sy >= -reach && sy <= h + reach {
+                    out.push((
+                        (sx - w / 2.0).powi(2) + (sy - h / 2.0).powi(2),
+                        (bx, by, bz),
+                    ));
+                }
+            }
+        }
+    }
+    out.sort_by(|p, q| p.0.total_cmp(&q.0));
+    out.into_iter().map(|(_, i)| i).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
