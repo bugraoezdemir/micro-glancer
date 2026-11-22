@@ -88,3 +88,29 @@ def test_the_app_window(qapp, images, monkeypatch):
     _pump(qapp, 0.1)
     assert "layer 1/" not in win.status.text()           # one layer left: no layer count
     win.close()
+
+
+def test_the_add_and_open_buttons(qapp, images, monkeypatch):
+    """The toolbar's Add layer (it calls the dialog with add=True: once killed the app)."""
+    monkeypatch.setenv("MICRO_VIEWER_MODE", "offscreen")
+    from PyQt6.QtGui import QAction
+    from PyQt6.QtWidgets import QFileDialog
+    from micro_viewer.app import MainWindow
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: images["flat"]))
+    win = MainWindow([images["vol"]])
+    win.show()
+    _pump(qapp)
+    actions = {a.text(): a for a in win.findChildren(QAction)}
+    actions["Add layer"].trigger()
+    _pump(qapp, 0.3)
+    assert len(win.view.viewer.layers) == 2
+    actions["Open"].trigger()                            # replaces the layers
+    _pump(qapp, 0.3)
+    assert len(win.view.viewer.layers) == 1
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(images["flat"]) + "-missing"))
+    actions["Add layer"].trigger()                       # an error: reported, no crash
+    _pump(qapp, 0.2)
+    assert "missing" in win.status.text() or win.view.viewer.error is None
+    win.close()

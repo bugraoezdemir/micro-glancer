@@ -52,6 +52,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter
 from PyQt6.QtWidgets import QWidget
 
+from . import ERRORS
 from ._core import Viewer
 
 #: zoom per wheel notch
@@ -158,7 +159,7 @@ class ViewerWidget(QWidget):
         from .save import save_transform
         try:
             done = save_transform(self.viewer)
-        except Exception as exc:  # noqa: BLE001 (see the module's notes)
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
             self._fail(exc, force=True)
             return None
         self.saved.emit(done)
@@ -183,7 +184,7 @@ class ViewerWidget(QWidget):
     def paintEvent(self, _event):
         try:
             self._paint()
-        except Exception as exc:  # noqa: BLE001 (see the module's notes)
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
             self._fail(exc)
             if self.mode != "native":
                 painter = QPainter(self)
@@ -214,7 +215,7 @@ class ViewerWidget(QWidget):
             w, h, _ = self._pixels()
             try:
                 self._viewer.resize(w, h)
-            except Exception as exc:  # noqa: BLE001 (see the module's notes)
+            except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
                 self._fail(exc)
         super().resizeEvent(event)
 
@@ -223,11 +224,23 @@ class ViewerWidget(QWidget):
         """Run an input step; report its error instead of raising (see the notes)."""
         try:
             step()
-        except Exception as exc:  # noqa: BLE001
+        except ERRORS as exc:  # noqa: BLE001
             self._fail(exc, force=True)
             return
         self._changed()
 
+    def _safe(handler):  # noqa: N805 (a decorator in the class body)
+        """An event handler that reports its error on `failed` instead of raising."""
+        def run(self, *args):
+            try:
+                return handler(self, *args)
+            except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
+                self._fail(exc, force=True)
+        run.__name__ = handler.__name__
+        run.__doc__ = handler.__doc__
+        return run
+
+    @_safe
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag = event.position()
@@ -238,6 +251,7 @@ class ViewerWidget(QWidget):
             self._drag_layer = ctrl and has
             self._drag_turn = alt and has
 
+    @_safe
     def mouseMoveEvent(self, event):
         p = event.position()
         r = self.devicePixelRatioF()
@@ -258,12 +272,13 @@ class ViewerWidget(QWidget):
         elif self._viewer is not None and self.receivers(self.picked) > 0:
             try:
                 self.picked.emit(self._viewer.pick(p.x() * r, p.y() * r))
-            except Exception as exc:  # noqa: BLE001 (see the module's notes)
+            except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
                 self._fail(exc)
 
     def mouseReleaseEvent(self, _event):
         self._drag = None
 
+    @_safe
     def wheelEvent(self, event):
         d = event.angleDelta()
         steps = (d.y() or d.x()) / 120.0                 # Shift may turn the wheel sideways
@@ -300,6 +315,7 @@ class ViewerWidget(QWidget):
     def focusNextPrevChild(self, _next):
         return False                                     # Tab picks the layer here
 
+    @_safe
     def keyPressEvent(self, event):
         key, K = event.key(), Qt.Key
         mods = event.modifiers()

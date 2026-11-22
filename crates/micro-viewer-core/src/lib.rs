@@ -1645,6 +1645,10 @@ impl Viewer {
     /// plane put at its default z). It becomes the current layer; returns its index.
     pub fn add(&mut self, path: &Path) -> Result<usize, ViewerError> {
         let source = Source::open(path)?;
+        if source.z_axis.is_some() {
+            // its brick and projection pipelines, built while the plane is looked at
+            self.gpu.warm(source.texel);
+        }
         let (transform, note) = saved_transform(&source);
         let nc = source.channels.len();
         let id = self.fresh_id();

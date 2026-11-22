@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget, QF
                              QMessageBox, QPushButton, QSlider, QToolBar, QVBoxLayout,
                              QWidget)
 
+from . import ERRORS
 from .panel import ChannelPanel
 from .qt import ViewerWidget
 
@@ -51,10 +52,10 @@ def _guarded(method):
     """A slot that shows its error in the status bar instead of raising (PyQt6 ends
     the process when a slot raises)."""
     @functools.wraps(method)
-    def run(self, *args):
+    def run(self, *args, **kwargs):
         try:
-            return method(self, *args)
-        except Exception as exc:  # noqa: BLE001
+            return method(self, *args, **kwargs)
+        except ERRORS as exc:  # noqa: BLE001 (a Rust panic too)
             self.note(str(exc))
     return run
 
@@ -119,7 +120,7 @@ class LayerPanel(QWidget):
             return
         try:
             step(self.window.view.viewer)
-        except Exception as exc:  # noqa: BLE001 (see _guarded)
+        except ERRORS as exc:  # noqa: BLE001 (see _guarded)
             self.window.note(str(exc))
             return
         self.window.view._changed()
@@ -192,7 +193,7 @@ class PlanePanel(QWidget):
     def _moved(self, name, value):
         try:
             self.window.view.viewer.set_position(name, float(value))
-        except Exception as exc:  # noqa: BLE001 (see _guarded)
+        except ERRORS as exc:  # noqa: BLE001 (see _guarded)
             self.window.note(str(exc))
             return
         self.window.view._changed()
@@ -344,7 +345,7 @@ class MainWindow(QMainWindow):
         if paths:
             try:
                 self.open_paths(paths, add=bool(self.view.viewer.layers))
-            except Exception as exc:  # noqa: BLE001 (see _guarded)
+            except ERRORS as exc:  # noqa: BLE001 (see _guarded)
                 self.note(str(exc))
 
     def showEvent(self, event):
@@ -362,7 +363,7 @@ class MainWindow(QMainWindow):
     def _apply(self, step):
         try:
             step(self.view.viewer)
-        except Exception as exc:  # noqa: BLE001 (see _guarded)
+        except ERRORS as exc:  # noqa: BLE001 (see _guarded)
             self.note(str(exc))
             return
         self.view._changed()
@@ -398,6 +399,7 @@ class MainWindow(QMainWindow):
         self._apply(step)
 
     # ------------------------------------------------------------------ following the view
+    @_guarded
     def _view_changed(self):
         v = self.view.viewer
         self.layer_panel.refresh()
@@ -430,6 +432,7 @@ class MainWindow(QMainWindow):
         self._note = text
         self._show()
 
+    @_guarded
     def _picked(self, p):
         try:
             if p["pixel"] is None:
@@ -442,14 +445,14 @@ class MainWindow(QMainWindow):
                 where = (f"x={p['voxel'][0]} y={p['voxel'][1]} z={p['voxel'][2]}"
                          if p.get("voxel") else f"x={p['pixel'][0]} y={p['pixel'][1]}")
                 self._pick = f"{where}  {vals}"
-        except Exception as exc:  # noqa: BLE001 (see _guarded)
+        except ERRORS as exc:  # noqa: BLE001 (see _guarded)
             self._pick = str(exc)
         self._show()
 
     def _show(self):
         try:
             v = self.view.viewer
-        except Exception as exc:  # noqa: BLE001 (see _guarded)
+        except ERRORS as exc:  # noqa: BLE001 (see _guarded)
             self.status.setText(str(exc))
             return
         layers = v.layers

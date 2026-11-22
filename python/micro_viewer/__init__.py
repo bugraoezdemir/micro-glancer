@@ -5,6 +5,10 @@
 in a shared world); ``micro_viewer.save.save_transform`` writes a layer's transform into
 its image. Incubation: tasks V7 and V9, not released.
 """
-from ._core import ALIGNED, COLOUR_MAPS, Viewer, ViewerError, __version__
+from ._core import ALIGNED, COLOUR_MAPS, PanicException, Viewer, ViewerError, __version__
 
-__all__ = ["ALIGNED", "COLOUR_MAPS", "Viewer", "ViewerError", "__version__"]
+#: what a Qt host catches around the viewer: errors, and a Rust panic (which Python sees
+#: as a BaseException; PyQt6 ends the process when a slot lets one through)
+ERRORS = (Exception, PanicException)
+
+__all__ = ["ALIGNED", "COLOUR_MAPS", "ERRORS", "Viewer", "ViewerError", "__version__"]

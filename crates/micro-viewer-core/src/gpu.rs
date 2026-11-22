@@ -69,6 +69,9 @@ pub enum Draw {
     Mip(u16, FrameParams),
 }
 
+/// A pipeline and its bind group layout.
+type Built = (wgpu::RenderPipeline, wgpu::BindGroupLayout);
+
 /// Pipeline kinds.
 const KIND_FLAT: u8 = 0;
 const KIND_BRICKS: u8 = 1;
@@ -201,6 +204,8 @@ pub struct Gpu {
     /// Per texel type and kind (tiles, bricks, projection): the pipeline and its bind
     /// group layout.
     pipelines: HashMap<(Texel, u8), (wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
+    /// Pipelines being built on threads (see [`Gpu::warm`]).
+    warming: HashMap<(Texel, u8), std::thread::JoinHandle<Result<Built, String>>>,
     /// Fills the background where no layer drew.
     background: wgpu::RenderPipeline,
     /// Fills what no view covered.
@@ -227,10 +232,29 @@ fn err(e: impl std::fmt::Display) -> ViewerError {
     ViewerError(e.to_string())
 }
 
-fn instance() -> wgpu::Instance {
+fn instance_for(backends: wgpu::Backends) -> wgpu::Instance {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-    desc.backends = wgpu::Backends::PRIMARY;
+    desc.backends = backends;
     wgpu::Instance::new(desc)
+}
+
+/// The backends to try, in order: `MICRO_VIEWER_BACKEND` ("vulkan", "dx12", "metal",
+/// "gl") picks one; else Vulkan first on Windows (DX12's shader compiler took 7 to 11 s
+/// for the projection shader, uncached, freezing the window), then the platform's own.
+fn backend_choices() -> Vec<wgpu::Backends> {
+    use wgpu::Backends as B;
+    match std::env::var("MICRO_VIEWER_BACKEND")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "vulkan" => vec![B::VULKAN],
+        "dx12" => vec![B::DX12],
+        "metal" => vec![B::METAL],
+        "gl" => vec![B::GL],
+        _ if cfg!(windows) => vec![B::VULKAN, B::PRIMARY],
+        _ => vec![B::PRIMARY],
+    }
 }
 
 fn texel_format(t: Texel) -> (wgpu::TextureFormat, wgpu::TextureSampleType, &'static str) {
@@ -266,20 +290,34 @@ impl Gpu {
         height: u32,
         options: GpuOptions,
     ) -> Result<Self, ViewerError> {
-        let instance = instance();
-        let surface = instance
-            .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: Some(display),
-                raw_window_handle: window,
-            })
-            .map_err(err)?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: options.software,
-            compatible_surface: Some(&surface),
-            apply_limit_buckets: false,
-        }))
-        .map_err(err)?;
+        let mut last = None;
+        let (surface, adapter) = 'found: {
+            for backends in backend_choices() {
+                let instance = instance_for(backends);
+                let surface =
+                    match instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                        raw_display_handle: Some(display),
+                        raw_window_handle: window,
+                    }) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            last = Some(err(e));
+                            continue;
+                        }
+                    };
+                let options = wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: options.software,
+                    compatible_surface: Some(&surface),
+                    apply_limit_buckets: false,
+                };
+                match pollster::block_on(instance.request_adapter(&options)) {
+                    Ok(adapter) => break 'found (surface, adapter),
+                    Err(e) => last = Some(err(e)),
+                }
+            }
+            return Err(last.unwrap_or_else(|| err("no GPU adapter for the window")));
+        };
         let (device, queue) = request_device(&adapter)?;
         let caps = surface.get_capabilities(&adapter);
         // a plain (non-sRGB) format: the shader's values are written as they are
@@ -322,14 +360,23 @@ impl Gpu {
 
     /// A GPU drawing into an off-screen texture of `width` x `height` pixels.
     pub fn offscreen(width: u32, height: u32, options: GpuOptions) -> Result<Self, ViewerError> {
-        let instance = instance();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: options.software,
-            compatible_surface: None,
-            apply_limit_buckets: false,
-        }))
-        .map_err(err)?;
+        let mut last = None;
+        let adapter = 'found: {
+            for backends in backend_choices() {
+                let instance = instance_for(backends);
+                let options = wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: options.software,
+                    compatible_surface: None,
+                    apply_limit_buckets: false,
+                };
+                match pollster::block_on(instance.request_adapter(&options)) {
+                    Ok(adapter) => break 'found adapter,
+                    Err(e) => last = Some(err(e)),
+                }
+            }
+            return Err(last.unwrap_or_else(|| err("no GPU adapter")));
+        };
         let (device, queue) = request_device(&adapter)?;
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let texture = offscreen_texture(&device, format, width, height);
@@ -381,6 +428,7 @@ impl Gpu {
             target,
             format,
             planes: HashMap::new(),
+            warming: HashMap::new(),
             pipelines: HashMap::new(),
             background,
             gaps,
@@ -525,15 +573,54 @@ impl Gpu {
 
     /// The pipeline for `texel`s of one kind, made once.
     fn ensure_pipeline(&mut self, texel: Texel, kind: u8) -> Result<(), ViewerError> {
+        // built on a thread already (or still being built: wait for it)
+        if let Some(handle) = self.warming.remove(&(texel, kind)) {
+            match handle.join() {
+                Ok(Ok(made)) => {
+                    self.pipelines.insert((texel, kind), made);
+                }
+                Ok(Err(e)) => {
+                    return Err(err(format!("the GPU refused the drawing pipeline: {e}")))
+                }
+                Err(_) => {} // the thread failed: build it here
+            }
+        }
         if !self.pipelines.contains_key(&(texel, kind)) {
             let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let made = self.pipeline(texel, kind);
+            let made = Self::build_pipeline(&self.device, self.format, texel, kind);
             if let Some(e) = pollster::block_on(scope.pop()) {
                 return Err(err(format!("the GPU refused the drawing pipeline: {e}")));
             }
             self.pipelines.insert((texel, kind), made);
         }
         Ok(())
+    }
+
+    /// Start building the volume pipelines (planes from bricks, projections) for
+    /// `texel`s on threads, so the first view that needs them does not wait for the
+    /// shader compiler.
+    pub fn warm(&mut self, texel: Texel) {
+        for kind in [KIND_BRICKS, KIND_MIP] {
+            let key = (texel, kind);
+            if self.pipelines.contains_key(&key) || self.warming.contains_key(&key) {
+                continue;
+            }
+            let device = self.device.clone();
+            let format = self.format;
+            let spawned = std::thread::Builder::new()
+                .name("micro-viewer pipelines".into())
+                .spawn(move || {
+                    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                    let made = Gpu::build_pipeline(&device, format, texel, kind);
+                    match pollster::block_on(scope.pop()) {
+                        Some(e) => Err(e.to_string()),
+                        None => Ok(made),
+                    }
+                });
+            if let Ok(handle) = spawned {
+                self.warming.insert(key, handle);
+            }
+        }
     }
 
     /// The brick slots a volume can have: `wanted`, within `budget_mib` and the device's
@@ -717,7 +804,12 @@ impl Gpu {
         self.planes.values().map(|p| p.slots).sum()
     }
 
-    fn pipeline(&self, texel: Texel, kind: u8) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    fn build_pipeline(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        texel: Texel,
+        kind: u8,
+    ) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
         let (_, sample_type, wgsl_type) = texel_format(texel);
         let code = match kind {
             KIND_FLAT => include_str!("shader.wgsl").to_string(),
@@ -731,12 +823,10 @@ impl Gpu {
             }
         };
         let source = code.replace("TEXEL", wgsl_type);
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("plane"),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
-            });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("plane"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
         let buffer = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -748,10 +838,47 @@ impl Gpu {
             count: None,
         };
         let read_only = wgpu::BufferBindingType::Storage { read_only: true };
-        let layout = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("plane"),
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("plane"),
+            entries: &[
+                buffer(0, wgpu::BufferBindingType::Uniform),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                buffer(2, read_only),
+                buffer(3, read_only),
+                buffer(4, read_only),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        // bricks: their value ranges too (binding 7)
+        let layout = if kind == KIND_FLAT {
+            layout
+        } else {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("bricks"),
                 entries: &[
                     buffer(0, wgpu::BufferBindingType::Uniform),
                     wgpu::BindGroupLayoutEntry {
@@ -783,93 +910,49 @@ impl Gpu {
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
+                    buffer(7, read_only),
                 ],
-            });
-        // bricks: their value ranges too (binding 7)
-        let layout = if kind == KIND_FLAT {
-            layout
-        } else {
-            self.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("bricks"),
-                    entries: &[
-                        buffer(0, wgpu::BufferBindingType::Uniform),
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type,
-                                view_dimension: wgpu::TextureViewDimension::D2Array,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        buffer(2, read_only),
-                        buffer(3, read_only),
-                        buffer(4, read_only),
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 5,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 6,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                        buffer(7, read_only),
-                    ],
-                })
+            })
         };
-        let pl = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("plane"),
-                bind_group_layouts: &[Some(&layout)],
-                ..Default::default()
-            });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("plane"),
+            bind_group_layouts: &[Some(&layout)],
+            ..Default::default()
+        });
         // layers add up: colours and coverage (alpha) both
         let add = wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::One,
             dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Add,
         };
-        let pipeline = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("plane"),
-                layout: Some(&pl),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: self.format,
-                        blend: Some(wgpu::BlendState {
-                            color: add,
-                            alpha: add,
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("plane"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: add,
+                        alpha: add,
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         (pipeline, layout)
     }
 

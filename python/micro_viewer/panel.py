@@ -25,7 +25,7 @@ from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel, QPushButton,
                              QSizePolicy, QVBoxLayout, QWidget)
 
-from . import COLOUR_MAPS
+from . import COLOUR_MAPS, ERRORS
 
 #: pixels within which a handle is caught
 GRAB = 6
@@ -67,7 +67,7 @@ class HistogramWidget(QWidget):
                 volume = v.layers[v.current]["volume"]
                 whole = self.whole or (volume and self._mode() is not None)
                 self._hist = v.histogram(self.channel, bins=BINS, whole=whole)
-        except Exception as exc:  # noqa: BLE001 (see the module's notes)
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
             self._hist = None
             self.view._fail(exc, force=True)
         self.update()
@@ -115,7 +115,7 @@ class HistogramWidget(QWidget):
     def paintEvent(self, _event):
         try:
             self._paint()
-        except Exception as exc:  # noqa: BLE001 (see the module's notes)
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
             self.view._fail(exc, force=True)
 
     def _paint(self):
@@ -189,7 +189,7 @@ class HistogramWidget(QWidget):
     def _apply(self, **kw):
         try:
             self.view.viewer.set_channel(self.channel, **kw)
-        except Exception as exc:  # noqa: BLE001 (see the module's notes)
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
             self.view._fail(exc, force=True)
             return
         self.changed.emit()
@@ -293,7 +293,7 @@ class ChannelPanel(QWidget):
         try:
             v = self.view.viewer
             chans = v.channels
-        except Exception as exc:  # noqa: BLE001 (see the module's notes)
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
             self.view._fail(exc, force=True)
             return
         self._filling = True
@@ -337,7 +337,7 @@ class ChannelPanel(QWidget):
             return
         try:
             self.view.viewer.set_channel(self.hist.channel, **kw)
-        except Exception as exc:  # noqa: BLE001 (see the module's notes)
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
             self.view._fail(exc, force=True)
             return
         self.view._changed()
@@ -351,7 +351,7 @@ class ChannelPanel(QWidget):
     def _auto(self):
         try:
             self.view.viewer.auto_contrast(self.hist.channel)
-        except Exception as exc:  # noqa: BLE001 (see the module's notes)
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
             self.view._fail(exc, force=True)
             return
         self.view._changed()

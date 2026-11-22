@@ -18,6 +18,15 @@ fn err(e: core::ViewerError) -> PyErr {
     ViewerError::new_err(e.0)
 }
 
+#[cfg(target_os = "windows")]
+const GWLP_HINSTANCE: i32 = -6;
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+extern "system" {
+    fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+}
+
 /// The raw handles of a native window on this platform: `window` is Qt's `winId()`
 /// (an HWND, an NSView, an X11 window), `display` the X11 Display pointer (Linux only).
 fn handles(window: usize, display: usize) -> PyResult<(RawDisplayHandle, RawWindowHandle)> {
@@ -26,9 +35,14 @@ fn handles(window: usize, display: usize) -> PyResult<(RawDisplayHandle, RawWind
         let _ = display;
         let hwnd = std::num::NonZeroIsize::new(window as isize)
             .ok_or_else(|| ViewerError::new_err("a window handle of 0"))?;
+        let mut handle = raw_window_handle::Win32WindowHandle::new(hwnd);
+        // Vulkan needs the module the window belongs to (DX12 does not)
+        // SAFETY: a plain query of a live window's attribute
+        handle.hinstance =
+            std::num::NonZeroIsize::new(unsafe { GetWindowLongPtrW(hwnd.get(), GWLP_HINSTANCE) });
         Ok((
             RawDisplayHandle::Windows(raw_window_handle::WindowsDisplayHandle::new()),
-            RawWindowHandle::Win32(raw_window_handle::Win32WindowHandle::new(hwnd)),
+            RawWindowHandle::Win32(handle),
         ))
     }
     #[cfg(target_os = "macos")]
@@ -947,6 +961,11 @@ impl Viewer {
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("ViewerError", m.py().get_type::<ViewerError>())?;
+    // a Rust panic reaches Python as this (a BaseException): hosts catch it with errors
+    m.add(
+        "PanicException",
+        m.py().get_type::<pyo3::panic::PanicException>(),
+    )?;
     m.add("COLOUR_MAPS", core::COLOUR_MAPS.to_vec())?;
     m.add("ALIGNED", core::ALIGNED)?;
     m.add_class::<Viewer>()?;
