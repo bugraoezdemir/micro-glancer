@@ -1,0 +1,20 @@
+[package]
+name = "micro-viewer-core"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "micro-viewer's core: GPU rendering of OME-Zarr images from a tile cache, read through ome-zarr-pyramid and dyna-zarr's arrays (Workplan WP14)"
+
+[dependencies]
+# rendering: Vulkan, Metal, DX12, GL, and software adapters (WARP, lavapipe)
+wgpu = "30"
+raw-window-handle = "0.6"
+# waiting for the adapter and device (wgpu's requests are futures)
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+# ozp in Rust (DR9): images, levels and their matrices. A path into the local ozp
+# checkout until its branch dr9-rust-core is merged (then a git dependency).
+ome-zarr-pyramid = { path = "../../../../../WS-OmeZarrPyramid/ome_zarr_pyramid/core/crates/ome-zarr-pyramid" }
+# tiles are region reads of dyna's engine arrays: the commit ozp's core pins
+dyna-zarr-arrays = { git = "https://github.com/bugraoezdemir/dyna_zarr", rev = "8699f9b34a5bee5e550e7c436b65cf9de6aa99f7" }

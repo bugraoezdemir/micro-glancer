@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "micro-viewer"
+dynamic = ["version"]              # from Cargo.toml
+description = "A GPU viewer for OME-Zarr images on a Rust core, hosted in Qt."
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Private :: Do Not Upload",
+]
+dependencies = ["numpy>=1.26"]
+
+[project.optional-dependencies]
+qt = ["PyQt6>=6.7"]
+dev = ["PyQt6>=6.7", "pytest", "ome_zarr_pyramid"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "micro_viewer._core"
