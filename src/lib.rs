@@ -190,6 +190,58 @@ impl Viewer {
         self.inner.add(&path).map_err(err)
     }
 
+    /// A plate layer's layout (the current layer by default), or None for an image:
+    /// {"name", "rows", "columns", "grid": (rows, columns), "field", "fields" (the most
+    /// any well has), "wells": [{"name", "path", "row", "column", "fields"}], "skipped"
+    /// (wells left out, with why)}.
+    #[pyo3(signature = (layer = None))]
+    fn plate<'py>(
+        &self,
+        py: Python<'py>,
+        layer: Option<usize>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let i = self.layer_index(layer)?;
+        let Some(p) = self.inner.layer(i).map_err(err)?.plate() else {
+            return Ok(None);
+        };
+        let d = PyDict::new(py);
+        d.set_item("name", p.info.name.clone())?;
+        d.set_item("rows", p.info.rows.clone())?;
+        d.set_item("columns", p.info.columns.clone())?;
+        d.set_item("grid", p.info.grid())?;
+        d.set_item("field", p.field)?;
+        d.set_item("fields", p.info.field_count())?;
+        let wells = PyList::empty(py);
+        for w in &p.info.wells {
+            let e = PyDict::new(py);
+            e.set_item("name", &w.name)?;
+            e.set_item("path", &w.path)?;
+            e.set_item("row", w.row)?;
+            e.set_item("column", w.column)?;
+            e.set_item("fields", w.fields.clone())?;
+            wells.append(e)?;
+        }
+        d.set_item("wells", wells)?;
+        d.set_item("skipped", p.skipped.clone())?;
+        Ok(Some(d))
+    }
+
+    /// Show well `name` ("B3", or its path "B/3") of a plate layer (the current one by
+    /// default) whole, centred.
+    #[pyo3(signature = (name, layer = None))]
+    fn show_well(&mut self, name: &str, layer: Option<usize>) -> PyResult<()> {
+        let i = self.layer_index(layer)?;
+        self.inner.show_well(i, name).map_err(err)
+    }
+
+    /// Show field `field` of every well of a plate layer (the current one by default);
+    /// its channels, plane, visibility and opacity stay.
+    #[pyo3(signature = (field, layer = None))]
+    fn set_field(&mut self, field: usize, layer: Option<usize>) -> PyResult<()> {
+        let i = self.layer_index(layer)?;
+        self.inner.set_field(i, field).map_err(err)
+    }
+
     /// Read layer `index`'s image again (after its metadata changed): placement and
     /// saved transform from the file; channels, plane, visibility and opacity stay.
     fn reload(&mut self, index: usize) -> PyResult<()> {
@@ -269,6 +321,8 @@ impl Viewer {
             d.set_item("transform_3d", rows3(&l.transform()))?;
             d.set_item("volume", l.is_volume())?;
             d.set_item("label", l.is_label())?;
+            d.set_item("plate", l.plate().is_some())?;
+            d.set_item("field", l.field())?;
             d.set_item("outline", l.outline)?;
             d.set_item("selected", l.selected)?;
             d.set_item("only_selected", l.only_selected)?;
@@ -961,6 +1015,7 @@ impl Viewer {
         let layers = PyList::empty(py);
         let mut current = (None, PyList::empty(py));
         let mut current_voxel = None;
+        let mut current_well = None;
         for lp in p.layers {
             let values = PyList::empty(py);
             for v in &lp.values {
@@ -973,12 +1028,15 @@ impl Viewer {
             }
             let pixel = lp.pixel.map(|q| (q[0], q[1]));
             let voxel = lp.voxel.map(|q| (q[0], q[1], q[2]));
+            let well = lp.well.clone();
             if lp.layer == self.inner.current() {
                 current = (pixel, values.clone());
                 current_voxel = voxel;
+                current_well = well.clone();
             }
             let l = PyDict::new(py);
             l.set_item("layer", lp.layer)?;
+            l.set_item("well", well)?;
             l.set_item("pixel", pixel)?;
             l.set_item("voxel", voxel)?;
             l.set_item("values", values)?;
@@ -986,6 +1044,7 @@ impl Viewer {
         }
         d.set_item("pixel", current.0)?;
         d.set_item("voxel", current_voxel)?;
+        d.set_item("well", current_well)?;
         d.set_item("values", current.1)?;
         d.set_item("layers", layers)?;
         Ok(d)
@@ -1017,8 +1076,15 @@ impl Viewer {
     }
 }
 
+/// The navigation tree of the store at `path` as JSON (`micro_viewer.tree` parses it).
+#[pyfunction]
+fn tree_json(path: PathBuf) -> PyResult<String> {
+    core::tree(&path).map(|v| v.to_string()).map_err(err)
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(tree_json, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("ViewerError", m.py().get_type::<ViewerError>())?;
     // a Rust panic reaches Python as this (a BaseException): hosts catch it with errors

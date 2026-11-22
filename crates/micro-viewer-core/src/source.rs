@@ -14,6 +14,9 @@
 //! keeps its stored integers: texels of its own width (8, 16, 32 bits, or two 32-bit
 //! halves for 64), never cast to float, so every id stays exact.
 //!
+//! A plate (NGFF "plate" metadata) opens as one image: its wells on a grid, one field
+//! of each (see `plate.rs`).
+//!
 //! The axis right before y, when it is spatial (type "space", or named "z") and not the
 //! channel axis, is the image's z: such an image is a volume, placed in 3-D by its
 //! matrix's x, y and z rows and columns, and can be cut by planes at any angle.
@@ -23,11 +26,12 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
-use dyna_zarr_arrays::{read, Cast, DType, Source as _, SourceRef};
+use dyna_zarr_arrays::{read, Cast, DType, Mean, Source as _, SourceRef};
 use ome_zarr_pyramid::{Image, Location};
 use serde_json::Value;
 
 use crate::geom::Affine3;
+use crate::plate::{par_map, plate_array, PlateArray, PlateInfo, PlateLayout};
 use crate::ViewerError;
 
 fn err(e: impl std::fmt::Display) -> ViewerError {
@@ -301,11 +305,13 @@ pub struct Source {
     pub signed: bool,
     /// Where the image is (for its label images).
     location: Location,
+    /// A plate: its layout (the image is its wells on a grid).
+    pub plate: Option<PlateLayout>,
 }
 
 /// The location of `path`: a folder, or a place inside a zip file (`.zip`, `.ozx`) on
 /// the path (`plate.ozx/labels/cells`: the zip and "labels/cells").
-fn locate(path: &Path) -> Location {
+pub(crate) fn locate(path: &Path) -> Location {
     for a in path.ancestors() {
         let zipped = a
             .extension()
@@ -400,11 +406,58 @@ fn channels_from(omero: Option<&Value>, n: usize) -> Vec<ChannelInfo> {
         .collect()
 }
 
+/// The channel axis and the z axis (see the module's notes) of axes `ms`.
+fn axis_roles(ms: &ome_zarr_pyramid::Multiscale) -> (Option<usize>, Option<usize>) {
+    let n = ms.axes.len();
+    let y = n - 2;
+    let channel_axis = ms.axes[..y]
+        .iter()
+        .position(|a| a.kind.as_deref() == Some("channel"))
+        .or_else(|| ms.axes[..y].iter().position(|a| a.name == "c"));
+    let z_axis = (n >= 3)
+        .then_some(n - 3)
+        .filter(|&a| Some(a) != channel_axis)
+        .filter(|&a| ms.axes[a].kind.as_deref() == Some("space") || ms.axes[a].name == "z");
+    (channel_axis, z_axis)
+}
+
+/// Where an image opens on its plane axes: omero's defaultZ / defaultT, else 0.
+fn default_position_of(
+    omero: Option<&Value>,
+    axes: &[String],
+    plane_axes: &[usize],
+    shape: &[u64],
+) -> Vec<f64> {
+    plane_axes
+        .iter()
+        .map(|&a| {
+            let key = match axes[a].as_str() {
+                "z" => "/rdefs/defaultZ",
+                "t" => "/rdefs/defaultT",
+                _ => return 0.0,
+            };
+            let v = omero
+                .and_then(|o| o.pointer(key))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            v.clamp(0.0, (shape[a].max(1) - 1) as f64)
+        })
+        .collect()
+}
+
 impl Source {
     /// The image at `path`: a folder, or a zip file (`.zip`, `.ozx`) holding the image at
-    /// its root.
+    /// its root. A plate opens with field 0 of every well.
     pub fn open(path: &Path) -> Result<Self, ViewerError> {
+        Self::open_field(path, 0)
+    }
+
+    /// As [`Source::open`]; a plate shows field `field` of every well.
+    pub fn open_field(path: &Path, field: usize) -> Result<Self, ViewerError> {
         let location = locate(path);
+        if let Some(info) = PlateInfo::read(&location) {
+            return Self::open_plate(location, info, field);
+        }
         let image = Image::at(location.clone()).map_err(err)?;
         let label = image.image_label.is_some();
         let mut signed = false;
@@ -418,14 +471,7 @@ impl Source {
         }
         let axes: Vec<String> = ms.axes.iter().map(|a| a.name.clone()).collect();
         let (y, x) = (n - 2, n - 1);
-        let channel_axis = ms.axes[..y]
-            .iter()
-            .position(|a| a.kind.as_deref() == Some("channel"))
-            .or_else(|| ms.axes[..y].iter().position(|a| a.name == "c"));
-        let z_axis = (n >= 3)
-            .then_some(n - 3)
-            .filter(|&a| Some(a) != channel_axis)
-            .filter(|&a| ms.axes[a].kind.as_deref() == Some("space") || ms.axes[a].name == "z");
+        let (channel_axis, z_axis) = axis_roles(ms);
         let mut levels = Vec::new();
         let mut texel = None;
         let mut dtype_name = String::new();
@@ -523,21 +569,7 @@ impl Source {
         let nc = channel_axis.map_or(1, |c| levels[0].shape[c] as usize);
         let omero = image.omero.as_ref();
         let channels = channels_from(omero, nc);
-        let default_position = plane_axes
-            .iter()
-            .map(|&a| {
-                let key = match axes[a].as_str() {
-                    "z" => "/rdefs/defaultZ",
-                    "t" => "/rdefs/defaultT",
-                    _ => return 0.0,
-                };
-                let v = omero
-                    .and_then(|o| o.pointer(key))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
-                v.clamp(0.0, (levels[0].shape[a].max(1) - 1) as f64)
-            })
-            .collect();
+        let default_position = default_position_of(omero, &axes, &plane_axes, &levels[0].shape);
         let name = |v: &Option<Value>| {
             v.as_ref()
                 .and_then(|v| v.get("name"))
@@ -569,6 +601,264 @@ impl Source {
             dtype: dtype_name,
             texel,
             version: image.version.clone(),
+            plate: None,
+        })
+    }
+
+    /// A plate as one image (see `plate.rs`): field `field` of every well that has it,
+    /// on a grid. The first well that opens sets the axes, channels and type; a well
+    /// with other axes, or that cannot be read, is left out (and named in the layout).
+    fn open_plate(location: Location, info: PlateInfo, field: usize) -> Result<Self, ViewerError> {
+        let picks: Vec<(usize, usize, String, String)> = info
+            .wells
+            .iter()
+            .filter_map(|w| {
+                w.fields
+                    .get(field)
+                    .map(|f| (w.row, w.column, format!("{}/{f}", w.path), w.name.clone()))
+            })
+            .collect();
+        if picks.is_empty() {
+            return Err(err(format!(
+                "the plate has no field {field} in any well (at most {} fields)",
+                info.field_count()
+            )));
+        }
+        // every well's image and level arrays, on several threads
+        type Opened = Result<(Image, Vec<dyna_zarr_arrays::ZarrArray>), String>;
+        let opened: Vec<Opened> = par_map(&picks, |(_, _, rel, _)| {
+            let image = Image::at(location.child(rel)).map_err(|e| e.to_string())?;
+            let nl = image.multiscales.first().map_or(0, |m| m.levels.len());
+            let arrays = (0..nl)
+                .map(|l| image.level_array(0, l).map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((image, arrays))
+        });
+        let mut skipped = Vec::new();
+        let mut wells = Vec::new();
+        for (pick, o) in picks.iter().zip(opened) {
+            match o {
+                Ok(v) if !v.1.is_empty() => wells.push((pick, v)),
+                Ok(_) => skipped.push(format!("{}: no levels", pick.3)),
+                Err(e) => skipped.push(format!("{}: {e}", pick.3)),
+            }
+        }
+        let Some((_, (first, first_arrays))) = wells.first() else {
+            return Err(err(format!(
+                "no well of the plate could be read: {}",
+                skipped.join("; ")
+            )));
+        };
+        let reference = first.clone();
+        let dtype = first_arrays[0].dtype();
+        let ms = reference
+            .multiscales
+            .first()
+            .ok_or_else(|| err("the plate's first well has no multiscale"))?;
+        let n = ms.axes.len();
+        if n < 2 {
+            return Err(err("a plane needs at least two axes"));
+        }
+        let axes: Vec<String> = ms.axes.iter().map(|a| a.name.clone()).collect();
+        let (y, x) = (n - 2, n - 1);
+        let (channel_axis, z_axis) = axis_roles(ms);
+        let (texel, _) = Texel::of(dtype)?;
+        // wells of the same axes; the levels all of them have
+        let mut cells: Vec<(usize, usize, Vec<SourceRef>)> = Vec::new();
+        for ((r, c, _, name), (image, arrays)) in wells {
+            let same = image
+                .multiscales
+                .first()
+                .is_some_and(|m| m.axes.iter().map(|a| &a.name).eq(axes.iter()));
+            if !same || arrays.iter().any(|a| a.shape().len() != n) {
+                skipped.push(format!("{name}: other axes than the first well"));
+                continue;
+            }
+            let mut refs = Vec::new();
+            for a in arrays {
+                let d = a.dtype();
+                let src: SourceRef = Arc::new(a);
+                refs.push(if d == texel.dtype() {
+                    src
+                } else {
+                    Arc::new(Cast::new(src, texel.dtype()).map_err(err)?)
+                });
+            }
+            cells.push((*r, *c, refs));
+        }
+        let nl = cells
+            .iter()
+            .map(|c| c.2.len())
+            .min()
+            .unwrap_or(0)
+            .min(ms.levels.len());
+        if nl == 0 {
+            return Err(err("the plate's wells have no levels in common"));
+        }
+        let (rows, columns) = info.grid();
+        // per level: the cells' arrays, the level's y-x scale and translation (x, y), the
+        // well level whose matrix gives the other axes, and a name
+        struct Spec {
+            arrays: Vec<(usize, usize, SourceRef)>,
+            s: (f64, f64),
+            t: (f64, f64),
+            m: usize,
+            name: String,
+        }
+        let mut specs: Vec<Spec> = (0..nl)
+            .map(|l| {
+                let m = &ms.levels[l].matrix;
+                Spec {
+                    arrays: cells
+                        .iter()
+                        .map(|(r, c, a)| (*r, *c, a[l].clone()))
+                        .collect(),
+                    s: (m.get(x, x), m.get(y, y)),
+                    t: (m.get(x, n), m.get(y, n)),
+                    m: l,
+                    name: ms.levels[l].path.clone(),
+                }
+            })
+            .collect();
+        // coarser levels than the wells have, each well's coarsest level averaged, until
+        // the whole plate fits about 2048 pixels (a plate of few levels otherwise needs
+        // thousands of tiles zoomed out)
+        let last = nl - 1;
+        let extent = |arrays: &[(usize, usize, SourceRef)]| {
+            let most = |k: usize| arrays.iter().map(|a| a.2.shape()[k]).max().unwrap_or(1);
+            (rows as u64 * most(y)).max(columns as u64 * most(x))
+        };
+        let mut f = 2u64;
+        while extent(&specs[specs.len() - 1].arrays) > 2048 && f <= 1 << 16 {
+            let base = &specs[last];
+            let mut factors = vec![1u64; n];
+            factors[y] = f;
+            factors[x] = f;
+            let arrays = base
+                .arrays
+                .iter()
+                .map(|(r, c, a)| {
+                    Mean::new(a.clone(), &factors).map(|m| (*r, *c, Arc::new(m) as SourceRef))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(err)?;
+            let k = f as f64;
+            specs.push(Spec {
+                arrays,
+                s: (base.s.0 * k, base.s.1 * k),
+                t: (
+                    base.t.0 + (k - 1.0) / 2.0 * base.s.0,
+                    base.t.1 + (k - 1.0) / 2.0 * base.s.1,
+                ),
+                m: last,
+                name: format!("{} / {f}", base.name),
+            });
+            f *= 2;
+        }
+        // the largest field and the cell pitch: level 0 a gap of 4 % (at least 2 pixels),
+        // the coarser levels the same world distance in their pixels
+        let most = |arrays: &[(usize, usize, SourceRef)], k: usize| {
+            arrays.iter().map(|a| a.2.shape()[k]).max().unwrap_or(1)
+        };
+        let (sx0, sy0) = specs[0].s;
+        let cell0 = [most(&specs[0].arrays, y), most(&specs[0].arrays, x)];
+        let pitch0 = [
+            cell0[0] + (cell0[0] / 25).max(2),
+            cell0[1] + (cell0[1] / 25).max(2),
+        ];
+        let mut levels = Vec::new();
+        for (l, spec) in specs.into_iter().enumerate() {
+            let m = &ms.levels[spec.m].matrix;
+            let (sx, sy) = spec.s;
+            if !(sx > 0.0 && sy > 0.0 && sx0 > 0.0 && sy0 > 0.0) {
+                return Err(err(format!(
+                    "plate level {l}: scales ({sx}, {sy}): plates need positive y-x scales"
+                )));
+            }
+            let (ch, cw) = (most(&spec.arrays, y), most(&spec.arrays, x));
+            let lead: Vec<u64> = (0..y).map(|k| most(&spec.arrays, k)).collect();
+            let py = ((pitch0[0] as f64 * sy0 / sy).ceil() as u64).max(ch + 1);
+            let px = ((pitch0[1] as f64 * sx0 / sx).ceil() as u64).max(cw + 1);
+            // one pixel of this level: the level-0 pitch over this level's pitch
+            let (vx, vy) = (
+                sx0 * pitch0[1] as f64 / px as f64,
+                sy0 * pitch0[0] as f64 / py as f64,
+            );
+            let (tx, ty) = spec.t;
+            let array = plate_array(PlateArray::new(
+                spec.arrays,
+                rows,
+                columns,
+                [py, px],
+                lead,
+                texel.dtype(),
+            ));
+            let shape = array.shape().to_vec();
+            let to_world = Affine2 {
+                m: [[vx, 0.0, tx], [0.0, vy, ty]],
+            };
+            let to_index = to_world.inverse().ok_or_else(|| err("plate placement"))?;
+            let to_world3 = match z_axis {
+                None => Affine3::from_2d(&to_world),
+                Some(z) => Affine3 {
+                    m: [
+                        [vx, 0.0, 0.0, tx],
+                        [0.0, vy, 0.0, ty],
+                        [0.0, 0.0, m.get(z, z), m.get(z, n)],
+                    ],
+                },
+            };
+            let to_index3 = to_world3.inverse().ok_or_else(|| err("plate placement"))?;
+            let lead = (0..n)
+                .map(|a| match a {
+                    _ if a == x => (vx, tx),
+                    _ if a == y => (vy, ty),
+                    _ => (m.get(a, a), m.get(a, n)),
+                })
+                .collect();
+            levels.push(Level {
+                path: spec.name,
+                width: shape[x],
+                height: shape[y],
+                depth: z_axis.map_or(1, |z| shape[z]),
+                to_world3,
+                to_index3,
+                shape,
+                array,
+                pixel: (vx * vy).sqrt(),
+                to_world,
+                to_index,
+                lead,
+            });
+        }
+
+        let plane_axes: Vec<usize> = (0..y).filter(|&a| Some(a) != channel_axis).collect();
+        let nc = channel_axis.map_or(1, |c| levels[0].shape[c] as usize);
+        let omero = reference.omero.as_ref();
+        let channels = channels_from(omero, nc);
+        let default_position = default_position_of(omero, &axes, &plane_axes, &levels[0].shape);
+        Ok(Self {
+            label: false,
+            signed: false,
+            location,
+            aligned: None,
+            z_axis,
+            axes,
+            levels,
+            channel_axis,
+            plane_axes,
+            channels,
+            default_position,
+            dtype: dtype.name().to_string(),
+            texel,
+            version: reference.version.clone(),
+            plate: Some(PlateLayout {
+                info,
+                field,
+                pitch: pitch0,
+                cell: cell0,
+                skipped,
+            }),
         })
     }
 

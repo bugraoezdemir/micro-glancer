@@ -47,6 +47,14 @@ reading are Rust (the crate `micro-viewer-core`); Python gets a small API and a 
   only that one. Ids stay exact up to 64 bits. A label image moves with its image when
   the image is moved or turned, on flat planes and on planes at an angle through a
   volume. Label images are left out of projections.
+- Open an HCS plate whole: its wells on a grid, one field of each (the same field in
+  every well, chosen by number). Zoomed out it reads the wells' coarse levels (and
+  averages coarser ones of its own when the wells have few), zoomed in only the wells
+  in view. The well under the pointer is named. A plate opens in a fraction of a
+  second: a 384-well plate of 520 x 696 fields is sharp 0.25 s after opening.
+- See a store's contents as a tree (`micro_viewer.tree`, and the Contents panel): a
+  plate's wells and fields, an image's label images, a collection's series. Double-click
+  a well to show it on its plate, a field to open it, a label image to add it.
 - Read the values under the pointer, for every channel of every layer (for a label
   image, its id).
 - Save the whole view (camera, layers with their images, transforms, planes and
@@ -108,6 +116,10 @@ and New colours instead of the histogram. Double-click a label in the view to se
 it (double-click the background or press Esc to clear it), and press O to switch
 outlines.
 
+A plate opens whole; the Planes panel's "field" picks the field shown in every well, and
+the Contents panel on the left lists the wells, fields and label images of the store
+opened last.
+
 From Python:
 
 ```python
@@ -149,7 +161,32 @@ v.label_names()                 # ["cells", ...] from the image's labels/ group
 v.add_label("cells")            # above its image, following its transform
 v.set_labels(outline=True, selected=42, only_selected=False, seed=3)
 print(v.pick(512, 384)["layers"][1]["values"][0]["id"])  # the exact id
+
+v.open("plate.ome.zarr")        # a plate: its wells on a grid
+print(v.plate()["wells"][:2])   # [{"name": "A1", "path": "A/1", "fields": [...]}, ...]
+v.set_field(1)                  # field 1 of every well
+v.show_well("B3")               # zoom onto a well
+print(v.pick(512, 384)["well"]) # ("B3", "B/3/1")
+
+from micro_viewer import tree
+tree("plate.ome.zarr")          # {"kind": "plate", "children": [wells > fields]}
 ```
+
+## In eubi
+
+eubi's Inspect page uses micro-viewer when it can import it (`EUBI_VIEWER=classic`, or
+Settings > Viewer, switches back to eubi's classic viewer): planes at any angle and the
+3-D views, linked views, the histogram panel under eubi's channel panel, moving the image
+and saving its transform, plates and the Contents tree. Several images as layers are
+left out there until layers are stable. To try it with eubi's own venv, nothing
+installed into it:
+
+```
+.\eubi-dev.ps1 [PATH]
+```
+
+(it puts this folder's `python` directory on `PYTHONPATH` and starts `eubi-gui`). The
+code on eubi's side is `eubi_bridge/qt_gui/widgets/gpu_viewer.py` and `viewers.py`.
 
 `micro_viewer.panel.ChannelPanel` (and its `HistogramWidget`) adjusts the channels of a
 `ViewerWidget`'s current layer.

@@ -26,6 +26,7 @@ mod geom;
 mod gpu;
 mod loader;
 mod luts;
+pub mod plate;
 mod source;
 mod tiles;
 mod view;
@@ -45,6 +46,18 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 pub use source::{Affine2, ChannelInfo, Level, Source, Texel};
 use tiles::{Cache, TileKey, TILE};
 pub use view::{parse_transform, ViewState};
+
+/// The navigation tree of the store at `path` (a folder, or a place in a .zip / .ozx):
+/// a plate's wells and fields, an image's label images, a collection's series (see
+/// [`plate::tree`]), as JSON.
+pub fn tree(path: &Path) -> Result<serde_json::Value, ViewerError> {
+    let loc = source::locate(path);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    plate::tree(&loc, &name, &path.to_string_lossy()).map_err(ViewerError)
+}
 
 /// The coordinate system a layer's transform is saved into (NGFF 0.6): an edge from the
 /// image's own coordinate system to this one. Opening an image that has such an edge
@@ -251,6 +264,8 @@ pub struct LayerPick {
     /// For a volume: the level-0 voxel (x, y, z) whose centre is nearest, if inside.
     pub voxel: Option<[u64; 3]>,
     pub values: Vec<PickedValue>,
+    /// On a plate: the well under the point ("B3") and its field's path in the plate.
+    pub well: Option<(String, String)>,
 }
 
 /// What lies under a screen point: the world point and every layer's pixel and values.
@@ -375,6 +390,16 @@ pub struct Layer {
 }
 
 impl Layer {
+    /// The plate's layout, if the layer is a plate.
+    pub fn plate(&self) -> Option<&plate::PlateLayout> {
+        self.source.plate.as_ref()
+    }
+
+    /// The field a plate layer shows (0 for an image).
+    pub fn field(&self) -> usize {
+        self.source.plate.as_ref().map_or(0, |p| p.field)
+    }
+
     /// Whether this is a label image.
     pub fn is_label(&self) -> bool {
         self.source.label
@@ -1697,7 +1722,12 @@ impl Viewer {
     /// system, if any). The first layer is fitted into the target (and the camera's
     /// plane put at its default z). It becomes the current layer; returns its index.
     pub fn add(&mut self, path: &Path) -> Result<usize, ViewerError> {
-        let source = Source::open(path)?;
+        self.add_field(path, 0)
+    }
+
+    /// As [`Viewer::add`]; a plate shows field `field` of every well.
+    pub fn add_field(&mut self, path: &Path, field: usize) -> Result<usize, ViewerError> {
+        let source = Source::open_field(path, field)?;
         let label = source.label;
         if source.z_axis.is_some() {
             // its brick and projection pipelines, built while the plane is looked at
@@ -1829,6 +1859,20 @@ impl Viewer {
     /// channels (when their number is the same), plane, visibility, opacity and sampling
     /// stay.
     pub fn reload(&mut self, i: usize) -> Result<(), ViewerError> {
+        let field = self.layer(i)?.field();
+        self.reopen(i, field)
+    }
+
+    /// Show field `field` of every well of plate layer `i` (its channels, plane,
+    /// visibility and opacity stay).
+    pub fn set_field(&mut self, i: usize, field: usize) -> Result<(), ViewerError> {
+        if self.layer(i)?.source.plate.is_none() {
+            return Err(verr(format!("layer {i} is not a plate")));
+        }
+        self.reopen(i, field)
+    }
+
+    fn reopen(&mut self, i: usize, field: usize) -> Result<(), ViewerError> {
         let (path, channels, position, visible, opacity, linear) = {
             let l = self.layer(i)?;
             (
@@ -1841,7 +1885,7 @@ impl Viewer {
             )
         };
         let current = self.current;
-        let n = self.add(&path)?;
+        let n = self.add_field(&path, field)?;
         let fresh = self.layers.remove(n);
         self.layers.insert(i + 1, fresh);
         self.remove(i);
@@ -2265,21 +2309,57 @@ impl Viewer {
         if self.linked {
             return self.fit_linked();
         }
+        let c = self.camera;
+        let points: Vec<V3> = self
+            .layers
+            .iter()
+            .filter(|l| l.visible && l.mode(&c) != Mode::Off)
+            .flat_map(|l| l.corners())
+            .collect();
+        self.fit_points(&points);
+    }
+
+    /// Show the well `name` ("B3") of plate layer `i` whole, centred (the camera keeps
+    /// its orientation).
+    pub fn show_well(&mut self, i: usize, name: &str) -> Result<(), ViewerError> {
+        let l = self.layer(i)?;
+        let p = l
+            .source
+            .plate
+            .as_ref()
+            .ok_or_else(|| verr(format!("layer {i} is not a plate")))?;
+        let w = p
+            .info
+            .wells
+            .iter()
+            .find(|w| w.name == name || w.path == name)
+            .ok_or_else(|| verr(format!("no well {name:?} in the plate")))?;
+        let (y0, x0) = (
+            (w.row as u64 * p.pitch[0]) as f64 - 0.5,
+            (w.column as u64 * p.pitch[1]) as f64 - 0.5,
+        );
+        let (y1, x1) = (y0 + p.cell[0] as f64, x0 + p.cell[1] as f64);
+        let lv = &l.source.levels[0];
+        let points: Vec<V3> = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+            .iter()
+            .map(|&(x, y)| l.transform.apply(lv.to_world3.apply([x, y, 0.0])))
+            .collect();
+        self.fit_points(&points);
+        Ok(())
+    }
+
+    /// Fit world points `points` into the target, as the screen sees them.
+    fn fit_points(&mut self, points: &[V3]) {
         let (tw, th) = self.gpu.size();
         let c = self.camera;
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-        for l in self.layers.iter().filter(|l| l.visible) {
-            if l.mode(&c) == Mode::Off {
-                continue;
-            }
-            for p in l.corners() {
-                let d = sub(p, c.center);
-                let (u, v) = (dot(d, c.right), dot(d, c.down)); // as the screen sees it
-                x0 = x0.min(u);
-                y0 = y0.min(v);
-                x1 = x1.max(u);
-                y1 = y1.max(v);
-            }
+        for &p in points {
+            let d = sub(p, c.center);
+            let (u, v) = (dot(d, c.right), dot(d, c.down)); // as the screen sees it
+            x0 = x0.min(u);
+            y0 = y0.min(v);
+            x1 = x1.max(u);
+            y1 = y1.max(v);
         }
         if x0 > x1 {
             return;
@@ -3172,11 +3252,17 @@ impl Viewer {
                 }
                 values.push(found);
             }
+            let well = o.source.plate.as_ref().and_then(|p| {
+                let px = pixel?;
+                p.well_at(px[0], px[1])
+                    .map(|w| (w.name.clone(), format!("{}/{}", w.path, w.fields[p.field])))
+            });
             layers.push(LayerPick {
                 layer: li,
                 pixel,
                 voxel,
                 values,
+                well,
             });
         }
         Ok(Pick { world, layers })

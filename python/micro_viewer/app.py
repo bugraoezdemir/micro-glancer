@@ -27,10 +27,11 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog,
                              QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-                             QMenu, QMessageBox, QPushButton, QSlider, QToolBar,
+                             QMenu, QMessageBox, QPushButton, QSlider, QSpinBox, QToolBar,
                              QVBoxLayout, QWidget)
 
 from . import ERRORS
+from .contents import ContentsPanel, open_node
 from .panel import ChannelPanel
 from .qt import ViewerWidget
 
@@ -47,7 +48,11 @@ Layers: Tab picks the current layer; Ctrl + drag moves it, Ctrl + wheel turns it
 (with Shift finely), Ctrl + arrows nudge it, Ctrl + Alt + drag tilts a volume,
 Ctrl + 0 puts it back, Ctrl + S saves its transform into its image.
 Label images (Layers > Labels adds one): double-click selects the id under the pointer,
-Esc clears it, O switches outlines."""
+Esc clears it, O switches outlines.
+
+A plate opens whole: its wells on a grid, one field of each (the Planes panel's "field"
+picks which). The Contents panel lists the opened store's wells, fields and label images:
+double-click a well to show it, a field or image to open it, a label image to add it."""
 
 
 def _guarded(method):
@@ -194,6 +199,9 @@ class PlanePanel(QWidget):
         v = self.window.view.viewer
         pos = v.position if v.layers else []
         axes = [(n, s) for n, _, s in pos]
+        plate = v.plate() if v.layers and v.layers[v.current]["plate"] else None
+        if plate:
+            axes = axes + [("field", plate["fields"])]
         if axes != self._axes:
             while self.lay.count():
                 item = self.lay.takeAt(0)
@@ -207,6 +215,17 @@ class PlanePanel(QWidget):
             self._rows = {}
             for name, size in axes:
                 row = QHBoxLayout()
+                if name == "field":
+                    spin = QSpinBox()
+                    spin.setRange(0, max(size - 1, 0))
+                    spin.setToolTip("the field shown in every well")
+                    spin.valueChanged.connect(self._field)
+                    row.addWidget(QLabel("field"))
+                    row.addWidget(spin)
+                    row.addStretch(1)
+                    self.lay.addLayout(row)
+                    self._rows[name] = (spin, None)
+                    continue
                 slider = QSlider(Qt.Orientation.Horizontal)
                 slider.setRange(0, max(size - 1, 0))
                 label = QLabel()
@@ -224,6 +243,19 @@ class PlanePanel(QWidget):
             slider.setValue(round(index))
             slider.blockSignals(False)
             label.setText(f"{round(index)} / {size - 1}")
+        if plate:
+            spin = self._rows["field"][0]
+            spin.blockSignals(True)
+            spin.setValue(plate["field"])
+            spin.blockSignals(False)
+
+    def _field(self, value):
+        try:
+            self.window.view.viewer.set_field(int(value))
+        except ERRORS as exc:  # noqa: BLE001 (see _guarded)
+            self.window.note(str(exc))
+            return
+        self.window.view._changed()
 
     def _moved(self, name, value):
         try:
@@ -250,7 +282,10 @@ class MainWindow(QMainWindow):
         self.layer_panel = LayerPanel(self)
         self.channel_panel = ChannelPanel(self.view)
         self.plane_panel = PlanePanel(self)
+        self.contents = ContentsPanel()
+        self.contents.activated.connect(self._open_node)
         for title, widget, area in (
+                ("Contents", self.contents, Qt.DockWidgetArea.LeftDockWidgetArea),
                 ("Layers", self.layer_panel, Qt.DockWidgetArea.LeftDockWidgetArea),
                 ("Channels", self.channel_panel, Qt.DockWidgetArea.RightDockWidgetArea),
                 ("Planes", self.plane_panel, Qt.DockWidgetArea.BottomDockWidgetArea)):
@@ -347,12 +382,20 @@ class MainWindow(QMainWindow):
         for k, path in enumerate(paths):
             if k == 0 and not add:
                 self.view.open(path)
+                self.contents.show_tree(path)
             else:
                 self.view.add(path)
         self._first_colours()
         self.setWindowTitle("micro-viewer: " + "  +  ".join(
             os.path.basename(str(p).rstrip("/\\")) for p in paths))
         self._view_changed()
+
+    @_guarded
+    def _open_node(self, node):
+        """A node of the Contents panel (see contents.open_node)."""
+        done = open_node(self.view.viewer, node)
+        self.view._changed()
+        self.note(done)
 
     def _first_colours(self):
         """Two one-channel images: green and magenta, to align them."""
@@ -480,6 +523,8 @@ class MainWindow(QMainWindow):
                     else f"{names[e['channel']]}: -" for e in p["values"])
                 where = (f"x={p['voxel'][0]} y={p['voxel'][1]} z={p['voxel'][2]}"
                          if p.get("voxel") else f"x={p['pixel'][0]} y={p['pixel'][1]}")
+                if p.get("well"):
+                    where = f"well {p['well'][0]} ({p['well'][1]})  " + where
                 self._pick = f"{where}  {vals}"
         except ERRORS as exc:  # noqa: BLE001 (see _guarded)
             self._pick = str(exc)

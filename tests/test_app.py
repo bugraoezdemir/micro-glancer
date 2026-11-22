@@ -205,3 +205,44 @@ def test_label_images_in_the_app(qapp, labelled, monkeypatch):
     win.layer_panel.labels.click()
     assert chosen[-1] == ["(all open)"] and len(v.layers) == 2
     win.close()
+
+
+from test_plates import plate  # noqa: E402,F401 (the plate fixture)
+
+
+def test_plates_in_the_app(qapp, plate, monkeypatch):  # noqa: F811
+    monkeypatch.setenv("MICRO_VIEWER_MODE", "offscreen")
+    from micro_viewer.app import MainWindow
+    win = MainWindow([plate])
+    win.show()
+    _pump(qapp)
+    v = win.view.viewer
+    assert v.layers[0]["plate"]
+    # the Contents panel: plate > wells > fields
+    top = win.contents.view.topLevelItem(0)
+    assert top.text(0) == "plate: test plate" and top.childCount() == 3
+    a3 = top.child(1)
+    assert a3.text(0) == "A3"
+    # a well: shown on the plate (the camera zooms onto it)
+    scale = v.camera[2]
+    win.contents.view.itemActivated.emit(a3, 0)
+    _pump(qapp, 0.2)
+    assert v.camera[2] < scale and len(v.layers) == 1
+    assert "well A3" in win.status.text()
+    # the field control in the Planes panel
+    spin = win.plane_panel._rows["field"][0]
+    assert spin.maximum() == 1
+    spin.setValue(1)
+    assert v.plate()["field"] == 1
+    # a field's label images are read when it is opened up; a label adds over its field
+    a1 = top.child(0)
+    f0 = a1.child(0)
+    f0.setExpanded(True)
+    assert f0.childCount() == 1 and f0.child(0).text(0) == "label: cells"
+    win.contents.view.itemActivated.emit(f0, 0)       # the field opens on its own
+    _pump(qapp, 0.2)
+    assert not v.layers[0]["plate"] and len(v.layers) == 1
+    win.contents.view.itemActivated.emit(f0.child(0), 0)
+    _pump(qapp, 0.2)
+    assert len(v.layers) == 2 and v.layers[1]["label"]
+    win.close()

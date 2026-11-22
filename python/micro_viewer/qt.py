@@ -71,8 +71,14 @@ def default_mode() -> str:
     mode = os.environ.get("MICRO_VIEWER_MODE")
     if mode in ("native", "offscreen"):
         return mode
-    # Linux needs the X11 display for a native surface, which the widget does not obtain
-    # from Qt yet; Wayland always needs the off-screen mode
+    # a native surface needs a real window: Qt's "windows" and "cocoa" platforms give
+    # one (not "offscreen" or "minimal", as tests run Qt). Linux needs the X11 display
+    # for a native surface, which the widget does not obtain from Qt yet; Wayland
+    # always needs the off-screen mode
+    from PyQt6.QtGui import QGuiApplication
+    platform = QGuiApplication.platformName() if QGuiApplication.instance() else ""
+    if platform and platform not in ("windows", "cocoa"):
+        return "offscreen"
     return "native" if sys.platform in ("win32", "darwin") else "offscreen"
 
 

@@ -362,7 +362,15 @@ impl Gpu {
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
         };
+        // before the error recorder is installed, wgpu's default handler panics: a
+        // window that cannot be drawn into (Qt's off-screen platform) is an error here
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         surface.configure(&device, &config);
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            return Err(err(format!(
+                "the window cannot be drawn into ({e}); draw off-screen instead"
+            )));
+        }
         let info = adapter_label(&adapter);
         Ok(Self::with(
             device,
