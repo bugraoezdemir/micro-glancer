@@ -12,10 +12,12 @@ pub const SLOTS_PER_ROW: u32 = 16;
 /// Slots per atlas layer.
 pub const SLOTS_PER_LAYER: u32 = SLOTS_PER_ROW * SLOTS_PER_ROW;
 
-/// One tile: the plane (a hash of its indices on the axes before y and x, the channel
-/// axis left out, at its level), the channel, the level and the tile's column and row.
+/// One tile: the layer (its id), the plane (a hash of its indices on the axes before y
+/// and x, the channel axis left out, at its level), the channel, the level and the tile's
+/// column and row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileKey {
+    pub layer: u16,
     pub plane: u64,
     pub channel: u16,
     pub level: u8,
@@ -93,6 +95,7 @@ mod tests {
 
     fn key(x: u32) -> TileKey {
         TileKey {
+            layer: 0,
             plane: 0,
             channel: 0,
             level: 0,

@@ -46,6 +46,14 @@ rows[1]["visible"] = False
 mv._apply_channels(rows)
 print("core channels after the panel:", [(c["color"], c["visible"]) for c in v.channels])
 
+# eubi's Auto button sets the contrast from the view
+before = (v.channels[0]["lo"], v.channels[0]["hi"])
+mv.channel_panel.auto_requested.emit(0)
+pump(0.2)
+print("auto contrast, channel 0:", before, "->", (v.channels[0]["lo"], v.channels[0]["hi"]),
+      "| panel:", (mv.channel_panel.channel_data()[0]["intensityMin"],
+                   mv.channel_panel.channel_data()[0]["intensityMax"]))
+
 # the z slider moves the plane
 name, slider, _ = mv._sliders[0]
 slider.setValue(10)

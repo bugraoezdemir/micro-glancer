@@ -1,8 +1,11 @@
-// An image's plane drawn from a tile atlas. Every screen pixel finds, per level, the
+// One layer's plane drawn from its tile atlas. Every screen pixel finds, per level, the
 // level pixel whose centre is nearest (from that level's placement, computed per frame on
-// the CPU in double precision); per active channel it takes the value from the frame's
-// level, or else from the nearest coarser level holding the tile, or else a finer one;
-// contrast, gamma and colour map it, and the channels add up.
+// the CPU in double precision, the layer's transform and the camera's turn included); per
+// active channel it takes the value from the frame's level, or else from the nearest
+// coarser level holding the tile, or else a finer one; contrast and gamma map it to 0..1
+// and the channel's colour map (a row of the colour map texture) to a colour; the
+// channels add up. The output is premultiplied by the layer's opacity, alpha being the
+// coverage, and layers add up on the target; outside the image the layer adds nothing.
 //
 // TEXEL is replaced by u32, i32 or f32 to match the atlas format.
 
@@ -13,8 +16,13 @@ struct Params {
     level: u32,
     // page table entries per channel (all levels)
     channel_stride: u32,
-    background: vec4<f32>,
     missing: vec4<f32>,
+    // what the layer draws where it has nothing (the background for a lone opaque layer)
+    outside: vec4<f32>,
+    opacity: f32,
+    _p0: f32,
+    _p1: f32,
+    _p2: f32,
 }
 
 // One level's placement on screen: the level pixel at screen position p (pixels, centres
@@ -36,7 +44,8 @@ struct Channel {
     lo: f32,
     hi: f32,
     shown: u32,
-    _pad: u32,
+    // 1: the colour map (a row of the colour map texture) instead of the colour
+    lut: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -44,10 +53,13 @@ struct Channel {
 @group(0) @binding(2) var<storage, read> pages: array<u32>;
 @group(0) @binding(3) var<storage, read> levels: array<Level>;
 @group(0) @binding(4) var<storage, read> channels: array<Channel>;
+@group(0) @binding(5) var luts: texture_2d<f32>;
+@group(0) @binding(6) var lut_sampler: sampler;
 
 const TILE: i32 = 256;
 const SLOTS_PER_ROW: u32 = 16u;
 const SLOTS_PER_LAYER: u32 = 256u;
+const LUT_SIZE: f32 = 256.0;
 
 struct Out {
     @builtin(position) pos: vec4<f32>,
@@ -82,7 +94,7 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
     let top = levels[p.level];
     let here = pixel_at(top, s);
     if (any(here < vec2<i32>(0)) || any(here >= top.size)) {
-        return p.background;
+        return p.outside;
     }
     var rgb = vec3<f32>(0.0);
     var shown = false;
@@ -109,13 +121,22 @@ fn fs(in: Out) -> @location(0) vec4<f32> {
             if (ch.gamma != 1.0) {
                 g = pow(g, ch.gamma);
             }
-            rgb += g * ch.color;
+            if (ch.lut != 0u) {
+                let lu = (g * (LUT_SIZE - 1.0) + 0.5) / LUT_SIZE;
+                let lv = (f32(c) + 0.5) / f32(p.n_channels);
+                rgb += textureSampleLevel(luts, lut_sampler, vec2<f32>(lu, lv), 0.0).rgb;
+            } else {
+                rgb += g * ch.color;
+            }
             shown = true;
             break;
         }
     }
-    if (wanted && !shown) {
-        return p.missing;
+    if (!wanted) {
+        return p.outside;
     }
-    return vec4<f32>(min(rgb, vec3<f32>(1.0)), 1.0);
+    if (!shown) {
+        return vec4<f32>(p.missing.rgb * p.opacity, p.opacity);
+    }
+    return vec4<f32>(min(rgb, vec3<f32>(1.0)) * p.opacity, p.opacity);
 }

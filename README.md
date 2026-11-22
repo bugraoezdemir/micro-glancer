@@ -10,42 +10,72 @@ reading are Rust (the crate `micro-viewer-core`); Python gets a small API and a 
   file.
 - Pan and zoom smoothly. The viewer picks the resolution level that fits the zoom. While
   finer tiles are read in the background, coarser ones stand in, so the view never waits.
-- See every channel at once, each in its own colour, with its own contrast limits and
-  gamma. Colours, labels and contrast windows come from the image's omero metadata when
-  it has them.
+- See every channel at once, each in its own colour or colour map (viridis, magma,
+  inferno, plasma, cividis, turbo, hot, gray), with its own contrast limits and gamma.
+  Colours, labels and contrast windows come from the image's omero metadata when it has
+  them. Contrast can also be taken from what is in view.
 - Move through z and t. The image opens at omero's default z and t. The planes next to
   the current one are read ahead, so stepping is quick.
-- Read the values under the pointer, for every channel.
-- Save the whole view (image, camera, plane, channels) as JSON and restore it later.
+- Turn the view.
+- Open several images as layers in one view. They add up, each can be hidden or made
+  fainter, and each can be moved and turned by hand, for example to line two images up
+  before a registration tool refines it.
+- Save a layer's transform into its image, without rewriting any pixel. NGFF 0.4 and
+  0.5 images take a shift only. NGFF 0.6 images take the whole transform, kept apart
+  from the image's own placement (in a coordinate system called "aligned"). Reopening
+  the image shows it where it was saved.
+- Read the values under the pointer, for every channel of every layer.
+- Save the whole view (camera, layers with their images, transforms, planes and
+  channels) as JSON and restore it later.
+
+On slow sources (remote stores, slow codecs, and later other file formats) the viewer
+reads coarser levels while the view moves and the finer ones once it stops. To see how
+it behaves, set `MICRO_VIEWER_SLOW_READS_MS` to add that many milliseconds to every
+tile read.
 
 ## Trying it
 
 ```
-python -m micro_viewer.qt PATH
+python -m micro_viewer.qt PATH [PATH ...]
 ```
 
-Drag to pan, scroll to zoom at the pointer, press F to fit the image, and press Page Up
-or Page Down to move through z (with Shift: t). The status bar shows the plane, the level
-and the values under the pointer.
+Drag to pan, scroll to zoom at the pointer, press F to fit, and press Page Up or Page
+Down to move through z (with Shift: t). Shift + scroll turns the view; [ and ] turn it
+by 90 degrees, 0 turns it back.
+
+With several images, Tab picks the current layer. Ctrl + drag moves it, Ctrl + scroll
+turns it (1 degree a notch, with Shift 0.1), Ctrl + arrow keys nudge it by a pixel,
+Ctrl + 0 puts it back, and Ctrl + S saves its transform into its image. Two one-channel
+images open in green and magenta. The status bar shows the current layer, its plane,
+level and transform, and the values under the pointer.
 
 From Python:
 
 ```python
 from micro_viewer import Viewer
+from micro_viewer.save import save_transform
 
 v = Viewer.offscreen(1024, 768)
 v.open("image.ome.zarr")
 v.set_position("z", 10)
 v.set_channel(0, color=(0.0, 1.0, 0.0), lo=100, hi=4000, gamma=0.8)
+v.auto_contrast()               # or: contrast from what is in view
 v.settle()                      # wait until the view is sharp
 rgba, width, height, stats = v.render_rgba()
 print(v.pick(512, 384))         # the values under the centre
+
+v.add("moving.ome.zarr")        # a second layer, now the current one
+v.set_channel(0, lut="magma")
+v.rotate_layer(12.5)            # turn it about its centre (degrees)
+v.move_layer(40, -10)           # move it (screen pixels)
+print(v.transform_matrix())     # the NGFF affine over the image's axes
+save_transform(v)               # into moving.ome.zarr
 state = v.view_state()          # JSON
 ```
 
-In Qt, `micro_viewer.qt.ViewerWidget` shows an image. It emits `viewChanged` when the
-camera, plane or channels change, `picked` with the values under the pointer, and
-`failed` when the core cannot draw.
+In Qt, `micro_viewer.qt.ViewerWidget` shows the layers. It emits `viewChanged` when the
+camera, a plane, a layer or the channels change, `picked` with the values under the
+pointer, `saved` after a transform was saved, and `failed` when something fails.
 
 ## How it is hosted
 

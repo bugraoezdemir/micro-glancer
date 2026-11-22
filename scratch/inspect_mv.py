@@ -7,8 +7,9 @@
 ``level_paths``, ``orientation``, ``z``, ``fov_center``, ``image_widget``). eubi's own ``ChannelPanel`` drives the channels. The metadata tab,
 the sidebar and the save buttons are eubi's, unchanged. Nothing in eubi is modified.
 
-Not in this copy: XZ / YZ orientations (V4), the Auto contrast buttons (they report
-that they are not wired), the field-of-view combo and the reload button.
+The Auto buttons set a channel's contrast from what is in view (micro-viewer's
+``auto_contrast``: the 0.1 and 99.9 percentiles over the view). Not in this copy: XZ / YZ
+orientations (V4), the field-of-view combo and the reload button.
 
 usage (eubi's venv; micro-viewer from a wheel on PYTHONPATH):
     python scratch/inspect_mv.py [IMAGE]
@@ -67,8 +68,7 @@ class MicroZarrViewer(QWidget):
         self.view = ViewerWidget()
         self.channel_panel = ChannelPanel()
         self.channel_panel.channels_changed.connect(self._apply_channels)
-        self.channel_panel.auto_requested.connect(
-            lambda i: self.status_changed.emit("Auto contrast is not wired to micro-viewer yet"))
+        self.channel_panel.auto_requested.connect(self._auto)
         self._planes = QGroupBox("Plane")
         self._planes_layout = QVBoxLayout(self._planes)
         side = QWidget()
@@ -215,6 +215,14 @@ class MicroZarrViewer(QWidget):
                           hi=cur["hi"] if hi is None else float(hi),
                           visible=bool(ch.get("visible", True)),
                           label=str(ch.get("label", cur["label"])))
+        self.view._changed()
+
+    @_safe
+    def _auto(self, index: int):
+        v = self.view.viewer
+        v.auto_contrast(index)
+        c = v.channels[index]
+        self.channel_panel.set_channel_range(index, c["lo"], c["hi"])
         self.view._changed()
 
     @_safe

@@ -33,6 +33,8 @@ pub struct Loaded {
     pub w: u32,
     pub h: u32,
     pub data: Result<Vec<u8>, String>,
+    /// Seconds the read took (the block's decode included when this tile started it).
+    pub took: f64,
 }
 
 /// The host's wake-up, shared with the workers.
@@ -64,7 +66,17 @@ pub struct Loader {
     notify: Wakeup,
 }
 
-fn work(shared: Arc<Shared>, tx: Sender<Loaded>, notify: Wakeup) {
+/// Extra time every tile read takes, from `MICRO_VIEWER_SLOW_READS_MS` (to try and test
+/// how the viewer behaves on slow sources: remote stores, slow codecs, other formats).
+fn slow_reads() -> std::time::Duration {
+    let ms = std::env::var("MICRO_VIEWER_SLOW_READS_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    std::time::Duration::from_millis(ms)
+}
+
+fn work(shared: Arc<Shared>, tx: Sender<Loaded>, notify: Wakeup, slow: std::time::Duration) {
     loop {
         let r = {
             let mut q = shared.queue.lock().expect("loader queue");
@@ -80,7 +92,12 @@ fn work(shared: Arc<Shared>, tx: Sender<Loaded>, notify: Wakeup) {
         };
         let w = (r.stop[r.stop.len() - 1] - r.start[r.start.len() - 1]) as u32;
         let h = (r.stop[r.stop.len() - 2] - r.start[r.start.len() - 2]) as u32;
+        let t0 = std::time::Instant::now();
         let data = shared.blocks.read(r.gen, &r.array, &r.start, &r.stop);
+        if !slow.is_zero() {
+            std::thread::sleep(slow);
+        }
+        let took = t0.elapsed().as_secs_f64();
         shared.waiting.fetch_add(1, Ordering::Release);
         if tx
             .send(Loaded {
@@ -89,6 +106,7 @@ fn work(shared: Arc<Shared>, tx: Sender<Loaded>, notify: Wakeup) {
                 w,
                 h,
                 data,
+                took,
             })
             .is_err()
         {
@@ -114,12 +132,13 @@ impl Loader {
         });
         let (tx, results) = channel();
         let notify: Wakeup = Arc::new(Mutex::new(None));
+        let slow = slow_reads();
         let workers = (0..threads.max(1))
             .map(|i| {
                 let (s, t, n) = (shared.clone(), tx.clone(), notify.clone());
                 std::thread::Builder::new()
                     .name(format!("micro-viewer tiles {i}"))
-                    .spawn(move || work(s, t, n))
+                    .spawn(move || work(s, t, n, slow))
                     .expect("a tile reading thread")
             })
             .collect();

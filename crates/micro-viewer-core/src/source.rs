@@ -28,7 +28,7 @@ fn err(e: impl std::fmt::Display) -> ViewerError {
 /// How tiles are kept on the GPU: the image's own type where a texture format holds it
 /// exactly, float32 otherwise (32- and 64-bit integers and floats, float16, booleans as
 /// uint8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Texel {
     U8,
     I8,
@@ -110,6 +110,52 @@ pub struct Affine2 {
 }
 
 impl Affine2 {
+    pub const IDENTITY: Affine2 = Affine2 {
+        m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+    };
+
+    /// A shift by (`dx`, `dy`).
+    pub fn translation(dx: f64, dy: f64) -> Self {
+        Self {
+            m: [[1.0, 0.0, dx], [0.0, 1.0, dy]],
+        }
+    }
+
+    /// A turn by `degrees` about (`cx`, `cy`). With y pointing down (as image rows and
+    /// the screen do) a positive angle turns clockwise.
+    pub fn rotation(degrees: f64, cx: f64, cy: f64) -> Self {
+        let (s, c) = degrees.to_radians().sin_cos();
+        Self {
+            m: [[c, -s, cx - c * cx + s * cy], [s, c, cy - s * cx - c * cy]],
+        }
+    }
+
+    /// `self` after `first`: x -> self(first(x)).
+    pub fn after(&self, first: &Affine2) -> Self {
+        let (a, b) = (&self.m, &first.m);
+        let mut m = [[0.0; 3]; 2];
+        for (r, row) in m.iter_mut().enumerate() {
+            for (c, v) in row.iter_mut().enumerate() {
+                *v = a[r][0] * b[0][c] + a[r][1] * b[1][c];
+            }
+            row[2] += a[r][2];
+        }
+        Self { m }
+    }
+
+    /// Whether the linear part is the identity (only a shift), within `tol`.
+    pub fn is_translation(&self, tol: f64) -> bool {
+        let m = &self.m;
+        (m[0][0] - 1.0).abs() <= tol
+            && m[0][1].abs() <= tol
+            && m[1][0].abs() <= tol
+            && (m[1][1] - 1.0).abs() <= tol
+    }
+
+    pub fn is_finite(&self) -> bool {
+        self.m.iter().flatten().all(|v| v.is_finite())
+    }
+
     pub fn apply(&self, x: f64, y: f64) -> (f64, f64) {
         let m = &self.m;
         (
@@ -184,6 +230,9 @@ pub struct Source {
     pub dtype: String,
     pub texel: Texel,
     pub version: String,
+    /// The NGFF affine (n rows of n + 1, over the image's axes) of an edge from the
+    /// image's own coordinate system to the "aligned" one (NGFF 0.6), if there is one.
+    pub aligned: Option<Vec<Vec<f64>>>,
 }
 
 /// Default colours for `n` channels without colours of their own.
@@ -365,7 +414,24 @@ impl Source {
                 v.clamp(0.0, (levels[0].shape[a].max(1) - 1) as f64)
             })
             .collect();
+        let name = |v: &Option<Value>| {
+            v.as_ref()
+                .and_then(|v| v.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let aligned = ms
+            .edges
+            .iter()
+            .find(|e| {
+                name(&e.output).as_deref() == Some(crate::ALIGNED)
+                    && ms.system.is_some()
+                    && name(&e.input) == ms.system
+            })
+            .and_then(|e| e.matrix(n).ok())
+            .map(|m| m.rows());
         Ok(Self {
+            aligned,
             axes,
             levels,
             channel_axis,
@@ -471,6 +537,21 @@ mod tests {
         let (x, y) = a.apply(11.0, -4.0);
         let (u, v) = b.apply(x, y);
         assert!((u - 11.0).abs() < 1e-12 && (v + 4.0).abs() < 1e-12);
+        let id = b.after(&a);
+        assert!(id.is_translation(1e-12) && id.m[0][2].abs() < 1e-12);
+    }
+
+    #[test]
+    fn rotation_turns_clockwise_about_its_centre() {
+        let r = Affine2::rotation(90.0, 10.0, 20.0);
+        let (x, y) = r.apply(10.0, 20.0);
+        assert!((x - 10.0).abs() < 1e-12 && (y - 20.0).abs() < 1e-12);
+        // y down: the point to the right of the centre goes below it
+        let (x, y) = r.apply(11.0, 20.0);
+        assert!((x - 10.0).abs() < 1e-12 && (y - 21.0).abs() < 1e-12);
+        let t = Affine2::translation(3.0, -1.0).after(&r);
+        assert_eq!(t.apply(11.0, 20.0), (13.0, 20.0));
+        assert!(!r.is_translation(1e-9) && t.is_finite());
     }
 
     #[test]

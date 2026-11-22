@@ -379,8 +379,9 @@ def test_the_view_state_round_trips(stores):
     a.set_channel(0, visible=False)
     state = a.view_state()
     doc = json.loads(state)
-    assert doc["version"] == 1 and doc["camera"] == {"center": [300.0, 200.0], "scale": 0.75}
-    assert doc["channels"][1]["color"] == "#0000ff"
+    assert doc["version"] == 2
+    assert doc["camera"] == {"center": [300.0, 200.0], "scale": 0.75, "rotation": 0.0}
+    assert doc["layers"][0]["channels"][1]["color"] == "#0000ff"
     b = Viewer.offscreen(300, 200)
     b.set_view_state(state)                               # opens the image too
     assert b.view_state() == state

@@ -11,15 +11,27 @@ Two hosting modes, chosen automatically (``MICRO_VIEWER_MODE`` overrides):
 Tiles are read in the background; while some are on their way the widget repaints at
 about 60 Hz, and not at all when nothing changes.
 
-Input: drag to pan, wheel to zoom at the pointer, F to fit, Page Up / Page Down to move
-through the first plane axis (z), with Shift the second (t). HiDPI scaling is passed to
-the core in physical pixels.
+Input (the view, and the current layer of several):
 
-Signals: ``viewChanged()`` after the camera, plane or channels change;
+- drag: pan; wheel: zoom at the pointer; F: fit;
+- Shift + wheel: turn the view about the pointer (5 degrees a notch); [ and ]: turn the
+  view by 90 degrees; 0: turn it back;
+- Ctrl + drag: move the current layer; Ctrl + wheel: turn it about its centre (1 degree
+  a notch, with Shift 0.1); Ctrl + arrow keys: move it by one screen pixel; Ctrl + 0:
+  put it back where its image places it; Ctrl + S: save its transform into its image
+  (``micro_viewer.save``);
+- Tab: the next layer becomes the current one;
+- Page Up / Page Down: the current layer's first plane axis (z), with Shift the second
+  (t).
+
+HiDPI scaling is passed to the core in physical pixels.
+
+Signals: ``viewChanged()`` after the camera, a plane, a layer or the channels change;
 ``picked(dict)`` with what lies under the pointer (``Viewer.pick``) as it moves;
-``failed(str)`` when the core cannot draw (the message; also in ``error``). PyQt6 ends
-the whole process when a Qt override raises, so the widget's overrides never do: the
-host shows ``failed`` instead.
+``saved(str)`` after a transform was saved (what was written); ``failed(str)`` when the
+core cannot draw or a step fails (the message; also in ``error``). PyQt6 ends the whole
+process when a Qt override raises, so the widget's overrides never do: the host shows
+``failed`` instead.
 """
 from __future__ import annotations
 
@@ -34,6 +46,8 @@ from ._core import Viewer
 
 #: zoom per wheel notch
 ZOOM_STEP = 1.25
+#: degrees per wheel notch: the view, a layer, a layer finely
+TURN_VIEW, TURN_LAYER, TURN_FINE = 5.0, 1.0, 0.1
 #: repaint interval while tiles are on their way (ms)
 POLL_MS = 15
 
@@ -52,6 +66,7 @@ class ViewerWidget(QWidget):
 
     viewChanged = pyqtSignal()
     picked = pyqtSignal(dict)
+    saved = pyqtSignal(str)
     failed = pyqtSignal(str)
 
     def __init__(self, parent=None, *, mode: str | None = None, software: bool = False,
@@ -62,7 +77,8 @@ class ViewerWidget(QWidget):
         self._no_vsync = no_vsync
         self._atlas_mib = atlas_mib
         self._viewer: Viewer | None = None
-        self._pending: str | None = None
+        self._pending: list[str] = []
+        self._drag_layer = False
         self._drag = None
         self._frame: bytearray | None = None
         self.last_stats = (0, 0, 0, 0, 0)
@@ -100,18 +116,40 @@ class ViewerWidget(QWidget):
             else:
                 self._viewer = Viewer.offscreen(w, h, software=self._software,
                                                 atlas_mib=self._atlas_mib)
-            if self._pending is not None:
-                path, self._pending = self._pending, None   # tried once, even if it fails
-                self._viewer.open(path)
+            if self._pending:
+                paths, self._pending = self._pending, []   # tried once, even if it fails
+                self._viewer.open(paths[0])
+                for p in paths[1:]:
+                    self._viewer.add(p)
         return self._viewer
 
     def open(self, path) -> None:
-        """Open the OME-Zarr image at ``path`` and fit it."""
+        """Open the OME-Zarr image at ``path`` as the only layer and fit it."""
         if self._viewer is None:
-            self._pending = str(path)
+            self._pending = [str(path)]
         else:
             self._viewer.open(str(path))
         self._changed()
+
+    def add(self, path) -> None:
+        """Add the OME-Zarr image at ``path`` as a new layer on top."""
+        if self._viewer is None:
+            self._pending.append(str(path))
+        else:
+            self._viewer.add(str(path))
+        self._changed()
+
+    def save_transform(self) -> str | None:
+        """Save the current layer's transform into its image (``saved`` or ``failed``)."""
+        from .save import save_transform
+        try:
+            done = save_transform(self.viewer)
+        except Exception as exc:  # noqa: BLE001 (see the module's notes)
+            self._fail(exc, force=True)
+            return None
+        self.saved.emit(done)
+        self._changed()
+        return done
 
     def _changed(self):
         self.update()
@@ -122,9 +160,9 @@ class ViewerWidget(QWidget):
         # native: Qt must not paint over the core's frames
         return None if self.mode == "native" else super().paintEngine()
 
-    def _fail(self, exc: Exception):
+    def _fail(self, exc: Exception, force: bool = False):
         msg = str(exc)
-        if msg != self.error:
+        if force or msg != self.error:
             self.error = msg
             self.failed.emit(msg)
 
@@ -152,8 +190,9 @@ class ViewerWidget(QWidget):
             painter = QPainter(self)
             painter.drawImage(0, 0, image)
             painter.end()
-        # tiles on their way: paint again soon (the timer is single-shot)
-        if (self.last_stats[2] > 0 or v.has_results()) and not self._poll.isActive():
+        # tiles on their way, or reading deferred while the view moves: paint again soon
+        # (the timer is single-shot)
+        if v.wants_frame() and not self._poll.isActive():
             self._poll.start()
 
     def resizeEvent(self, event):
@@ -166,17 +205,32 @@ class ViewerWidget(QWidget):
         super().resizeEvent(event)
 
     # ---------------------------------------------------------------- input
+    def _guard(self, step) -> None:
+        """Run an input step; report its error instead of raising (see the notes)."""
+        try:
+            step()
+        except Exception as exc:  # noqa: BLE001
+            self._fail(exc, force=True)
+            return
+        self._changed()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag = event.position()
+            ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            self._drag_layer = ctrl and bool(self._viewer is not None and self._viewer.layers)
 
     def mouseMoveEvent(self, event):
         p = event.position()
         r = self.devicePixelRatioF()
         if self._drag is not None:
-            self.viewer.pan((p.x() - self._drag.x()) * r, (p.y() - self._drag.y()) * r)
+            dx, dy = (p.x() - self._drag.x()) * r, (p.y() - self._drag.y()) * r
             self._drag = p
-            self._changed()
+            if self._drag_layer:
+                self._guard(lambda: self.viewer.move_layer(dx, dy))
+            else:
+                self.viewer.pan(dx, dy)
+                self._changed()
         elif self._viewer is not None and self.receivers(self.picked) > 0:
             try:
                 self.picked.emit(self._viewer.pick(p.x() * r, p.y() * r))
@@ -187,13 +241,24 @@ class ViewerWidget(QWidget):
         self._drag = None
 
     def wheelEvent(self, event):
-        steps = event.angleDelta().y() / 120.0
+        d = event.angleDelta()
+        steps = (d.y() or d.x()) / 120.0                 # Shift may turn the wheel sideways
         if not steps:
             return
         r = self.devicePixelRatioF()
         p = event.position()
-        self.viewer.zoom(ZOOM_STEP ** steps, p.x() * r, p.y() * r)
-        self._changed()
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        if ctrl:
+            turn = TURN_FINE if shift else TURN_LAYER
+            self._guard(lambda: self.viewer.rotate_layer(turn * steps))
+        elif shift:
+            self.viewer.rotate(TURN_VIEW * steps, p.x() * r, p.y() * r)
+            self._changed()
+        else:
+            self.viewer.zoom(ZOOM_STEP ** steps, p.x() * r, p.y() * r)
+            self._changed()
 
     def step(self, axis: int, delta: int) -> bool:
         """Move the plane by ``delta`` on plane axis number ``axis`` (0: z, 1: t, ...)."""
@@ -208,43 +273,84 @@ class ViewerWidget(QWidget):
         self._changed()
         return True
 
+    def focusNextPrevChild(self, _next):
+        return False                                     # Tab picks the layer here
+
     def keyPressEvent(self, event):
-        key = event.key()
-        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
-        if key == Qt.Key.Key_F:
-            self.viewer.fit()
+        key, K = event.key(), Qt.Key
+        mods = event.modifiers()
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        v = self.viewer
+        nudge = {K.Key_Left: (-1, 0), K.Key_Right: (1, 0), K.Key_Up: (0, -1),
+                 K.Key_Down: (0, 1)}
+        if key == K.Key_F:
+            v.fit()
             self._changed()
-        elif key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
-            self.step(1 if shift else 0, 1 if key == Qt.Key.Key_PageUp else -1)
+        elif key in (K.Key_PageUp, K.Key_PageDown):
+            self.step(1 if shift else 0, 1 if key == K.Key_PageUp else -1)
+        elif key == K.Key_Tab and v.layers:
+            v.current = (v.current + 1) % len(v.layers)
+            self._changed()
+        elif ctrl and key == K.Key_S:
+            self.save_transform()
+        elif ctrl and key == K.Key_0:
+            self._guard(lambda: v.reset_transform())
+        elif ctrl and key in nudge:
+            self._guard(lambda: v.move_layer(*nudge[key]))
+        elif key == K.Key_0:
+            v.set_rotation(0.0)
+            self._changed()
+        elif key in (K.Key_BracketLeft, K.Key_BracketRight):
+            v.rotate(-90.0 if key == K.Key_BracketLeft else 90.0)
+            self._changed()
         else:
             super().keyPressEvent(event)
 
 
+def _turn_and_shift(m):
+    """A 2 x 3 transform as words: its turn (degrees) and shift."""
+    import math
+    angle = math.degrees(math.atan2(m[1][0], m[0][0]))
+    return f"turned {angle:+.2f} deg, moved ({m[0][2]:+.2f}, {m[1][2]:+.2f})"
+
+
 def main(argv=None) -> int:
-    """``python -m micro_viewer.qt PATH``: a window showing one image, with the plane
-    position, the level and the values under the pointer in the status bar."""
+    """``python -m micro_viewer.qt PATH [PATH ...]``: a window showing the images as
+    layers (two one-channel images in green and magenta, to align them), with the
+    current layer, its plane, transform and level and the values under the pointer in
+    the status bar."""
     from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow
 
     argv = list(sys.argv if argv is None else argv)
     app = QApplication.instance() or QApplication(argv)
     if len(argv) < 2:
-        print("usage: python -m micro_viewer.qt PATH")
+        print("usage: python -m micro_viewer.qt PATH [PATH ...]")
         return 2
     win = QMainWindow()
     widget = ViewerWidget()
     win.setCentralWidget(widget)
     win.resize(1280, 800)
-    win.setWindowTitle(f"micro-viewer: {argv[1]}")
+    win.setWindowTitle("micro-viewer: " + "  +  ".join(argv[1:]))
     status = QLabel()
     win.statusBar().addWidget(status, 1)
-    state = {"pick": ""}
+    state = {"pick": "", "note": ""}
 
     def show():
         v = widget.viewer
-        pos = "  ".join(f"{n}={round(i)}/{s}" for n, i, s in v.position)
+        layers = v.layers
+        if not layers:
+            status.setText(state["note"])
+            return
+        cur = layers[v.current]
+        pos = "  ".join(f"{n}={round(i)}/{s}" for n, i, s in cur["position"])
         visible, loaded, pending, level, missing = widget.last_stats
-        err = f"  read error: {v.error}" if v.error else ""
-        status.setText(f"{pos}  level {level}  pending {pending}  {state['pick']}{err}")
+        err = f"  error: {v.error}" if v.error else ""
+        which = f"layer {v.current + 1}/{len(layers)}  " if len(layers) > 1 else ""
+        moved = _turn_and_shift(cur["transform"])
+        view = f"view {v.rotation:.0f} deg  " if v.rotation else ""
+        status.setText(f"{which}{pos}  level {level}  pending {pending}  {view}{moved}  "
+                       f"{state['pick']}{err}  {state['note']}")
 
     def picked(p):
         if p["pixel"] is None:
@@ -257,10 +363,25 @@ def main(argv=None) -> int:
             state["pick"] = f"x={p['pixel'][0]} y={p['pixel'][1]}  {vals}"
         show()
 
+    def note(text):
+        state["note"] = text
+        show()
+
     widget.viewChanged.connect(show)
     widget.picked.connect(picked)
+    widget.saved.connect(note)
+    widget.failed.connect(note)
     widget.open(argv[1])
+    for path in argv[2:]:
+        widget.add(path)
     win.show()
+    try:
+        v = widget.viewer                                # made now: the window exists
+        if len(v.layers) == 2 and all(len(l["channels"]) == 1 for l in v.layers):
+            v.set_channel(0, color=(0.0, 1.0, 0.0), layer=0)
+            v.set_channel(0, color=(1.0, 0.0, 1.0), layer=1)
+    except Exception as exc:  # noqa: BLE001 (shown in the status bar)
+        note(str(exc))
     timer = QTimer(win)
     timer.timeout.connect(show)
     timer.start(250)
