@@ -950,6 +950,8 @@ dependencies = [
  "ome-zarr-pyramid",
  "pollster",
  "raw-window-handle",
+ "serde",
+ "serde_json",
  "wgpu",
 ]
 

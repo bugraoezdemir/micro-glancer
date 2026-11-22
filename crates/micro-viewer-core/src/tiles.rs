@@ -1,57 +1,73 @@
-//! The tile cache on the GPU: an atlas of `slots` tiles of `TILE` x `TILE` float32
-//! texels, and a page table from each tile of the plane to its slot (0 = not loaded),
-//! least recently used tiles evicted when the atlas is full.
+//! The tile cache on the GPU: an atlas of slots (`TILE` x `TILE` texels each, 256 slots
+//! per 4096 x 4096 layer of a texture array) and which tile sits in which slot, least
+//! recently used tiles evicted when the atlas is full. A tile is one channel of one
+//! plane of one level; tiles of every level, channel and plane share the atlas.
 
 use std::collections::HashMap;
 
 /// Tile edge in pixels.
 pub const TILE: u32 = 256;
-/// Tiles per atlas row and column: a 4096 x 4096 float32 texture, 64 MiB.
+/// Slots per atlas layer row and column: a layer is 4096 x 4096 texels.
 pub const SLOTS_PER_ROW: u32 = 16;
+/// Slots per atlas layer.
+pub const SLOTS_PER_LAYER: u32 = SLOTS_PER_ROW * SLOTS_PER_ROW;
 
-/// Which tile sits in which slot, and when each was last used.
-pub struct TileTable {
-    pub grid_w: u32,
-    pub grid_h: u32,
-    /// Per tile of the plane (row-major): slot + 1, or 0.
-    pub pages: Vec<u32>,
-    /// Per slot: the tile it holds and the frame it was last drawn in.
-    slots: Vec<Option<(u32, u64)>>,
-    free: Vec<u32>,
-    tile_of: HashMap<u32, u32>,
+/// One tile: the plane (a hash of its indices on the axes before y and x, the channel
+/// axis left out, at its level), the channel, the level and the tile's column and row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TileKey {
+    pub plane: u64,
+    pub channel: u16,
+    pub level: u8,
+    pub x: u32,
+    pub y: u32,
 }
 
-impl TileTable {
-    pub fn new(width: u64, height: u64) -> Self {
-        let grid_w = width.div_ceil(TILE as u64) as u32;
-        let grid_h = height.div_ceil(TILE as u64) as u32;
-        let n = SLOTS_PER_ROW * SLOTS_PER_ROW;
+/// Which tile sits in which slot, and the frame each was last used in.
+pub struct Cache {
+    slots: Vec<Option<(TileKey, u64)>>,
+    free: Vec<u32>,
+    map: HashMap<TileKey, u32>,
+}
+
+impl Cache {
+    pub fn new(slots: u32) -> Self {
         Self {
-            grid_w,
-            grid_h,
-            pages: vec![0; (grid_w * grid_h) as usize],
-            slots: vec![None; n as usize],
-            free: (0..n).rev().collect(),
-            tile_of: HashMap::new(),
+            slots: vec![None; slots as usize],
+            free: (0..slots).rev().collect(),
+            map: HashMap::new(),
         }
     }
 
-    /// Mark tile `t` as drawn in `frame`; whether it is loaded.
-    pub fn touch(&mut self, t: u32, frame: u64) -> bool {
-        match self.tile_of.get(&t) {
-            Some(&s) => {
-                self.slots[s as usize] = Some((t, frame));
-                true
-            }
-            None => false,
-        }
+    pub fn capacity(&self) -> u32 {
+        self.slots.len() as u32
     }
 
-    /// A slot for tile `t`: a free one, else the least recently used one not drawn in
-    /// `frame` (its tile leaves the page table). None when every slot is in this frame.
-    pub fn place(&mut self, t: u32, frame: u64) -> Option<u32> {
-        let s = match self.free.pop() {
-            Some(s) => s,
+    /// The slot of `key` if cached, marked as used in `frame`.
+    pub fn touch(&mut self, key: &TileKey, frame: u64) -> Option<u32> {
+        let s = *self.map.get(key)?;
+        self.slots[s as usize] = Some((*key, frame));
+        Some(s)
+    }
+
+    /// The slot of `key` if cached (not marked as used).
+    pub fn peek(&self, key: &TileKey) -> Option<u32> {
+        self.map.get(key).copied()
+    }
+
+    /// Every cached tile and its slot.
+    pub fn iter(&self) -> impl Iterator<Item = (&TileKey, &u32)> {
+        self.map.iter()
+    }
+
+    /// A slot for `key`: a free one, else the least recently used one not used in
+    /// `frame` (the tile it held is returned). None when every slot is in this frame.
+    pub fn place(&mut self, key: TileKey, frame: u64) -> Option<(u32, Option<TileKey>)> {
+        if let Some(s) = self.touch(&key, frame) {
+            return Some((s, None));
+        }
+        let (s, old) = match self.free.pop() {
+            Some(s) => (s, None),
             None => {
                 let (s, old) = self
                     .slots
@@ -61,15 +77,13 @@ impl TileTable {
                     .filter(|&(_, _, f)| f < frame)
                     .min_by_key(|&(_, _, f)| f)
                     .map(|(s, old, _)| (s, old))?;
-                self.pages[old as usize] = 0;
-                self.tile_of.remove(&old);
-                s
+                self.map.remove(&old);
+                (s, Some(old))
             }
         };
-        self.slots[s as usize] = Some((t, frame));
-        self.tile_of.insert(t, s);
-        self.pages[t as usize] = s + 1;
-        Some(s)
+        self.slots[s as usize] = Some((key, frame));
+        self.map.insert(key, s);
+        Some((s, old))
     }
 }
 
@@ -77,17 +91,29 @@ impl TileTable {
 mod tests {
     use super::*;
 
+    fn key(x: u32) -> TileKey {
+        TileKey {
+            plane: 0,
+            channel: 0,
+            level: 0,
+            x,
+            y: 0,
+        }
+    }
+
     #[test]
     fn least_recently_used_tiles_leave() {
-        let mut t = TileTable::new(256 * 20, 256 * 20); // 400 tiles, 256 slots
-        for k in 0..256 {
-            assert!(t.place(k, 1).is_some());
+        let mut c = Cache::new(4);
+        for k in 0..4 {
+            assert_eq!(c.place(key(k), 1).unwrap().1, None);
         }
-        assert!(t.place(300, 1).is_none()); // every slot drawn in this frame
-        assert!(t.touch(5, 2));
-        let s = t.place(300, 2).unwrap();
-        assert_eq!(t.pages[300], s + 1);
-        assert_eq!(t.pages[0], 0); // tile 0 (frame 1) went first
-        assert!(t.pages[5] != 0);
+        assert!(c.place(key(9), 1).is_none()); // every slot used in this frame
+        assert!(c.touch(&key(2), 2).is_some());
+        let (s, old) = c.place(key(9), 2).unwrap();
+        assert_eq!(old, Some(key(0))); // the oldest of frame 1 went first
+        assert_eq!(c.peek(&key(9)), Some(s));
+        assert_eq!(c.peek(&key(0)), None);
+        assert!(c.peek(&key(2)).is_some());
+        assert_eq!(c.place(key(9), 3).unwrap(), (s, None)); // already there
     }
 }

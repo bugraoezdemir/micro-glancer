@@ -13,6 +13,9 @@ raw-window-handle = "0.6"
 # waiting for the adapter and device (wgpu's requests are futures)
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
+# the view state as JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # ozp in Rust (DR9): images, levels and their matrices. A path into the local ozp
 # checkout until its branch dr9-rust-core is merged (then a git dependency).
 ome-zarr-pyramid = { path = "../../../../../WS-OmeZarrPyramid/ome_zarr_pyramid/core/crates/ome-zarr-pyramid" }

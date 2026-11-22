@@ -1,27 +1,53 @@
-//! The GPU side: device, the target (a window's surface or an off-screen texture), the
-//! pipeline that draws a plane from the tile atlas, and the atlas itself.
+//! The GPU side: device, the target (a window's surface or an off-screen texture), and
+//! for the open image the pipeline, the tile atlas (a texture array in the image's own
+//! texel format) and the buffers the shader reads: page table, levels and channels.
 
 use bytemuck::{Pod, Zeroable};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
-use crate::tiles::{SLOTS_PER_ROW, TILE};
+use crate::source::Texel;
+use crate::tiles::{SLOTS_PER_LAYER, SLOTS_PER_ROW, TILE};
 use crate::ViewerError;
 
-/// The shader's parameters (std140-compatible, 48 bytes).
+/// The shader's per-frame parameters (uniform, 48 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
-pub struct Params {
-    pub origin: [f32; 2],
-    pub scale: f32,
+pub struct FrameParams {
+    pub n_levels: u32,
+    pub n_channels: u32,
+    pub level: u32,
+    pub channel_stride: u32,
+    pub background: [f32; 4],
+    pub missing: [f32; 4],
+}
+
+/// One level's placement on screen for the frame (storage, 48 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct LevelGpu {
+    pub origin_int: [i32; 2],
+    pub origin_frac: [f32; 2],
+    pub ux: [f32; 2],
+    pub uy: [f32; 2],
+    pub size: [i32; 2],
+    pub grid_w: u32,
+    pub page_base: u32,
+}
+
+/// One channel's display (storage, 32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct ChannelGpu {
+    pub color: [f32; 3],
+    pub gamma: f32,
     pub lo: f32,
     pub hi: f32,
-    pub width: f32,
-    pub height: f32,
-    pub grid_w: u32,
-    pub tile: u32,
-    pub slots_per_row: u32,
-    pub _pad: [u32; 2],
+    pub active: u32,
+    pub _pad: u32,
 }
+
+pub const BACKGROUND: [f32; 4] = [0.08, 0.08, 0.08, 1.0];
+pub const MISSING: [f32; 4] = [0.16, 0.16, 0.18, 1.0];
 
 /// Where frames go.
 enum Target {
@@ -45,6 +71,22 @@ pub struct GpuOptions {
     pub software: bool,
     /// Present without waiting for the display's refresh (for measuring frame times).
     pub no_vsync: bool,
+    /// The most GPU memory the tile atlas may take, in MiB (0: 1024).
+    pub atlas_mib: u32,
+}
+
+/// The open image's pipeline, atlas and buffers.
+struct Plane {
+    texel: Texel,
+    pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    params: wgpu::Buffer,
+    atlas: wgpu::Texture,
+    slots: u32,
+    pages: wgpu::Buffer,
+    levels: wgpu::Buffer,
+    channels: wgpu::Buffer,
+    bind: Option<wgpu::BindGroup>,
 }
 
 pub struct Gpu {
@@ -52,15 +94,12 @@ pub struct Gpu {
     queue: wgpu::Queue,
     target: Target,
     format: wgpu::TextureFormat,
-    pipeline: wgpu::RenderPipeline,
-    layout: wgpu::BindGroupLayout,
-    params: wgpu::Buffer,
-    atlas: wgpu::Texture,
-    pages: wgpu::Buffer,
-    pages_len: usize,
-    bind: Option<wgpu::BindGroup>,
+    plane: Option<Plane>,
     /// The off-screen frames' readback buffer, kept between frames.
     readback: Option<wgpu::Buffer>,
+    atlas_mib: u32,
+    /// The first GPU error no error scope caught.
+    errors: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pub adapter_info: String,
 }
 
@@ -72,6 +111,26 @@ fn instance() -> wgpu::Instance {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = wgpu::Backends::PRIMARY;
     wgpu::Instance::new(desc)
+}
+
+fn texel_format(t: Texel) -> (wgpu::TextureFormat, wgpu::TextureSampleType, &'static str) {
+    use wgpu::{TextureFormat as F, TextureSampleType as S};
+    match t {
+        Texel::U8 => (F::R8Uint, S::Uint, "u32"),
+        Texel::I8 => (F::R8Sint, S::Sint, "i32"),
+        Texel::U16 => (F::R16Uint, S::Uint, "u32"),
+        Texel::I16 => (F::R16Sint, S::Sint, "i32"),
+        Texel::F32 => (F::R32Float, S::Float { filterable: false }, "f32"),
+    }
+}
+
+fn storage(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: bytes.max(64),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 impl Gpu {
@@ -103,7 +162,7 @@ impl Gpu {
         .map_err(err)?;
         let (device, queue) = request_device(&adapter)?;
         let caps = surface.get_capabilities(&adapter);
-        // a plain (non-sRGB) format: the shader's grey values are written as they are
+        // a plain (non-sRGB) format: the shader's values are written as they are
         let format = caps
             .formats
             .iter()
@@ -131,12 +190,13 @@ impl Gpu {
         };
         surface.configure(&device, &config);
         let info = adapter_label(&adapter);
-        Ok(Self::build(
+        Ok(Self::with(
             device,
             queue,
             Target::Surface { surface, config },
             format,
             info,
+            options,
         ))
     }
 
@@ -154,7 +214,7 @@ impl Gpu {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let texture = offscreen_texture(&device, format, width, height);
         let info = adapter_label(&adapter);
-        Ok(Self::build(
+        Ok(Self::with(
             device,
             queue,
             Target::Offscreen {
@@ -164,125 +224,39 @@ impl Gpu {
             },
             format,
             info,
+            options,
         ))
     }
 
-    fn build(
+    fn with(
         device: wgpu::Device,
         queue: wgpu::Queue,
         target: Target,
         format: wgpu::TextureFormat,
         adapter_info: String,
+        options: GpuOptions,
     ) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("plane"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("plane"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("plane"),
-            bind_group_layouts: &[Some(&layout)],
-            ..Default::default()
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("plane"),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let params = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("params"),
-            size: std::mem::size_of::<Params>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let side = TILE * SLOTS_PER_ROW;
-        let atlas = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("atlas"),
-            size: wgpu::Extent3d {
-                width: side,
-                height: side,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let pages = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pages"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // errors outside an error scope are recorded, never a panic across the bindings
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let sink = errors.clone();
+        device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
+            if let Ok(mut slot) = sink.lock() {
+                slot.get_or_insert_with(|| e.to_string());
+            }
+        }));
         Self {
+            errors,
             device,
             queue,
             target,
             format,
-            pipeline,
-            layout,
-            params,
-            atlas,
-            pages,
-            pages_len: 1,
-            bind: None,
+            plane: None,
             readback: None,
+            atlas_mib: if options.atlas_mib == 0 {
+                1024
+            } else {
+                options.atlas_mib
+            },
             adapter_info,
         }
     }
@@ -315,21 +289,201 @@ impl Gpu {
         }
     }
 
-    /// Tile data (`TILE` x `TILE` float32, row-major; a smaller edge tile padded by the
-    /// caller) into atlas slot `slot`.
-    pub fn upload_tile(&self, slot: u32, data: &[f32], w: u32, h: u32) {
-        let (sx, sy) = ((slot % SLOTS_PER_ROW) * TILE, (slot / SLOTS_PER_ROW) * TILE);
+    /// The atlas slots an image needs: `wanted`, within the memory budget and the
+    /// device's limits (whole layers of 256 slots).
+    fn layers_for(&self, texel: Texel, wanted: u32) -> u32 {
+        let layer_bytes = (SLOTS_PER_LAYER * TILE * TILE) as u64 * texel.bytes() as u64;
+        let budget = (self.atlas_mib as u64 * 1024 * 1024 / layer_bytes).max(1) as u32;
+        let limit = self.device.limits().max_texture_array_layers.max(1);
+        wanted.div_ceil(SLOTS_PER_LAYER).clamp(1, budget.min(limit))
+    }
+
+    /// Set up for an image of `texel`s wanting `slots` atlas slots: the pipeline (made
+    /// again only for another texel type) and the atlas. Returns the slots made (fewer
+    /// when memory is short: halved until the GPU can hold them).
+    pub fn prepare_image(&mut self, texel: Texel, slots: u32) -> Result<u32, ViewerError> {
+        let mut layers = self.layers_for(texel, slots);
+        let (format, _, _) = texel_format(texel);
+        let atlas = loop {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let atlas = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("atlas"),
+                size: wgpu::Extent3d {
+                    width: TILE * SLOTS_PER_ROW,
+                    height: TILE * SLOTS_PER_ROW,
+                    depth_or_array_layers: layers,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            match pollster::block_on(scope.pop()) {
+                None => break atlas,
+                Some(e) if layers == 1 => {
+                    return Err(err(format!("no GPU memory for the tile atlas: {e}")))
+                }
+                Some(_) => layers = layers.div_ceil(2),
+            }
+        };
+        let reuse = self.plane.take().filter(|p| p.texel == texel);
+        let (pipeline, layout, params, pages, levels, channels) = match reuse {
+            Some(p) => (
+                p.pipeline, p.layout, p.params, p.pages, p.levels, p.channels,
+            ),
+            None => {
+                let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let (pipeline, layout) = self.pipeline(texel);
+                if let Some(e) = pollster::block_on(scope.pop()) {
+                    return Err(err(format!("the GPU refused the drawing pipeline: {e}")));
+                }
+                let params = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("params"),
+                    size: std::mem::size_of::<FrameParams>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                (
+                    pipeline,
+                    layout,
+                    params,
+                    storage(&self.device, "pages", 4),
+                    storage(&self.device, "levels", 48),
+                    storage(&self.device, "channels", 32),
+                )
+            }
+        };
+        self.plane = Some(Plane {
+            texel,
+            pipeline,
+            layout,
+            params,
+            atlas,
+            slots: layers * SLOTS_PER_LAYER,
+            pages,
+            levels,
+            channels,
+            bind: None,
+        });
+        Ok(layers * SLOTS_PER_LAYER)
+    }
+
+    /// The first GPU error no error scope caught, if any (taken: reported once).
+    pub fn take_error(&self) -> Option<String> {
+        self.errors.lock().ok().and_then(|mut e| e.take())
+    }
+
+    /// Atlas slots of the open image (0 without one).
+    pub fn slots(&self) -> u32 {
+        self.plane.as_ref().map_or(0, |p| p.slots)
+    }
+
+    fn pipeline(&self, texel: Texel) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+        let (_, sample_type, wgsl_type) = texel_format(texel);
+        let source = include_str!("shader.wgsl").replace("TEXEL", wgsl_type);
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("plane"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let buffer = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let read_only = wgpu::BufferBindingType::Storage { read_only: true };
+        let layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("plane"),
+                entries: &[
+                    buffer(0, wgpu::BufferBindingType::Uniform),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type,
+                            view_dimension: wgpu::TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    buffer(2, read_only),
+                    buffer(3, read_only),
+                    buffer(4, read_only),
+                ],
+            });
+        let pl = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("plane"),
+                bind_group_layouts: &[Some(&layout)],
+                ..Default::default()
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("plane"),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+        (pipeline, layout)
+    }
+
+    /// Tile data (`w` x `h` texels, row-major, the image's texel type) into atlas slot
+    /// `slot`.
+    pub fn upload_tile(&self, slot: u32, data: &[u8], w: u32, h: u32) {
+        let Some(p) = &self.plane else { return };
+        let within = slot % SLOTS_PER_LAYER;
+        let (sx, sy) = (
+            (within % SLOTS_PER_ROW) * TILE,
+            (within / SLOTS_PER_ROW) * TILE,
+        );
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.atlas,
+                texture: &p.atlas,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: sx, y: sy, z: 0 },
+                origin: wgpu::Origin3d {
+                    x: sx,
+                    y: sy,
+                    z: slot / SLOTS_PER_LAYER,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
-            bytemuck::cast_slice(data),
+            data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * w),
+                bytes_per_row: Some(w * p.texel.bytes() as u32),
                 rows_per_image: Some(h),
             },
             wgpu::Extent3d {
@@ -340,34 +494,71 @@ impl Gpu {
         );
     }
 
-    /// The page table (slot + 1 per tile, 0 for none).
-    pub fn upload_pages(&mut self, pages: &[u32]) {
-        if pages.len() != self.pages_len {
-            self.pages = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("pages"),
-                size: (4 * pages.len().max(1)) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.pages_len = pages.len();
-            self.bind = None;
+    /// Write `data` into a storage buffer at element `offset`, making the buffer larger
+    /// (and its contents lost: the caller writes everything then) when `len` elements do
+    /// not fit. Returns whether it was made again.
+    fn write_storage<T: Pod>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        p: &mut Plane,
+        which: u8,
+        len: usize,
+        offset: usize,
+        data: &[T],
+    ) -> bool {
+        let size = std::mem::size_of::<T>();
+        let buf = match which {
+            0 => &mut p.pages,
+            1 => &mut p.levels,
+            _ => &mut p.channels,
+        };
+        let need = (len.max(1) * size) as u64;
+        let mut grown = false;
+        if buf.size() < need {
+            *buf = storage(device, "storage", need.next_power_of_two());
+            p.bind = None;
+            grown = true;
         }
-        if !pages.is_empty() {
-            self.queue
-                .write_buffer(&self.pages, 0, bytemuck::cast_slice(pages));
+        if !data.is_empty() {
+            queue.write_buffer(buf, (offset * size) as u64, bytemuck::cast_slice(data));
+        }
+        grown
+    }
+
+    /// The page table: `len` entries in all, `data` written from entry `offset`. Returns
+    /// whether the buffer was made again (then write every entry).
+    pub fn write_pages(&mut self, len: usize, offset: usize, data: &[u32]) -> bool {
+        let Some(p) = &mut self.plane else {
+            return false;
+        };
+        Self::write_storage(&self.device, &self.queue, p, 0, len, offset, data)
+    }
+
+    pub fn write_levels(&mut self, data: &[LevelGpu]) {
+        if let Some(p) = &mut self.plane {
+            Self::write_storage(&self.device, &self.queue, p, 1, data.len(), 0, data);
         }
     }
 
-    fn bind_group(&mut self) -> &wgpu::BindGroup {
-        if self.bind.is_none() {
-            let view = self.atlas.create_view(&Default::default());
-            self.bind = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    pub fn write_channels(&mut self, data: &[ChannelGpu]) {
+        if let Some(p) = &mut self.plane {
+            Self::write_storage(&self.device, &self.queue, p, 2, data.len(), 0, data);
+        }
+    }
+
+    fn bind_group(device: &wgpu::Device, p: &mut Plane) -> wgpu::BindGroup {
+        if p.bind.is_none() {
+            let view = p.atlas.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+            p.bind = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("plane"),
-                layout: &self.layout,
+                layout: &p.layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: self.params.as_entire_binding(),
+                        resource: p.params.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -375,24 +566,39 @@ impl Gpu {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: self.pages.as_entire_binding(),
+                        resource: p.pages.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: p.levels.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: p.channels.as_entire_binding(),
                     },
                 ],
             }));
         }
-        self.bind.as_ref().expect("made above")
+        p.bind.clone().expect("made above")
     }
 
-    fn draw(&mut self, view: &wgpu::TextureView, params: &Params, plane: bool) {
-        self.queue
-            .write_buffer(&self.params, 0, bytemuck::bytes_of(params));
-        let bind = plane.then(|| self.bind_group().clone());
+    /// One frame into `view`: the image when `params` is given, else the background.
+    fn draw(&mut self, view: &wgpu::TextureView, params: Option<&FrameParams>) {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+        let drawn = match (params, &mut self.plane) {
+            (Some(fp), Some(p)) => {
+                self.queue
+                    .write_buffer(&p.params, 0, bytemuck::bytes_of(fp));
+                Some((p.pipeline.clone(), Self::bind_group(&self.device, p)))
+            }
+            _ => None,
+        };
         {
+            let [r, g, b, a] = BACKGROUND.map(f64::from);
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frame"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -400,12 +606,7 @@ impl Gpu {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.08,
-                            g: 0.08,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -414,8 +615,8 @@ impl Gpu {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let Some(bind) = &bind {
-                pass.set_pipeline(&self.pipeline);
+            if let Some((pipeline, bind)) = &drawn {
+                pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, bind, &[]);
                 pass.draw(0..3, 0..1);
             }
@@ -423,8 +624,8 @@ impl Gpu {
         self.queue.submit([enc.finish()]);
     }
 
-    /// One frame to the window (`plane`: whether a plane is open).
-    pub fn present(&mut self, params: &Params, plane: bool) -> Result<(), ViewerError> {
+    /// One frame to the window.
+    pub fn present(&mut self, params: Option<&FrameParams>) -> Result<(), ViewerError> {
         let frame = match &self.target {
             Target::Surface { surface, config } => match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t)
@@ -443,25 +644,16 @@ impl Gpu {
             Target::Offscreen { .. } => return Err(err("this viewer draws off-screen")),
         };
         let view = frame.texture.create_view(&Default::default());
-        self.draw(&view, params, plane);
+        self.draw(&view, params);
         self.queue.present(frame);
         Ok(())
-    }
-
-    /// One frame off-screen, read back as RGBA8 rows (width x height x 4 bytes).
-    pub fn render_rgba(&mut self, params: &Params, plane: bool) -> Result<Vec<u8>, ViewerError> {
-        let (w, h) = self.size();
-        let mut out = vec![0u8; (4 * w * h) as usize];
-        self.render_into(params, plane, &mut out)?;
-        Ok(out)
     }
 
     /// One frame off-screen, read back into `out` (RGBA8 rows, width x height x 4
     /// bytes) through a readback buffer kept between frames.
     pub fn render_into(
         &mut self,
-        params: &Params,
-        plane: bool,
+        params: Option<&FrameParams>,
         out: &mut [u8],
     ) -> Result<(), ViewerError> {
         let (texture, w, h) = match &self.target {
@@ -480,7 +672,7 @@ impl Gpu {
             )));
         }
         let view = texture.create_view(&Default::default());
-        self.draw(&view, params, plane);
+        self.draw(&view, params);
         let row = (4 * w).div_ceil(256) * 256;
         let size = (row * h) as u64;
         if self.readback.as_ref().is_none_or(|b| b.size() != size) {
@@ -539,6 +731,58 @@ impl Gpu {
         Ok(())
     }
 
+    /// One texel of atlas slot `slot` at (`x`, `y`) within the tile, as stored (the
+    /// image's texel bytes), read back from the GPU.
+    pub fn read_texel(&self, slot: u32, x: u32, y: u32) -> Result<Vec<u8>, ViewerError> {
+        let p = self.plane.as_ref().ok_or_else(|| err("no image is open"))?;
+        let within = slot % SLOTS_PER_LAYER;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("texel"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("texel"),
+            });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &p.atlas,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: (within % SLOTS_PER_ROW) * TILE + x,
+                    y: (within / SLOTS_PER_ROW) * TILE + y,
+                    z: slot / SLOTS_PER_LAYER,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(err)?;
+        let out = slice.get_mapped_range().map_err(err)?[..p.texel.bytes()].to_vec();
+        buf.unmap();
+        Ok(out)
+    }
+
     /// Wait until the GPU has finished what was submitted (for timing).
     pub fn finish(&self) -> Result<(), ViewerError> {
         self.device
@@ -571,10 +815,13 @@ fn offscreen_texture(
 }
 
 fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), ViewerError> {
+    let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+    // the atlas is a texture array: as many layers as the adapter allows
+    limits.max_texture_array_layers = adapter.limits().max_texture_array_layers;
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("micro-viewer"),
         required_features: wgpu::Features::empty(),
-        required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+        required_limits: limits,
         ..Default::default()
     }))
     .map_err(err)

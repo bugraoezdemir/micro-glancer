@@ -1,26 +1,53 @@
-// One plane drawn from a tile atlas: every screen pixel finds its image pixel through
-// the camera, its tile through the page table, and its value in the atlas; contrast
-// limits map it to grey. A tile not loaded yet shows the background.
+// An image's plane drawn from a tile atlas. Every screen pixel finds, per level, the
+// level pixel whose centre is nearest (from that level's placement, computed per frame on
+// the CPU in double precision); per active channel it takes the value from the frame's
+// level, or else from the nearest coarser level holding the tile, or else a finer one;
+// contrast, gamma and colour map it, and the channels add up.
+//
+// TEXEL is replaced by u32, i32 or f32 to match the atlas format.
 
 struct Params {
-    // image pixel (x, y) at the screen's top-left corner
-    origin: vec2<f32>,
-    // image pixels per screen pixel
-    scale: f32,
+    n_levels: u32,
+    n_channels: u32,
+    // the frame's level (finest worth drawing at this zoom)
+    level: u32,
+    // page table entries per channel (all levels)
+    channel_stride: u32,
+    background: vec4<f32>,
+    missing: vec4<f32>,
+}
+
+// One level's placement on screen: the level pixel at screen position p (pixels, centres
+// at +0.5) is floor(origin + p.x * ux + p.y * uy), origin split into an integer part and a
+// fraction so deep zooms keep their precision.
+struct Level {
+    origin_int: vec2<i32>,
+    origin_frac: vec2<f32>,
+    ux: vec2<f32>,
+    uy: vec2<f32>,
+    size: vec2<i32>,
+    grid_w: u32,
+    page_base: u32,
+}
+
+struct Channel {
+    color: vec3<f32>,
+    gamma: f32,
     lo: f32,
     hi: f32,
-    width: f32,
-    height: f32,
-    grid_w: u32,
-    tile: u32,
-    slots_per_row: u32,
-    _pad0: u32,
-    _pad1: u32,
+    shown: u32,
+    _pad: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var atlas: texture_2d<f32>;
+@group(0) @binding(1) var atlas: texture_2d_array<TEXEL>;
 @group(0) @binding(2) var<storage, read> pages: array<u32>;
+@group(0) @binding(3) var<storage, read> levels: array<Level>;
+@group(0) @binding(4) var<storage, read> channels: array<Channel>;
+
+const TILE: i32 = 256;
+const SLOTS_PER_ROW: u32 = 16u;
+const SLOTS_PER_LAYER: u32 = 256u;
 
 struct Out {
     @builtin(position) pos: vec4<f32>,
@@ -36,25 +63,59 @@ fn vs(@builtin(vertex_index) i: u32) -> Out {
     return o;
 }
 
-const BACKGROUND = vec4<f32>(0.08, 0.08, 0.08, 1.0);
-const MISSING = vec4<f32>(0.16, 0.16, 0.18, 1.0);
+fn pixel_at(l: Level, s: vec2<f32>) -> vec2<i32> {
+    return l.origin_int + vec2<i32>(floor(l.origin_frac + s.x * l.ux + s.y * l.uy));
+}
+
+// The `k`-th level to try: the frame's level, then coarser ones, then finer ones.
+fn level_order(k: u32) -> u32 {
+    let coarser = p.n_levels - 1u - p.level;
+    if (k <= coarser) {
+        return p.level + k;
+    }
+    return p.level - (k - coarser);
+}
 
 @fragment
 fn fs(in: Out) -> @location(0) vec4<f32> {
-    // pixel centres: screen pixel (sx + 0.5) covers image x = origin + (sx + 0.5) * scale
-    let ip = p.origin + in.pos.xy * p.scale;
-    if (ip.x < 0.0 || ip.y < 0.0 || ip.x >= p.width || ip.y >= p.height) {
-        return BACKGROUND;
+    let s = in.pos.xy;
+    let top = levels[p.level];
+    let here = pixel_at(top, s);
+    if (any(here < vec2<i32>(0)) || any(here >= top.size)) {
+        return p.background;
     }
-    let px = vec2<u32>(floor(ip));
-    let t = px / p.tile;
-    let slot = pages[t.y * p.grid_w + t.x];
-    if (slot == 0u) {
-        return MISSING;
+    var rgb = vec3<f32>(0.0);
+    var shown = false;
+    var wanted = false;
+    for (var c = 0u; c < p.n_channels; c++) {
+        let ch = channels[c];
+        if (ch.shown == 0u) {
+            continue;
+        }
+        wanted = true;
+        for (var k = 0u; k < p.n_levels; k++) {
+            let l = levels[level_order(k)];
+            let px = clamp(pixel_at(l, s), vec2<i32>(0), l.size - 1);
+            let t = px / TILE;
+            let page = pages[c * p.channel_stride + l.page_base + u32(t.y) * l.grid_w + u32(t.x)];
+            if (page == 0u) {
+                continue;
+            }
+            let slot = page - 1u;
+            let within = slot % SLOTS_PER_LAYER;
+            let base = vec2<i32>(i32(within % SLOTS_PER_ROW), i32(within / SLOTS_PER_ROW)) * TILE;
+            let v = f32(textureLoad(atlas, base + px - t * TILE, i32(slot / SLOTS_PER_LAYER), 0).r);
+            var g = clamp((v - ch.lo) / max(ch.hi - ch.lo, 1e-30), 0.0, 1.0);
+            if (ch.gamma != 1.0) {
+                g = pow(g, ch.gamma);
+            }
+            rgb += g * ch.color;
+            shown = true;
+            break;
+        }
     }
-    let s = slot - 1u;
-    let base = vec2<u32>(s % p.slots_per_row, s / p.slots_per_row) * p.tile;
-    let v = textureLoad(atlas, vec2<i32>(base + px - t * p.tile), 0).r;
-    let g = clamp((v - p.lo) / max(p.hi - p.lo, 1e-30), 0.0, 1.0);
-    return vec4<f32>(g, g, g, 1.0);
+    if (wanted && !shown) {
+        return p.missing;
+    }
+    return vec4<f32>(min(rgb, vec3<f32>(1.0)), 1.0);
 }
