@@ -1,4 +1,4 @@
-"""micro-viewer's layers, transforms and the turned camera (Workplan WP14, task V9 part 1),
+"""micro-glancer's layers, transforms and the turned camera (Workplan WP14, task V9 part 1),
 colour maps and contrast from the view (V7's rest), reading coarser while the view moves
 on slow sources, and saving a layer's transform into its image.
 
@@ -17,8 +17,8 @@ import zipfile
 import numpy as np
 import pytest
 
-from micro_viewer import ALIGNED, COLOUR_MAPS, Viewer, ViewerError
-from micro_viewer.save import save_transform
+from micro_glancer import ALIGNED, COLOUR_MAPS, Viewer, ViewerError
+from micro_glancer.save import save_transform
 
 ozp = pytest.importorskip("ome_zarr_pyramid")
 
@@ -288,7 +288,7 @@ def test_the_view_state_keeps_layers_and_turns(stores):
 # ------------------------------------------------------------------ slow sources
 
 def test_slow_reads_take_coarser_levels_while_the_view_moves(stores, monkeypatch):
-    monkeypatch.setenv("MICRO_VIEWER_SLOW_READS_MS", "400")
+    monkeypatch.setenv("MICRO_GLANCER_SLOW_READS_MS", "400")
     v = Viewer.offscreen(450, 350)
     v.open(stores["pyramid"])                            # fitted: level 1 (scale 2)
     assert v.level == 1
@@ -396,7 +396,7 @@ def test_the_qt_widget_moves_and_turns_layers(qapp, stores, tmp_path):
     from PyQt6.QtCore import QPoint, QPointF, Qt
     from PyQt6.QtGui import QWheelEvent
     from PyQt6.QtTest import QTest
-    from micro_viewer.qt import ViewerWidget
+    from micro_glancer.qt import ViewerWidget
 
     w = ViewerWidget(mode="offscreen")
     w.resize(240, 180)
@@ -451,7 +451,7 @@ def test_the_qt_widget_moves_and_turns_layers(qapp, stores, tmp_path):
 def test_one_jump_on_a_slow_source_reads_at_once(stores, monkeypatch):
     """A jump, an open or a step in z is not a moving view: the frame's level is
     read straight away, even when reads are slow."""
-    monkeypatch.setenv("MICRO_VIEWER_SLOW_READS_MS", "400")
+    monkeypatch.setenv("MICRO_GLANCER_SLOW_READS_MS", "400")
     v = Viewer.offscreen(450, 350)
     v.open(stores["pyramid"])
     v.settle(30.0)

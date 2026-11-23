@@ -1,4 +1,4 @@
-"""micro-viewer's plates (Workplan WP14, task V9 part 2): an HCS plate opens as one image
+"""micro-glancer's plates (Workplan WP14, task V9 part 2): an HCS plate opens as one image
 (its wells on a grid, coarse levels zoomed out), the well under the pointer, switching
 fields, and the navigation tree (plate, wells, fields, label images). A plate opens with
 every field of each well (see test_positions.py: at their positions, here on a small
@@ -14,7 +14,7 @@ import os
 import numpy as np
 import pytest
 
-from micro_viewer import Viewer, ViewerError, tree
+from micro_glancer import Viewer, ViewerError, tree
 
 ozp = pytest.importorskip("ome_zarr_pyramid")
 
@@ -187,7 +187,7 @@ def test_the_navigation_tree(plate):
 
 
 def test_a_plates_transform_is_not_saved(plate):
-    from micro_viewer.save import save_transform
+    from micro_glancer.save import save_transform
     v = Viewer.offscreen(3 * PX, 2 * PY)
     v.open(plate)
     v.move_layer(5, 0)

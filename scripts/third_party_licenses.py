@@ -1,4 +1,4 @@
-"""Write THIRD_PARTY_LICENSES.txt: the licences of everything micro-viewer's wheels contain.
+"""Write THIRD_PARTY_LICENSES.txt: the licences of everything micro-glancer's wheels contain.
 
     python scripts/third_party_licenses.py        (from the repository's root)
 
@@ -19,7 +19,7 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # the repository
-ROOT = "micro-viewer"
+ROOT = "micro-glancer"
 LICENSE_NAME = re.compile(r"^(licen[cs]e|copying|notice|copyright|authors)", re.IGNORECASE)
 #: crate -> (bundled library, the folder in the crate holding its licence files, or None
 #: when the crate ships none and ``OWN_FILES`` has them)
@@ -53,7 +53,7 @@ for _crate in ("objc2-core-foundation", "objc2-core-graphics", "objc2-metal",
 #: repository) whose files stand for theirs
 SAME_AS = {"zarrs_plugin": "zarrs"}
 #: our own crates, all MIT: this repository's, ome_zarr_pyramid's and dyna-zarr's
-OWN_CRATES = {"micro-viewer-core", "ome-zarr-pyramid", "dyna-zarr-transforms",
+OWN_CRATES = {"micro-glancer-core", "ome-zarr-pyramid", "dyna-zarr-transforms",
               "dyna-zarr-arrays", "dyna-zarr-filters"}
 #: the targets the wheels are built for (.github/workflows/build-wheels.yml)
 TARGETS = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin",

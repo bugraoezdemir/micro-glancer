@@ -1,4 +1,4 @@
-"""A store's contents as a tree (``micro_viewer.tree``): a plate's wells and fields, an
+"""A store's contents as a tree (``micro_glancer.tree``): a plate's wells and fields, an
 image's label images, a collection's series.
 
 ``ContentsPanel.show_tree(path)`` reads the store's tree; double-clicking (or Enter on)
@@ -102,7 +102,7 @@ class ContentsPanel(QWidget):
 
 
 def open_node(viewer, node) -> str:
-    """What micro-viewer does with an activated node on `viewer` (a ``Viewer``); returns
+    """What micro-glancer does with an activated node on `viewer` (a ``Viewer``); returns
     what it did, in words. A plate opens whole; a well is shown on its plate when the
     plate is open (else the well opens, every field at its position); an image, a
     field or a collection opens (a collection with every series at its position); a

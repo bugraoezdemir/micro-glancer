@@ -1,4 +1,4 @@
-"""micro-viewer's transfer functions and histograms (Workplan WP14, task V4): opacity
+"""micro-glancer's transfer functions and histograms (Workplan WP14, task V4): opacity
 curves for the volume projection, the isosurface level, skipping empty bricks, the
 histogram (of the view, the whole plane, the whole volume) and the channel panel.
 """
@@ -7,7 +7,7 @@ import json
 import numpy as np
 import pytest
 
-from micro_viewer import Viewer, ViewerError
+from micro_glancer import Viewer, ViewerError
 
 ozp = pytest.importorskip("ome_zarr_pyramid")
 
@@ -182,8 +182,8 @@ def qapp():
 def test_the_panel_drags_contrast_level_and_curve(qapp, stores):
     from PyQt6.QtCore import QPoint, Qt
     from PyQt6.QtTest import QTest
-    from micro_viewer.panel import ChannelPanel
-    from micro_viewer.qt import ViewerWidget
+    from micro_glancer.panel import ChannelPanel
+    from micro_glancer.qt import ViewerWidget
 
     w = ViewerWidget(mode="offscreen")
     w.resize(200, 150)

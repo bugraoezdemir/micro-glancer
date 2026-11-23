@@ -1,6 +1,6 @@
-# eubi's GUI with micro-viewer in the Inspect page, for local testing (nothing is
-# installed into eubi's venv): micro-viewer's python folder goes on PYTHONPATH.
-# Build micro-viewer first (in this folder): .venv\Scripts\maturin develop --release
+# eubi's GUI with micro-glancer in the Inspect page, for local testing (nothing is
+# installed into eubi's venv): micro-glancer's python folder goes on PYTHONPATH.
+# Build micro-glancer first (in this folder): .venv\Scripts\maturin develop --release
 #
 # usage:   .\eubi-dev.ps1 [PATH]
 #          $env:EUBI_VIEWER = "classic"; .\eubi-dev.ps1     # the classic viewer

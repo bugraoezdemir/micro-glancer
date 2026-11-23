@@ -3,7 +3,7 @@ requires = ["maturin>=1.8,<2"]
 build-backend = "maturin"
 
 [project]
-name = "micro-viewer"
+name = "micro-glancer"
 dynamic = ["version"]              # from Cargo.toml
 description = "A GPU viewer for OME-Zarr images on a Rust core, hosted in Qt."
 readme = "README.md"
@@ -31,13 +31,13 @@ classifiers = [
 dependencies = ["numpy>=1.26"]
 
 [project.urls]
-Homepage = "https://github.com/bugraoezdemir/micro-viewer"
+Homepage = "https://github.com/bugraoezdemir/micro-glancer"
 
 [project.scripts]
-micro-viewer = "micro_viewer.cli:main"
+micro-glancer = "micro_glancer.cli:main"
 
 [project.optional-dependencies]
-# the window and the widget (micro_viewer.app, micro_viewer.qt)
+# the window and the widget (micro_glancer.app, micro_glancer.qt)
 qt = ["PyQt6>=6.7"]
 # saving a translation into an NGFF 0.4 / 0.5 image (0.6 needs nothing extra)
 save = ["ome_zarr_pyramid>=0.6.1"]
@@ -45,4 +45,4 @@ dev = ["PyQt6>=6.7", "pytest", "ome_zarr_pyramid>=0.6.1"]
 
 [tool.maturin]
 python-source = "python"
-module-name = "micro_viewer._core"
+module-name = "micro_glancer._core"

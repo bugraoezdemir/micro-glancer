@@ -1,18 +1,18 @@
-//! Python bindings of micro-viewer-core (module `micro_viewer._core`): a `Viewer` that
+//! Python bindings of micro-glancer-core (module `micro_glancer._core`): a `Viewer` that
 //! draws into a native window (a Qt widget's `winId()`) or off-screen. The Qt widget
-//! itself is Python (`micro_viewer.qt`).
+//! itself is Python (`micro_glancer.qt`).
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use micro_viewer_core as core;
+use micro_glancer_core as core;
 use pyo3::create_exception;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
-create_exception!(micro_viewer._core, ViewerError, PyValueError);
+create_exception!(micro_glancer._core, ViewerError, PyValueError);
 
 fn err(e: core::ViewerError) -> PyErr {
     ViewerError::new_err(e.0)
@@ -130,7 +130,7 @@ fn channel_list<'py>(
 
 /// A viewer: one GPU target, its layers (images, each with channels, plane and
 /// transform) and a camera.
-#[pyclass(unsendable, module = "micro_viewer._core")]
+#[pyclass(unsendable, module = "micro_glancer._core")]
 pub struct Viewer {
     inner: core::Viewer,
 }
@@ -243,7 +243,7 @@ impl Viewer {
     fn set_field(&mut self, field: Option<usize>, layer: Option<usize>) -> PyResult<()> {
         let i = self.layer_index(layer)?;
         self.inner
-            .set_field(i, field.unwrap_or(micro_viewer_core::ALL_FIELDS))
+            .set_field(i, field.unwrap_or(micro_glancer_core::ALL_FIELDS))
             .map_err(err)
     }
 
@@ -1120,7 +1120,7 @@ impl Viewer {
     }
 }
 
-/// The navigation tree of the store at `path` as JSON (`micro_viewer.tree` parses it).
+/// The navigation tree of the store at `path` as JSON (`micro_glancer.tree` parses it).
 #[pyfunction]
 fn tree_json(path: PathBuf) -> PyResult<String> {
     core::tree(&path).map(|v| v.to_string()).map_err(err)
@@ -1128,7 +1128,7 @@ fn tree_json(path: PathBuf) -> PyResult<String> {
 
 /// A plate's field for Python: None for every field.
 fn field_out(field: usize) -> Option<usize> {
-    (field != micro_viewer_core::ALL_FIELDS).then_some(field)
+    (field != micro_glancer_core::ALL_FIELDS).then_some(field)
 }
 
 #[pymodule]

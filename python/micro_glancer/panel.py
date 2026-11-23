@@ -1,4 +1,4 @@
-"""A channel panel for micro-viewer's Qt widget: the channel's histogram with its contrast
+"""A channel panel for micro-glancer's Qt widget: the channel's histogram with its contrast
 limits, isosurface level and opacity curve, all adjusted by dragging.
 
 ``HistogramWidget`` shows one channel's histogram (counts on a log scale, in the

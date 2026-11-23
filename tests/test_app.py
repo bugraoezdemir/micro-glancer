@@ -1,4 +1,4 @@
-"""micro-viewer's app window (micro_viewer.app): opening images, the layers, planes and
+"""micro-glancer's app window (micro_glancer.app): opening images, the layers, planes and
 channel panels, the toolbar driving the viewer, and label images (Labels button,
 double-click selection, the label controls)."""
 import json
@@ -42,8 +42,8 @@ def _pump(qapp, seconds=0.6):
 
 
 def test_the_app_window(qapp, images, monkeypatch):
-    monkeypatch.setenv("MICRO_VIEWER_MODE", "offscreen")
-    from micro_viewer.app import MainWindow
+    monkeypatch.setenv("MICRO_GLANCER_MODE", "offscreen")
+    from micro_glancer.app import MainWindow
     win = MainWindow([images["vol"], images["flat"]])
     win.show()
     _pump(qapp)
@@ -95,10 +95,10 @@ def test_the_app_window(qapp, images, monkeypatch):
 
 def test_the_add_and_open_buttons(qapp, images, monkeypatch):
     """The toolbar's Add layer (it calls the dialog with add=True: once killed the app)."""
-    monkeypatch.setenv("MICRO_VIEWER_MODE", "offscreen")
+    monkeypatch.setenv("MICRO_GLANCER_MODE", "offscreen")
     from PyQt6.QtGui import QAction
     from PyQt6.QtWidgets import QFileDialog
-    from micro_viewer.app import MainWindow
+    from micro_glancer.app import MainWindow
     monkeypatch.setattr(QFileDialog, "getExistingDirectory",
                         staticmethod(lambda *a, **k: images["flat"]))
     win = MainWindow([images["vol"]])
@@ -147,11 +147,11 @@ def labelled(tmp_path_factory):
 
 
 def test_label_images_in_the_app(qapp, labelled, monkeypatch):
-    monkeypatch.setenv("MICRO_VIEWER_MODE", "offscreen")
+    monkeypatch.setenv("MICRO_GLANCER_MODE", "offscreen")
     from PyQt6.QtCore import QEvent, QPointF
     from PyQt6.QtGui import QKeyEvent, QMouseEvent
     from PyQt6.QtWidgets import QMenu
-    from micro_viewer.app import MainWindow
+    from micro_glancer.app import MainWindow
     chosen = []
 
     def first_action(menu, *a, **k):                     # the menu without a click
@@ -211,8 +211,8 @@ from test_plates import plate  # noqa: E402,F401 (the plate fixture)
 
 
 def test_plates_in_the_app(qapp, plate, monkeypatch):  # noqa: F811
-    monkeypatch.setenv("MICRO_VIEWER_MODE", "offscreen")
-    from micro_viewer.app import MainWindow
+    monkeypatch.setenv("MICRO_GLANCER_MODE", "offscreen")
+    from micro_glancer.app import MainWindow
     win = MainWindow([plate])
     win.show()
     _pump(qapp)

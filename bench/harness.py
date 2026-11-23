@@ -1,4 +1,4 @@
-"""The V7 harness (Workplan WP14): micro-viewer's numbers against the targets
+"""The V7 harness (Workplan WP14): micro-glancer's numbers against the targets
 (120 frames per second for cached pan and zoom, 0.5 s from a change to a sharp view).
 
 For each image, on an off-screen 3840 x 2160 target (and the native window for the
@@ -89,7 +89,7 @@ def cached_fps(v, render):
 
 
 def offscreen(path):
-    from micro_viewer import Viewer
+    from micro_glancer import Viewer
     out = {}
     v = Viewer.offscreen(W, H)
     t0 = time.perf_counter()
@@ -167,7 +167,7 @@ def offscreen(path):
 
 def native(path):
     from PyQt6.QtWidgets import QApplication
-    from micro_viewer.qt import ViewerWidget
+    from micro_glancer.qt import ViewerWidget
     app = QApplication.instance() or QApplication([])
     widget = ViewerWidget(mode="native", no_vsync=True)
     r = widget.devicePixelRatioF()

@@ -1,6 +1,6 @@
-"""Smoke test of the scratch Inspect page on micro-viewer (off-screen Qt, no window).
+"""Smoke test of the scratch Inspect page on micro-glancer (off-screen Qt, no window).
 
-usage: QT_QPA_PLATFORM=offscreen MICRO_VIEWER_MODE=offscreen python scratch/smoke_inspect_mv.py IMAGE
+usage: QT_QPA_PLATFORM=offscreen MICRO_GLANCER_MODE=offscreen python scratch/smoke_inspect_mv.py IMAGE
 """
 import os
 import sys
@@ -54,7 +54,7 @@ print("auto contrast, channel 0:", before, "->", (v.channels[0]["lo"], v.channel
       "| panel:", (mv.channel_panel.channel_data()[0]["intensityMin"],
                    mv.channel_panel.channel_data()[0]["intensityMax"]))
 
-# micro-viewer's histogram panel: contrast changed there reaches eubi's panel
+# micro-glancer's histogram panel: contrast changed there reaches eubi's panel
 hp = mv.histogram_panel
 hp.refresh()
 v.set_channel(0, hi=1234.0)

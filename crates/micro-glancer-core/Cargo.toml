@@ -1,10 +1,10 @@
 [package]
-name = "micro-viewer-core"
+name = "micro-glancer-core"
 version = "0.0.1"
 edition.workspace = true
 license.workspace = true
 publish = false
-description = "micro-viewer's core: GPU rendering of OME-Zarr images from a tile cache, read through ome-zarr-pyramid and dyna-zarr's arrays (Workplan WP14)"
+description = "micro-glancer's core: GPU rendering of OME-Zarr images from a tile cache, read through ome-zarr-pyramid and dyna-zarr's arrays (Workplan WP14)"
 
 [dependencies]
 # rendering: Vulkan, Metal, DX12, GL, and software adapters (WARP, lavapipe)

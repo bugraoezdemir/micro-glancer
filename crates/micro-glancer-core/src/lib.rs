@@ -1,4 +1,4 @@
-//! micro-viewer's core (Workplan WP14): OME-Zarr images drawn by the GPU from a tile
+//! micro-glancer's core (Workplan WP14): OME-Zarr images drawn by the GPU from a tile
 //! cache, hosted by any toolkit that can hand over a native window, or read back
 //! off-screen. No Qt and no Python here: the bindings and the widget live outside.
 //!

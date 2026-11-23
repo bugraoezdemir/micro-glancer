@@ -24,14 +24,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # cargo test leaves out the binding (micro-viewer): it has no Rust tests, and its
+      # cargo test leaves out the binding (micro-glancer): it has no Rust tests, and its
       # test program cannot link on macOS, where an extension module finds Python's
       # symbols only when Python loads it. The Python tests below test it.
       - name: format, lint, test (toolchain from rust-toolchain.toml)
         run: |
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo test --workspace --exclude micro-viewer --locked
+          cargo test --workspace --exclude micro-glancer --locked
 
   licences:
     name: licence notices current
@@ -90,7 +90,7 @@ jobs:
           python -m pip install --upgrade pip
           # the wheel file itself (with --find-links, pip could take a PyPI copy instead)
           python -m pip install "$(ls dist/*.whl)[dev]"
-          python -c "import micro_viewer as m; print(m.__file__); assert 'site-packages' in m.__file__, 'not the installed wheel'"
+          python -c "import micro_glancer as m; print(m.__file__); assert 'site-packages' in m.__file__, 'not the installed wheel'"
 
       - name: pytest
         run: python -m pytest tests -v -o addopts=""

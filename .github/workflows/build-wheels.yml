@@ -1,4 +1,4 @@
-# Build micro-viewer: one abi3 wheel per platform (Python >= 3.11) and the sdist.
+# Build micro-glancer: one abi3 wheel per platform (Python >= 3.11) and the sdist.
 # Called by tests.yml, so it runs on every pull request and before every release
 # (publish.yml calls tests.yml), and the tests run on these very wheels.
 #

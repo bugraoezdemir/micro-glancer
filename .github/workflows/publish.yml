@@ -14,7 +14,7 @@ name: Publish to PyPI
 #
 # Keep this file's name: the PyPI trusted publisher is registered for publish.yml with
 # the environment pypi. One-time setup before the first release: on PyPI, a pending
-# publisher for the project micro-viewer (this repository, workflow publish.yml,
+# publisher for the project micro-glancer (this repository, workflow publish.yml,
 # environment pypi); on GitHub, the environment pypi (Settings > Environments).
 on:
   release:
@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/micro-viewer/
+      url: https://pypi.org/project/micro-glancer/
     permissions:
       contents: read                      # a permissions block drops the defaults: keep read
       id-token: write                     # OIDC token for Trusted Publishing

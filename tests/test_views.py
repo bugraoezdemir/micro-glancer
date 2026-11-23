@@ -1,11 +1,11 @@
-"""micro-viewer's linked views and projection (Workplan WP14, task V4): the main view, its
+"""micro-glancer's linked views and projection (Workplan WP14, task V4): the main view, its
 YZ and XZ companions and the maximum intensity projection in quarters of one target,
 sharing their centre; the projection compared with NumPy.
 """
 import numpy as np
 import pytest
 
-from micro_viewer import Viewer
+from micro_glancer import Viewer
 
 ozp = pytest.importorskip("ome_zarr_pyramid")
 
@@ -186,7 +186,7 @@ def test_qt_keys_toggle_linked_views_and_the_projection(stores):
     qt = pytest.importorskip("PyQt6.QtWidgets")
     from PyQt6.QtCore import Qt
     from PyQt6.QtTest import QTest
-    from micro_viewer.qt import ViewerWidget
+    from micro_glancer.qt import ViewerWidget
     app = qt.QApplication.instance() or qt.QApplication([])
     w = ViewerWidget(mode="offscreen")
     w.resize(240, 180)
@@ -307,7 +307,7 @@ def test_qt_keys_cycle_the_projection(stores):
     qt = pytest.importorskip("PyQt6.QtWidgets")
     from PyQt6.QtCore import Qt
     from PyQt6.QtTest import QTest
-    from micro_viewer.qt import ViewerWidget
+    from micro_glancer.qt import ViewerWidget
     app = qt.QApplication.instance() or qt.QApplication([])
     w = ViewerWidget(mode="offscreen")
     w.resize(200, 150)

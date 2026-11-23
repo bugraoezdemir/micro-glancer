@@ -1,6 +1,6 @@
-"""The Qt widget hosting micro-viewer's core.
+"""The Qt widget hosting micro-glancer's core.
 
-Two hosting modes, chosen automatically (``MICRO_VIEWER_MODE`` overrides):
+Two hosting modes, chosen automatically (``MICRO_GLANCER_MODE`` overrides):
 
 - ``native``: the core draws straight into the widget's own native window (Windows,
   macOS). Qt does not paint the widget; frames never pass through Python.
@@ -29,7 +29,7 @@ Input (the view, and the current layer of several):
 - Ctrl + drag: move the current layer; Ctrl + wheel: turn it about its centre (1 degree
   a notch, with Shift 0.1); Ctrl + arrow keys: move it by one screen pixel; Ctrl + 0:
   put it back where its image places it; Ctrl + S: save its transform into its image
-  (``micro_viewer.save``);
+  (``micro_glancer.save``);
 - Tab: the next layer becomes the current one;
 - label images: double-click selects the id under the pointer (highlighted; again on
   the background clears it), Esc clears it, O switches outlines;
@@ -84,14 +84,14 @@ def native_possible() -> bool:
 
 
 def default_mode() -> str:
-    mode = os.environ.get("MICRO_VIEWER_MODE")
+    mode = os.environ.get("MICRO_GLANCER_MODE")
     if mode in ("native", "offscreen"):
         return mode
     return "native" if native_possible() else "offscreen"
 
 
 class ViewerWidget(QWidget):
-    """A widget showing an OME-Zarr image, drawn by micro-viewer's core."""
+    """A widget showing an OME-Zarr image, drawn by micro-glancer's core."""
 
     viewChanged = pyqtSignal()
     picked = pyqtSignal(dict)
@@ -105,9 +105,9 @@ class ViewerWidget(QWidget):
         if self.mode == "native" and not native_possible():
             from PyQt6.QtGui import QGuiApplication
             raise ValueError(
-                f"micro-viewer cannot draw into a native window on Qt's "
+                f"micro-glancer cannot draw into a native window on Qt's "
                 f"{QGuiApplication.platformName()!r} platform ({sys.platform}); "
-                f"use mode='offscreen' (or unset MICRO_VIEWER_MODE)")
+                f"use mode='offscreen' (or unset MICRO_GLANCER_MODE)")
         self._software = software
         self._no_vsync = no_vsync
         self._atlas_mib = atlas_mib
@@ -430,8 +430,8 @@ class ViewerWidget(QWidget):
 
 
 def main(argv=None) -> int:
-    """``python -m micro_viewer.qt PATH [PATH ...]``: micro-viewer's app window
-    (micro_viewer.app)."""
+    """``python -m micro_glancer.qt PATH [PATH ...]``: micro-glancer's app window
+    (micro_glancer.app)."""
     from .app import main as app_main
     return app_main(argv)
 

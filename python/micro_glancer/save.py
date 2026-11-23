@@ -7,7 +7,7 @@ What can be saved depends on the image's NGFF version:
   (or scaled) layer is refused, naming the ways out.
 - 0.6 holds coordinate systems linked by transforms. The layer's transform is saved as
   a transform from the image's own coordinate system to the ``"aligned"`` one
-  (``micro_viewer.ALIGNED``): a translation, or an affine when the layer is turned. The
+  (``micro_glancer.ALIGNED``): a translation, or an affine when the layer is turned. The
   image's own placement stays as it was, so a registration tool can read the hand-made
   alignment as its starting point. Saving the identity removes it again. ozp has no
   public call for such a transform yet, so this edits the image's ``zarr.json``
@@ -82,7 +82,7 @@ def _save_translation(path: str, shift, axes) -> str:
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             f"saving a translation into an NGFF 0.4 or 0.5 image needs ome_zarr_pyramid "
-            f"({exc}): pip install \"micro-viewer[save]\"") from exc
+            f"({exc}): pip install \"micro-glancer[save]\"") from exc
 
     if not any(shift):
         return "nothing to save: the layer is where the image places it"
@@ -140,7 +140,7 @@ def _save_06(path: str, m, system: str) -> str:
         ms["coordinateTransformations"] = edges
     else:
         ms.pop("coordinateTransformations", None)
-    tmp = meta + ".micro-viewer.tmp"
+    tmp = meta + ".micro-glancer.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2)
     os.replace(tmp, meta)                    # a reader never sees half a file

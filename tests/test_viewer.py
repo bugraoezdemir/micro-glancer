@@ -1,4 +1,4 @@
-"""micro-viewer's 2D viewer (Workplan WP14, task V7): OME-Zarr images drawn by the GPU
+"""micro-glancer's 2D viewer (Workplan WP14, task V7): OME-Zarr images drawn by the GPU
 from a tile cache, read through ozp-in-Rust (DR9) and dyna's arrays crate.
 
 Off-screen frames are compared pixel by pixel with NumPy. A screen pixel (sx, sy) shows,
@@ -15,7 +15,7 @@ import zipfile
 import numpy as np
 import pytest
 
-from micro_viewer import Viewer, ViewerError
+from micro_glancer import Viewer, ViewerError
 
 ozp = pytest.importorskip("ome_zarr_pyramid")
 
@@ -422,11 +422,11 @@ def test_errors_name_the_way_out(tmp_path):
     assert (rgba[..., 0] == BACKGROUND).all() and stats == (0, 0, 0, 0, 0)
 
 
-@pytest.mark.skipif(not os.environ.get("MICRO_VIEWER_SAMPLE"),
-                    reason="set MICRO_VIEWER_SAMPLE to an OME-Zarr image with omero colours")
+@pytest.mark.skipif(not os.environ.get("MICRO_GLANCER_SAMPLE"),
+                    reason="set MICRO_GLANCER_SAMPLE to an OME-Zarr image with omero colours")
 def test_a_real_image():
     v = Viewer.offscreen(400, 300)
-    v.open(os.environ["MICRO_VIEWER_SAMPLE"])
+    v.open(os.environ["MICRO_GLANCER_SAMPLE"])
     rgba, (visible, loaded, pending, level, missing) = _settled(v)
     assert missing == 0 and v.error is None
     assert (rgba[..., :3] > BACKGROUND + 10).any()
@@ -452,7 +452,7 @@ def _pump(qapp, widget, rounds=200):
 
 
 def test_the_qt_widget_offscreen(qapp, stores, image):
-    from micro_viewer.qt import ViewerWidget
+    from micro_glancer.qt import ViewerWidget
     w = ViewerWidget(mode="offscreen")
     w.resize(240, 180)
     w.open(stores["0.5"])
@@ -476,7 +476,7 @@ def test_the_qt_widget_offscreen(qapp, stores, image):
 
 
 def test_the_qt_widget_steps_through_z(qapp, stores):
-    from micro_viewer.qt import ViewerWidget
+    from micro_glancer.qt import ViewerWidget
     w = ViewerWidget(mode="offscreen")
     w.resize(200, 160)
     w.open(stores["stack"])
@@ -490,7 +490,7 @@ def test_the_qt_widget_steps_through_z(qapp, stores):
 
 
 def test_the_qt_widget_reports_instead_of_crashing(qapp, tmp_path):
-    from micro_viewer.qt import ViewerWidget
+    from micro_glancer.qt import ViewerWidget
     w = ViewerWidget(mode="offscreen")
     w.resize(120, 90)
     errors = []
@@ -504,7 +504,7 @@ def test_the_qt_widget_reports_instead_of_crashing(qapp, tmp_path):
 
 
 def test_the_qt_widget_native(qapp, stores):
-    from micro_viewer.qt import ViewerWidget, native_possible
+    from micro_glancer.qt import ViewerWidget, native_possible
     if not native_possible():
         pytest.skip(f"no native windows on {sys.platform} with Qt's "
                     f"{qapp.platformName()!r} platform")
@@ -521,9 +521,9 @@ def test_the_qt_widget_native(qapp, stores):
 def test_native_without_real_windows_is_refused(qapp, monkeypatch):
     # on Qt's offscreen platform the window id is no window: Windows refused it and
     # macOS crashed on it (CI, 2026-11-23); the widget now says so before the core runs
-    import micro_viewer.qt as mvqt
+    import micro_glancer.qt as mvqt
     monkeypatch.setattr(mvqt, "native_possible", lambda: False)
     with pytest.raises(ValueError, match="mode='offscreen'"):
         mvqt.ViewerWidget(mode="native")
-    monkeypatch.setenv("MICRO_VIEWER_MODE", "")
+    monkeypatch.setenv("MICRO_GLANCER_MODE", "")
     assert mvqt.default_mode() == "offscreen"

@@ -1,15 +1,15 @@
-# micro-viewer
+# micro-glancer
 
 A viewer for OME-Zarr images that draws on the GPU. The drawing, the tile cache and the
-reading are Rust (the crate `micro-viewer-core`); Python gets a small API and a Qt widget
-(the package `micro-viewer`). It is new (alpha): the API may still change.
+reading are Rust (the crate `micro-glancer-core`); Python gets a small API and a Qt widget
+(the package `micro-glancer`). It is new (alpha): the API may still change.
 
 ## Install
 
 ```
-pip install "micro-viewer[qt]"      # the app window and the Qt widget
-pip install micro-viewer            # only the off-screen viewer (needs numpy alone)
-pip install "micro-viewer[save]"    # also: saving translations into NGFF 0.4 / 0.5 images
+pip install "micro-glancer[qt]"      # the app window and the Qt widget
+pip install micro-glancer            # only the off-screen viewer (needs numpy alone)
+pip install "micro-glancer[save]"    # also: saving translations into NGFF 0.4 / 0.5 images
 ```
 
 There are wheels for Windows (x64), macOS (Apple silicon and Intel) and Linux (x86_64
@@ -78,7 +78,7 @@ picture.
   field under the pointer are named. A 384-well plate of 28 fields per well (10,640
   fields) opens in 4 s and is sharp 4 s later; one field per well opens in a fraction
   of a second.
-- See a store's contents as a tree (`micro_viewer.tree`, and the Contents panel): a
+- See a store's contents as a tree (`micro_glancer.tree`, and the Contents panel): a
   plate's wells and fields, a well's fields, an image's label images, a collection's
   series. Double-click a well to show it on its plate (or to open it whole), a field or
   a series to open it, a label image to add it.
@@ -89,16 +89,16 @@ picture.
 
 On slow sources (remote stores, slow codecs, and later other file formats) the viewer
 reads coarser levels while the view moves and the finer ones once it stops. To see how
-it behaves, set `MICRO_VIEWER_SLOW_READS_MS` to add that many milliseconds to every
+it behaves, set `MICRO_GLANCER_SLOW_READS_MS` to add that many milliseconds to every
 tile read.
 
 ## Using it
 
 ```
-micro-viewer PATH [PATH ...]
+micro-glancer PATH [PATH ...]
 ```
 
-opens the app (also `python -m micro_viewer`), with the images as layers; File > Open,
+opens the app (also `python -m micro_glancer`), with the images as layers; File > Open,
 or dropping a folder or a .zip / .ozx on the window, adds more. The toolbar switches
 the views (XY, XZ, YZ), linked views, the projection and what it shows, the volume's
 density, shading and smooth sampling. The layers are on the left, the current layer's
@@ -145,8 +145,8 @@ the left lists the wells, fields, series and label images of the store opened la
 From Python:
 
 ```python
-from micro_viewer import Viewer
-from micro_viewer.save import save_transform
+from micro_glancer import Viewer
+from micro_glancer.save import save_transform
 
 v = Viewer.offscreen(1024, 768)
 v.open("image.ome.zarr")
@@ -196,13 +196,13 @@ print(v.members()["names"])     # ["field 0", "field 1", ...]
 print(v.pick(512, 384)["member"])  # ("field 7", "7")
 v.open("tiles.ome.zarr")        # a collection of series: each at its position
 
-from micro_viewer import tree
+from micro_glancer import tree
 tree("plate.ome.zarr")          # {"kind": "plate", "children": [wells > fields]}
 ```
 
 ## In eubi
 
-eubi's Inspect page uses micro-viewer when it is installed in eubi's environment
+eubi's Inspect page uses micro-glancer when it is installed in eubi's environment
 (`EUBI_VIEWER=classic`, or Settings > Viewer, switches back to eubi's classic viewer): planes at any angle and the
 3-D views, linked views, the histogram panel under eubi's channel panel, moving the image
 and saving its transform, image positions (plates with every field, wells and
@@ -210,10 +210,10 @@ collections whole), and the Contents tree. Several images as layers are
 left out there until layers are stable. The code on eubi's side is
 `eubi_bridge/qt_gui/widgets/gpu_viewer.py` and `viewers.py`.
 
-`micro_viewer.panel.ChannelPanel` (and its `HistogramWidget`) adjusts the channels of a
+`micro_glancer.panel.ChannelPanel` (and its `HistogramWidget`) adjusts the channels of a
 `ViewerWidget`'s current layer.
 
-In Qt, `micro_viewer.qt.ViewerWidget` shows the layers. It emits `viewChanged` when the
+In Qt, `micro_glancer.qt.ViewerWidget` shows the layers. It emits `viewChanged` when the
 camera, a plane, a layer or the channels change, `picked` with the values under the
 pointer, `saved` after a transform was saved, and `failed` when something fails.
 
@@ -222,22 +222,22 @@ pointer, `saved` after a transform was saved, and `failed` when something fails.
 On Windows and macOS the core draws straight into the widget's own native window, and
 frames never pass through Python. On Linux, and wherever a native window is not
 available, the core draws off-screen and Qt paints the frame. A machine without a GPU
-uses the system's software renderer. Set `MICRO_VIEWER_MODE=native` or `offscreen` to
+uses the system's software renderer. Set `MICRO_GLANCER_MODE=native` or `offscreen` to
 choose the mode.
 
 ## Development
 
-micro-viewer has its own virtual environment in `.venv` (Python 3.12, PyQt6, numpy),
-with micro-viewer installed in development mode: after a change to the Rust code,
+micro-glancer has its own virtual environment in `.venv` (Python 3.12, PyQt6, numpy),
+with micro-glancer installed in development mode: after a change to the Rust code,
 `maturin develop --release` (run in this folder) builds it again into the same place,
-and `.venv\Scripts\micro-viewer PATH` starts the app. To try it inside eubi with eubi's
+and `.venv\Scripts\micro-glancer PATH` starts the app. To try it inside eubi with eubi's
 own venv, nothing installed into it, run `.\eubi-dev.ps1 [PATH]`: it puts this folder's
 `python` directory on `PYTHONPATH` and starts `eubi-gui`.
 
 The core reads images through ome_zarr_pyramid's crate (`ome-zarr-pyramid`, a git
 dependency pinned to a commit). To build against a local ozp checkout instead, add a
 `[patch]` section to `.cargo/config.toml` (the form is in
-`crates/micro-viewer-core/Cargo.toml`).
+`crates/micro-glancer-core/Cargo.toml`).
 
 The wheels contain the Rust crates and C libraries listed, with their licences, in
 `THIRD_PARTY_LICENSES.txt`. After a change to `Cargo.lock`, run
@@ -259,7 +259,7 @@ The tests write their images with ome-zarr-pyramid, which `.venv` does not hold:
 them from an environment that has it, with this folder's `python` directory (where the
 development build puts the compiled module) on `PYTHONPATH`.
 
-`scratch/inspect_mv.py` is eubi's Inspect page with micro-viewer in its Viewer tab (and
-micro-viewer's histogram panel under eubi's channel panel), to try the viewer inside
+`scratch/inspect_mv.py` is eubi's Inspect page with micro-glancer in its Viewer tab (and
+micro-glancer's histogram panel under eubi's channel panel), to try the viewer inside
 eubi without changing eubi: run it with eubi's Python and `PYTHONPATH` set to this
 folder's `python` directory and the eubi checkout.

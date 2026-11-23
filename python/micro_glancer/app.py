@@ -1,13 +1,13 @@
-"""micro-viewer's app: a window around the viewer widget.
+"""micro-glancer's app: a window around the viewer widget.
 
-``micro-viewer [PATH ...]`` (or ``python -m micro_viewer``) opens the images as layers.
+``micro-glancer [PATH ...]`` (or ``python -m micro_glancer``) opens the images as layers.
 
 - Toolbar: open an image, add one as a layer, save the current layer's transform, fit;
   look along z (XY), y (XZ) or x (YZ); linked views; the projection (maximum intensity,
   volume or surfaces), the volume's density, shading, smooth (trilinear) sampling.
 - Left: the layers (shown or not, the current one, its opacity; remove it, put it back
   where its image places it).
-- Right: the current layer's channels with the histogram (micro_viewer.panel): contrast,
+- Right: the current layer's channels with the histogram (micro_glancer.panel): contrast,
   surface level and opacity curve adjusted on it.
 - Bottom: the current layer's planes (z, t, ...) as sliders.
 - Status bar: the current layer, its plane, level and transform, the values under the
@@ -271,11 +271,11 @@ class PlanePanel(QWidget):
 
 
 class MainWindow(QMainWindow):
-    """micro-viewer's window (see the module's notes)."""
+    """micro-glancer's window (see the module's notes)."""
 
     def __init__(self, paths=()):
         super().__init__()
-        self.setWindowTitle("micro-viewer")
+        self.setWindowTitle("micro-glancer")
         self.resize(1600, 900)
         self.setAcceptDrops(True)
         self.view = ViewerWidget()
@@ -390,7 +390,7 @@ class MainWindow(QMainWindow):
             else:
                 self.view.add(path)
         self._first_colours()
-        self.setWindowTitle("micro-viewer: " + "  +  ".join(
+        self.setWindowTitle("micro-glancer: " + "  +  ".join(
             os.path.basename(str(p).rstrip("/\\")) for p in paths))
         self._view_changed()
 
@@ -561,7 +561,7 @@ class MainWindow(QMainWindow):
 
 
 def main(argv=None) -> int:
-    """``micro-viewer [PATH ...]``: the window, opening the images as layers."""
+    """``micro-glancer [PATH ...]``: the window, opening the images as layers."""
     argv = list(sys.argv if argv is None else argv)
     app = QApplication.instance() or QApplication(argv)
     win = MainWindow(argv[1:])

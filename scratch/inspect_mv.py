@@ -1,20 +1,20 @@
-"""A scratch copy of eubi's Inspect page on micro-viewer (Workplan WP14, task V7).
+"""A scratch copy of eubi's Inspect page on micro-glancer (Workplan WP14, task V7).
 
-``InspectPageMV`` is eubi's ``InspectPage`` with its Viewer tab drawn by micro-viewer:
+``InspectPageMV`` is eubi's ``InspectPage`` with its Viewer tab drawn by micro-glancer:
 ``MicroZarrViewer`` stands in for eubi's ``ZarrViewer`` with the members the page uses
 (signals ``frame_ready``, ``dataset_loaded``, ``status_changed``; ``channel_panel``;
 ``load_dataset``, ``path``, ``axes``, ``shape``, ``channels``, ``level_idx``,
 ``level_paths``, ``orientation``, ``z``, ``fov_center``, ``image_widget``). eubi's own ``ChannelPanel`` drives the channels. The metadata tab,
 the sidebar and the save buttons are eubi's, unchanged. Nothing in eubi is modified.
 
-Below eubi's channel panel sits micro-viewer's (micro_viewer.panel): the channel's
+Below eubi's channel panel sits micro-glancer's (micro_glancer.panel): the channel's
 histogram with the contrast limits dragged on it (and the surface level and opacity
 curve for projections); contrast changed there flows back into eubi's panel, so "Save
-Channels" writes what is shown. The Auto buttons set a channel's contrast from what is in view (micro-viewer's
+Channels" writes what is shown. The Auto buttons set a channel's contrast from what is in view (micro-glancer's
 ``auto_contrast``: the 0.1 and 99.9 percentiles over the view). Not in this copy: XZ / YZ
 orientations (V4), the field-of-view combo and the reload button.
 
-usage (eubi's venv; micro-viewer's python folder, built by `maturin develop` in its own
+usage (eubi's venv; micro-glancer's python folder, built by `maturin develop` in its own
 .venv, on PYTHONPATH):
     python scratch/inspect_mv.py [IMAGE]
 """
@@ -30,8 +30,8 @@ from PyQt6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QSizePolicy, QSlide
 
 from eubi_bridge.qt_gui.pages.inspect_page import InspectPage, pyramid_cache
 from eubi_bridge.qt_gui.widgets.channel_panel import ChannelPanel
-from micro_viewer.panel import ChannelPanel as MicroChannelPanel
-from micro_viewer.qt import ViewerWidget
+from micro_glancer.panel import ChannelPanel as MicroChannelPanel
+from micro_glancer.qt import ViewerWidget
 
 
 def _safe(slot):
@@ -42,7 +42,7 @@ def _safe(slot):
         try:
             return slot(self, *args)
         except Exception as exc:  # noqa: BLE001
-            self.status_changed.emit(f"micro-viewer: {exc}")
+            self.status_changed.emit(f"micro-glancer: {exc}")
     return run
 
 
@@ -56,7 +56,7 @@ def _rgb(text: str):
 
 
 class MicroZarrViewer(QWidget):
-    """eubi's ZarrViewer, as far as the Inspect page uses it, on micro-viewer."""
+    """eubi's ZarrViewer, as far as the Inspect page uses it, on micro-glancer."""
 
     frame_ready = pyqtSignal(object, float, int)
     dataset_loaded = pyqtSignal(object)
@@ -81,7 +81,7 @@ class MicroZarrViewer(QWidget):
         side_layout.setContentsMargins(0, 0, 0, 0)
         side_layout.addWidget(self._planes)
         side_layout.addWidget(self.channel_panel, 1)
-        # micro-viewer's own panel: the histogram, contrast dragged on it, surface level
+        # micro-glancer's own panel: the histogram, contrast dragged on it, surface level
         # and opacity curve; what it changes flows back into eubi's panel
         self.histogram_panel = MicroChannelPanel(self.view)
         side_layout.addWidget(self.histogram_panel, 1)
@@ -155,7 +155,7 @@ class MicroZarrViewer(QWidget):
         return self
 
     def set_frame(self, *_args):
-        """eubi's image widget takes frames from Python; micro-viewer draws its own."""
+        """eubi's image widget takes frames from Python; micro-glancer draws its own."""
 
     # -- loading ---------------------------------------------------------------------
     def load_dataset(self, zarr_path: str):
@@ -238,7 +238,7 @@ class MicroZarrViewer(QWidget):
 
     @_safe
     def _sync_eubi_panel(self):
-        """Contrast changed on micro-viewer's histogram: into eubi's panel (only what
+        """Contrast changed on micro-glancer's histogram: into eubi's panel (only what
         differs: eubi's set_range always signals, and that would come back here)."""
         if not self._path:
             return
@@ -261,7 +261,7 @@ class MicroZarrViewer(QWidget):
 
 
 class InspectPageMV(InspectPage):
-    """eubi's Inspect page with micro-viewer in its Viewer tab."""
+    """eubi's Inspect page with micro-glancer in its Viewer tab."""
 
     def _build_viewer_tab(self):
         import eubi_bridge.qt_gui.pages.inspect_page as page
@@ -276,7 +276,7 @@ class InspectPageMV(InspectPage):
         try:
             self._update_status_bar(elapsed_ms)
         except Exception as exc:  # noqa: BLE001 (a slot: see _safe)
-            self._status_bar.setText(f"micro-viewer: {exc}")
+            self._status_bar.setText(f"micro-glancer: {exc}")
 
 
 def main(argv=None) -> int:
@@ -285,7 +285,7 @@ def main(argv=None) -> int:
     app = QApplication.instance() or QApplication(argv)
     page = InspectPageMV()
     page.resize(1400, 900)
-    page.setWindowTitle("eubi Inspect on micro-viewer (scratch)")
+    page.setWindowTitle("eubi Inspect on micro-glancer (scratch)")
     page.show()
     if len(argv) > 1:
         page._load_zarr(os.path.abspath(argv[1]))

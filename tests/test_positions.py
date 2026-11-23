@@ -17,7 +17,7 @@ import os
 import numpy as np
 import pytest
 
-from micro_viewer import Viewer, tree
+from micro_glancer import Viewer, tree
 
 ozp = pytest.importorskip("ome_zarr_pyramid")
 

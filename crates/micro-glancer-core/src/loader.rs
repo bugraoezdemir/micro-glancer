@@ -78,10 +78,10 @@ pub struct Loader {
     notify: Wakeup,
 }
 
-/// Extra time every tile read takes, from `MICRO_VIEWER_SLOW_READS_MS` (to try and test
+/// Extra time every tile read takes, from `MICRO_GLANCER_SLOW_READS_MS` (to try and test
 /// how the viewer behaves on slow sources: remote stores, slow codecs, other formats).
 fn slow_reads() -> std::time::Duration {
-    let ms = std::env::var("MICRO_VIEWER_SLOW_READS_MS")
+    let ms = std::env::var("MICRO_GLANCER_SLOW_READS_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(0);
@@ -180,7 +180,7 @@ impl Loader {
             .map(|i| {
                 let (s, t, n) = (shared.clone(), tx.clone(), notify.clone());
                 std::thread::Builder::new()
-                    .name(format!("micro-viewer tiles {i}"))
+                    .name(format!("micro-glancer tiles {i}"))
                     .spawn(move || work(s, t, n, slow))
                     .expect("a tile reading thread")
             })

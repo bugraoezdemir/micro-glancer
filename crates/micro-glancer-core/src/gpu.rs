@@ -252,12 +252,12 @@ fn instance_for(backends: wgpu::Backends) -> wgpu::Instance {
     wgpu::Instance::new(desc)
 }
 
-/// The backends to try, in order: `MICRO_VIEWER_BACKEND` ("vulkan", "dx12", "metal",
+/// The backends to try, in order: `MICRO_GLANCER_BACKEND` ("vulkan", "dx12", "metal",
 /// "gl") picks one; else Vulkan first on Windows (DX12's shader compiler took 7 to 11 s
 /// for the projection shader, uncached, freezing the window), then the platform's own.
 fn backend_choices() -> Vec<wgpu::Backends> {
     use wgpu::Backends as B;
-    match std::env::var("MICRO_VIEWER_BACKEND")
+    match std::env::var("MICRO_GLANCER_BACKEND")
         .unwrap_or_default()
         .to_ascii_lowercase()
         .as_str()
@@ -637,7 +637,7 @@ impl Gpu {
             let device = self.device.clone();
             let format = self.format;
             let spawned = std::thread::Builder::new()
-                .name("micro-viewer pipelines".into())
+                .name("micro-glancer pipelines".into())
                 .spawn(move || {
                     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
                     let made = Gpu::build_pipeline(&device, format, texel, kind);
@@ -1969,7 +1969,7 @@ fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)
     // the atlas is a texture array: as many layers as the adapter allows
     limits.max_texture_array_layers = adapter.limits().max_texture_array_layers;
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("micro-viewer"),
+        label: Some("micro-glancer"),
         required_features: wgpu::Features::empty(),
         required_limits: limits,
         ..Default::default()

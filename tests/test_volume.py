@@ -1,4 +1,4 @@
-"""micro-viewer's volumes cut at any angle (Workplan WP14, task V4 part 1): bricks, XZ and
+"""micro-glancer's volumes cut at any angle (Workplan WP14, task V4 part 1): bricks, XZ and
 YZ views, oblique planes, nearest and trilinear sampling, z shared by the layers, 3-D
 layer transforms saved into NGFF 0.6, and the view state's orientation.
 
@@ -16,8 +16,8 @@ import shutil
 import numpy as np
 import pytest
 
-from micro_viewer import Viewer, ViewerError
-from micro_viewer.save import save_transform
+from micro_glancer import Viewer, ViewerError
+from micro_glancer.save import save_transform
 
 ozp = pytest.importorskip("ome_zarr_pyramid")
 
@@ -279,7 +279,7 @@ def qapp():
 def test_the_qt_widget_turns_the_view(qapp, stores):
     from PyQt6.QtCore import QPoint, Qt
     from PyQt6.QtTest import QTest
-    from micro_viewer.qt import ViewerWidget
+    from micro_glancer.qt import ViewerWidget
 
     w = ViewerWidget(mode="offscreen")
     w.resize(240, 180)

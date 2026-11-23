@@ -1,4 +1,4 @@
-"""micro-viewer's label images (Workplan WP14, task V9 part 2): found in an image's
+"""micro-glancer's label images (Workplan WP14, task V9 part 2): found in an image's
 labels/ group, drawn over the image (colours per id, outlines, a selected id), exact
 ids up to 64 bits, following the image's transform, in flat views and planes at an
 angle, and in the view state.
@@ -12,7 +12,7 @@ import os
 import numpy as np
 import pytest
 
-from micro_viewer import Viewer, ViewerError
+from micro_glancer import Viewer, ViewerError
 
 ozp = pytest.importorskip("ome_zarr_pyramid")
 

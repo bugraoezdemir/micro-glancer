@@ -6,3 +6,5 @@ __pycache__/
 .pytest_cache/
 /.venv/
 *.pdb
+# release notes (given to gh release create, not part of the repo)
+/reports/
