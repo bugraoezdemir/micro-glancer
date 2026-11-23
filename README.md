@@ -47,14 +47,27 @@ reading are Rust (the crate `micro-viewer-core`); Python gets a small API and a 
   only that one. Ids stay exact up to 64 bits. A label image moves with its image when
   the image is moved or turned, on flat planes and on planes at an angle through a
   volume. Label images are left out of projections.
-- Open an HCS plate whole: its wells on a grid, one field of each (the same field in
-  every well, chosen by number). Zoomed out it reads the wells' coarse levels (and
-  averages coarser ones of its own when the wells have few), zoomed in only the wells
-  in view. The well under the pointer is named. A plate opens in a fraction of a
-  second: a 384-well plate of 520 x 696 fields is sharp 0.25 s after opening.
+- See every image where it was acquired. Positions are read both ways files hold them:
+  in an image's own translation (NGFF 0.4 and 0.5), or in the scene of the group that
+  owns the images (NGFF 0.6, as eubi and ozp write wells, mosaics and multi-position
+  acquisitions). A field, a tile or a series opened alone sits at its own position, and
+  a label image sits where its image sits. A well, or a collection of series (the tiles
+  of a mosaic, the views or positions of an acquisition), opens whole with each image
+  at its position, and the image under the pointer is named. Images without positions
+  are laid out side by side, and the viewer says so. In a whole well or collection,
+  each image lands on the nearest pixel of the shared grid (at most half a pixel off);
+  its own pixels are never resampled.
+- Open an HCS plate whole: its wells on a grid, each well with every field at its
+  position, or one field of each well (the same field in every well, chosen by
+  number). Zoomed out it reads the fields' coarse levels (and averages coarser ones of
+  its own when the fields have few), zoomed in only what is in view. The well and the
+  field under the pointer are named. A 384-well plate of 28 fields per well (10,640
+  fields) opens in 4 s and is sharp 4 s later; one field per well opens in a fraction
+  of a second.
 - See a store's contents as a tree (`micro_viewer.tree`, and the Contents panel): a
-  plate's wells and fields, an image's label images, a collection's series. Double-click
-  a well to show it on its plate, a field to open it, a label image to add it.
+  plate's wells and fields, a well's fields, an image's label images, a collection's
+  series. Double-click a well to show it on its plate (or to open it whole), a field or
+  a series to open it, a label image to add it.
 - Read the values under the pointer, for every channel of every layer (for a label
   image, its id).
 - Save the whole view (camera, layers with their images, transforms, planes and
@@ -116,9 +129,9 @@ and New colours instead of the histogram. Double-click a label in the view to se
 it (double-click the background or press Esc to clear it), and press O to switch
 outlines.
 
-A plate opens whole; the Planes panel's "field" picks the field shown in every well, and
-the Contents panel on the left lists the wells, fields and label images of the store
-opened last.
+A plate opens whole with every field of each well at its position; the Planes panel's
+"field" shows one field of every well instead ("all" goes back). The Contents panel on
+the left lists the wells, fields, series and label images of the store opened last.
 
 From Python:
 
@@ -162,11 +175,17 @@ v.add_label("cells")            # above its image, following its transform
 v.set_labels(outline=True, selected=42, only_selected=False, seed=3)
 print(v.pick(512, 384)["layers"][1]["values"][0]["id"])  # the exact id
 
-v.open("plate.ome.zarr")        # a plate: its wells on a grid
+v.open("plate.ome.zarr")        # a plate: its wells on a grid, every field at its place
 print(v.plate()["wells"][:2])   # [{"name": "A1", "path": "A/1", "fields": [...]}, ...]
 v.set_field(1)                  # field 1 of every well
+v.set_field(None)               # every field again
 v.show_well("B3")               # zoom onto a well
-print(v.pick(512, 384)["well"]) # ("B3", "B/3/1")
+print(v.pick(512, 384)["well"]) # ("B3", "B/3/7"): the well and the field under the point
+
+v.open("plate.ome.zarr/B/3")    # a well alone: its fields at their positions (micrometres)
+print(v.members()["names"])     # ["field 0", "field 1", ...]
+print(v.pick(512, 384)["member"])  # ("field 7", "7")
+v.open("tiles.ome.zarr")        # a collection of series: each at its position
 
 from micro_viewer import tree
 tree("plate.ome.zarr")          # {"kind": "plate", "children": [wells > fields]}
@@ -177,7 +196,8 @@ tree("plate.ome.zarr")          # {"kind": "plate", "children": [wells > fields]
 eubi's Inspect page uses micro-viewer when it can import it (`EUBI_VIEWER=classic`, or
 Settings > Viewer, switches back to eubi's classic viewer): planes at any angle and the
 3-D views, linked views, the histogram panel under eubi's channel panel, moving the image
-and saving its transform, plates and the Contents tree. Several images as layers are
+and saving its transform, image positions (plates with every field, wells and
+collections whole), and the Contents tree. Several images as layers are
 left out there until layers are stable. To try it with eubi's own venv, nothing
 installed into it:
 

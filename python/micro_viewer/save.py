@@ -46,6 +46,11 @@ def save_transform(viewer: Viewer, layer: int | None = None, *, system: str = AL
         raise ViewerError(
             "a plate is shown as its wells on a grid, which is not stored in any image: "
             "open a field (in the Contents panel) to save its transform")
+    if info.get("group"):
+        raise ViewerError(
+            "a well or a collection is shown as its images at their positions, which no "
+            "one image stores: open one of its images (in the Contents panel) to save "
+            "its transform")
     if info.get("label") and info.get("follows") is not None:
         raise ViewerError(
             "this label image follows its image: save the image's transform instead")

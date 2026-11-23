@@ -50,8 +50,9 @@ Ctrl + 0 puts it back, Ctrl + S saves its transform into its image.
 Label images (Layers > Labels adds one): double-click selects the id under the pointer,
 Esc clears it, O switches outlines.
 
-A plate opens whole: its wells on a grid, one field of each (the Planes panel's "field"
-picks which). The Contents panel lists the opened store's wells, fields and label images:
+A plate opens whole: its wells on a grid, every field of each well at its position (the
+Planes panel's "field" shows one field instead, "all" every field). A well, or a
+collection of series (tiles, views, positions), opens with each image at its position. The Contents panel lists the opened store's wells, fields and label images:
 double-click a well to show it, a field or image to open it, a label image to add it."""
 
 
@@ -217,8 +218,11 @@ class PlanePanel(QWidget):
                 row = QHBoxLayout()
                 if name == "field":
                     spin = QSpinBox()
-                    spin.setRange(0, max(size - 1, 0))
-                    spin.setToolTip("the field shown in every well")
+                    # -1: every field of each well at its position
+                    spin.setRange(-1, max(size - 1, 0))
+                    spin.setSpecialValueText("all")
+                    spin.setToolTip("the field shown in every well (all: every field at "
+                                    "its position)")
                     spin.valueChanged.connect(self._field)
                     row.addWidget(QLabel("field"))
                     row.addWidget(spin)
@@ -246,12 +250,12 @@ class PlanePanel(QWidget):
         if plate:
             spin = self._rows["field"][0]
             spin.blockSignals(True)
-            spin.setValue(plate["field"])
+            spin.setValue(-1 if plate["field"] is None else plate["field"])
             spin.blockSignals(False)
 
     def _field(self, value):
         try:
-            self.window.view.viewer.set_field(int(value))
+            self.window.view.viewer.set_field(None if int(value) < 0 else int(value))
         except ERRORS as exc:  # noqa: BLE001 (see _guarded)
             self.window.note(str(exc))
             return
@@ -525,6 +529,8 @@ class MainWindow(QMainWindow):
                          if p.get("voxel") else f"x={p['pixel'][0]} y={p['pixel'][1]}")
                 if p.get("well"):
                     where = f"well {p['well'][0]} ({p['well'][1]})  " + where
+                elif p.get("member"):
+                    where = f"{p['member'][0]}  " + where
                 self._pick = f"{where}  {vals}"
         except ERRORS as exc:  # noqa: BLE001 (see _guarded)
             self._pick = str(exc)

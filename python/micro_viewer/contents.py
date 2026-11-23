@@ -104,8 +104,9 @@ class ContentsPanel(QWidget):
 def open_node(viewer, node) -> str:
     """What micro-viewer does with an activated node on `viewer` (a ``Viewer``); returns
     what it did, in words. A plate opens whole; a well is shown on its plate when the
-    plate is open (else its first field opens); an image or a field opens; a label image
-    is added over its image when that is open (else it opens alone)."""
+    plate is open (else the well opens, every field at its position); an image, a
+    field or a collection opens (a collection with every series at its position); a
+    label image is added over its image when that is open (else it opens alone)."""
     kind, path = node["kind"], node["path"]
     layers = viewer.layers
     if kind == "well":
@@ -114,9 +115,9 @@ def open_node(viewer, node) -> str:
                 viewer.current = k
                 viewer.show_well(node["name"])
                 return f"well {node['name']}"
-        viewer.open(node.get("first_field") or os.path.join(path, "0"))
+        viewer.open(path)
         viewer.fit()
-        return f"well {node['name']}: its first field"
+        return f"well {node['name']}: every field at its position"
     if kind == "label":
         image = os.path.dirname(os.path.dirname(os.path.normpath(path)))
         for k, lay in enumerate(layers):

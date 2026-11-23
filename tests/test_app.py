@@ -231,9 +231,11 @@ def test_plates_in_the_app(qapp, plate, monkeypatch):  # noqa: F811
     assert "well A3" in win.status.text()
     # the field control in the Planes panel
     spin = win.plane_panel._rows["field"][0]
-    assert spin.maximum() == 1
+    assert spin.maximum() == 1 and spin.value() == -1 and spin.text() == "all"
     spin.setValue(1)
     assert v.plate()["field"] == 1
+    spin.setValue(-1)                                  # every field again
+    assert v.plate()["field"] is None
     # a field's label images are read when it is opened up; a label adds over its field
     a1 = top.child(0)
     f0 = a1.child(0)

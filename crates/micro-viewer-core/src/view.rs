@@ -105,9 +105,9 @@ pub struct LayerState {
     /// The index of the layer this one follows (a label image its image).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follows: Option<usize>,
-    /// A plate: the field shown in every well.
+    /// A plate: the field shown in every well (-1: every field at its position).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub field: Option<usize>,
+    pub field: Option<i64>,
 }
 
 /// How a label image is shown: outlines, the selected id, only it, the colours' seed.
@@ -232,7 +232,13 @@ impl ViewState {
                 .iter()
                 .map(|l| LayerState {
                     image: l.path().to_string_lossy().into_owned(),
-                    field: l.plate().map(|p| p.field),
+                    field: l.plate().map(|p| {
+                        if p.field == crate::ALL_FIELDS {
+                            -1
+                        } else {
+                            p.field as i64
+                        }
+                    }),
                     visible: Some(l.visible),
                     opacity: Some(l.opacity),
                     interpolation: l
@@ -414,6 +420,7 @@ fn apply_layer(
     camera_z: bool,
 ) -> Result<(), ViewerError> {
     if let Some(f) = s.field {
+        let f = usize::try_from(f).unwrap_or(crate::ALL_FIELDS);
         if v.layer(i)?.plate().is_some() && v.layer(i)?.field() != f {
             v.set_field(i, f)?;
         }

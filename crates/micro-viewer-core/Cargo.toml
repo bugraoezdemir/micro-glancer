@@ -21,3 +21,5 @@ serde_json = "1"
 ome-zarr-pyramid = { path = "../../../../../WS-OmeZarrPyramid/ome_zarr_pyramid/core/crates/ome-zarr-pyramid" }
 # tiles are region reads of dyna's engine arrays: the commit ozp's core pins
 dyna-zarr-arrays = { git = "https://github.com/bugraoezdemir/dyna_zarr", rev = "8699f9b34a5bee5e550e7c436b65cf9de6aa99f7" }
+# scene transformations (NGFF 0.6 positions): the same commit
+dyna-zarr-transforms = { git = "https://github.com/bugraoezdemir/dyna_zarr", rev = "8699f9b34a5bee5e550e7c436b65cf9de6aa99f7" }

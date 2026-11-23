@@ -191,9 +191,10 @@ impl Viewer {
     }
 
     /// A plate layer's layout (the current layer by default), or None for an image:
-    /// {"name", "rows", "columns", "grid": (rows, columns), "field", "fields" (the most
-    /// any well has), "wells": [{"name", "path", "row", "column", "fields"}], "skipped"
-    /// (wells left out, with why)}.
+    /// {"name", "rows", "columns", "grid": (rows, columns), "field" (None: every field at
+    /// its position), "fields" (the most any well has), "wells": [{"name", "path", "row",
+    /// "column", "fields", "gridded" (its fields carry no positions and lie on a grid)}],
+    /// "skipped" (fields left out, with why)}.
     #[pyo3(signature = (layer = None))]
     fn plate<'py>(
         &self,
@@ -209,16 +210,17 @@ impl Viewer {
         d.set_item("rows", p.info.rows.clone())?;
         d.set_item("columns", p.info.columns.clone())?;
         d.set_item("grid", p.info.grid())?;
-        d.set_item("field", p.field)?;
+        d.set_item("field", field_out(p.field))?;
         d.set_item("fields", p.info.field_count())?;
         let wells = PyList::empty(py);
-        for w in &p.info.wells {
+        for (wi, w) in p.info.wells.iter().enumerate() {
             let e = PyDict::new(py);
             e.set_item("name", &w.name)?;
             e.set_item("path", &w.path)?;
             e.set_item("row", w.row)?;
             e.set_item("column", w.column)?;
             e.set_item("fields", w.fields.clone())?;
+            e.set_item("gridded", p.fields.get(wi).is_some_and(|f| f.gridded))?;
             wells.append(e)?;
         }
         d.set_item("wells", wells)?;
@@ -235,11 +237,37 @@ impl Viewer {
     }
 
     /// Show field `field` of every well of a plate layer (the current one by default);
-    /// its channels, plane, visibility and opacity stay.
+    /// None: every field at its position. Its channels, plane, visibility and opacity
+    /// stay.
     #[pyo3(signature = (field, layer = None))]
-    fn set_field(&mut self, field: usize, layer: Option<usize>) -> PyResult<()> {
+    fn set_field(&mut self, field: Option<usize>, layer: Option<usize>) -> PyResult<()> {
         let i = self.layer_index(layer)?;
-        self.inner.set_field(i, field).map_err(err)
+        self.inner
+            .set_field(i, field.unwrap_or(micro_viewer_core::ALL_FIELDS))
+            .map_err(err)
+    }
+
+    /// A well or collection layer's images (the current layer by default), each at its
+    /// position, or None for any other layer: {"names", "paths", "rects" (level-0 pixels
+    /// [y0, x0, y1, x1) of each), "gridded" (they carry no positions and lie on a grid),
+    /// "skipped" (images left out, with why)}.
+    #[pyo3(signature = (layer = None))]
+    fn members<'py>(
+        &self,
+        py: Python<'py>,
+        layer: Option<usize>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let i = self.layer_index(layer)?;
+        let Some(m) = self.inner.layer(i).map_err(err)?.members() else {
+            return Ok(None);
+        };
+        let d = PyDict::new(py);
+        d.set_item("names", m.names.clone())?;
+        d.set_item("paths", m.rels.clone())?;
+        d.set_item("rects", m.rects.iter().map(|r| r.to_vec()).collect::<Vec<_>>())?;
+        d.set_item("gridded", m.gridded)?;
+        d.set_item("skipped", m.skipped.clone())?;
+        Ok(Some(d))
     }
 
     /// Read layer `index`'s image again (after its metadata changed): placement and
@@ -322,7 +350,8 @@ impl Viewer {
             d.set_item("volume", l.is_volume())?;
             d.set_item("label", l.is_label())?;
             d.set_item("plate", l.plate().is_some())?;
-            d.set_item("field", l.field())?;
+            d.set_item("field", if l.plate().is_some() { field_out(l.field()) } else { Some(0) })?;
+            d.set_item("group", l.members().is_some())?;
             d.set_item("outline", l.outline)?;
             d.set_item("selected", l.selected)?;
             d.set_item("only_selected", l.only_selected)?;
@@ -1016,6 +1045,7 @@ impl Viewer {
         let mut current = (None, PyList::empty(py));
         let mut current_voxel = None;
         let mut current_well = None;
+        let mut current_member = None;
         for lp in p.layers {
             let values = PyList::empty(py);
             for v in &lp.values {
@@ -1029,14 +1059,17 @@ impl Viewer {
             let pixel = lp.pixel.map(|q| (q[0], q[1]));
             let voxel = lp.voxel.map(|q| (q[0], q[1], q[2]));
             let well = lp.well.clone();
+            let member = lp.member.clone();
             if lp.layer == self.inner.current() {
                 current = (pixel, values.clone());
                 current_voxel = voxel;
                 current_well = well.clone();
+                current_member = member.clone();
             }
             let l = PyDict::new(py);
             l.set_item("layer", lp.layer)?;
             l.set_item("well", well)?;
+            l.set_item("member", member)?;
             l.set_item("pixel", pixel)?;
             l.set_item("voxel", voxel)?;
             l.set_item("values", values)?;
@@ -1045,6 +1078,7 @@ impl Viewer {
         d.set_item("pixel", current.0)?;
         d.set_item("voxel", current_voxel)?;
         d.set_item("well", current_well)?;
+        d.set_item("member", current_member)?;
         d.set_item("values", current.1)?;
         d.set_item("layers", layers)?;
         Ok(d)
@@ -1080,6 +1114,11 @@ impl Viewer {
 #[pyfunction]
 fn tree_json(path: PathBuf) -> PyResult<String> {
     core::tree(&path).map(|v| v.to_string()).map_err(err)
+}
+
+/// A plate's field for Python: None for every field.
+fn field_out(field: usize) -> Option<usize> {
+    (field != micro_viewer_core::ALL_FIELDS).then_some(field)
 }
 
 #[pymodule]

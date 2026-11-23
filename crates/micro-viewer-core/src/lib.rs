@@ -26,6 +26,8 @@ mod geom;
 mod gpu;
 mod loader;
 mod luts;
+pub mod mosaic;
+pub mod placement;
 pub mod plate;
 mod source;
 mod tiles;
@@ -43,7 +45,7 @@ use loader::{Loaded, Loader, Request};
 pub use luts::NAMES as COLOUR_MAPS;
 pub use raw_window_handle;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-pub use source::{Affine2, ChannelInfo, Level, Source, Texel};
+pub use source::{Affine2, ChannelInfo, Level, Source, Texel, ALL_FIELDS};
 use tiles::{Cache, TileKey, TILE};
 pub use view::{parse_transform, ViewState};
 
@@ -266,6 +268,9 @@ pub struct LayerPick {
     pub values: Vec<PickedValue>,
     /// On a plate: the well under the point ("B3") and its field's path in the plate.
     pub well: Option<(String, String)>,
+    /// On a well or a collection opened whole: the image under the point (its name,
+    /// "field 3" or "series 2", and its path in the group).
+    pub member: Option<(String, String)>,
 }
 
 /// What lies under a screen point: the world point and every layer's pixel and values.
@@ -395,9 +400,14 @@ impl Layer {
         self.source.plate.as_ref()
     }
 
-    /// The field a plate layer shows (0 for an image).
+    /// The field a plate layer shows ([`ALL_FIELDS`]: every field; 0 for an image).
     pub fn field(&self) -> usize {
         self.source.plate.as_ref().map_or(0, |p| p.field)
+    }
+
+    /// A well or collection layer's images, each at its position (None otherwise).
+    pub fn members(&self) -> Option<&mosaic::Placed> {
+        self.source.members.as_ref()
     }
 
     /// Whether this is a label image.
@@ -1722,10 +1732,11 @@ impl Viewer {
     /// system, if any). The first layer is fitted into the target (and the camera's
     /// plane put at its default z). It becomes the current layer; returns its index.
     pub fn add(&mut self, path: &Path) -> Result<usize, ViewerError> {
-        self.add_field(path, 0)
+        self.add_field(path, ALL_FIELDS)
     }
 
-    /// As [`Viewer::add`]; a plate shows field `field` of every well.
+    /// As [`Viewer::add`]; a plate shows field `field` of every well ([`ALL_FIELDS`]:
+    /// every field at its position).
     pub fn add_field(&mut self, path: &Path, field: usize) -> Result<usize, ViewerError> {
         let source = Source::open_field(path, field)?;
         let label = source.label;
@@ -1863,8 +1874,8 @@ impl Viewer {
         self.reopen(i, field)
     }
 
-    /// Show field `field` of every well of plate layer `i` (its channels, plane,
-    /// visibility and opacity stay).
+    /// Show field `field` of every well of plate layer `i` ([`ALL_FIELDS`]: every field
+    /// at its position; its channels, plane, visibility and opacity stay).
     pub fn set_field(&mut self, i: usize, field: usize) -> Result<(), ViewerError> {
         if self.layer(i)?.source.plate.is_none() {
             return Err(verr(format!("layer {i} is not a plate")));
@@ -2334,11 +2345,12 @@ impl Viewer {
             .iter()
             .find(|w| w.name == name || w.path == name)
             .ok_or_else(|| verr(format!("no well {name:?} in the plate")))?;
-        let (y0, x0) = (
-            (w.row as u64 * p.pitch[0]) as f64 - 0.5,
-            (w.column as u64 * p.pitch[1]) as f64 - 0.5,
-        );
-        let (y1, x1) = (y0 + p.cell[0] as f64, x0 + p.cell[1] as f64);
+        // the well's fields as placed in its cell
+        let wi = p.info.wells.iter().position(|v| std::ptr::eq(v, w)).unwrap_or(0);
+        let e = p.well_extent(wi);
+        let (cy, cx) = (w.row as u64 * p.pitch[0], w.column as u64 * p.pitch[1]);
+        let (y0, x0) = ((cy + e[0]) as f64 - 0.5, (cx + e[1]) as f64 - 0.5);
+        let (y1, x1) = ((cy + e[2]) as f64 - 0.5, (cx + e[3]) as f64 - 0.5);
         let lv = &l.source.levels[0];
         let points: Vec<V3> = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
             .iter()
@@ -3254,8 +3266,14 @@ impl Viewer {
             }
             let well = o.source.plate.as_ref().and_then(|p| {
                 let px = pixel?;
-                p.well_at(px[0], px[1])
-                    .map(|w| (w.name.clone(), format!("{}/{}", w.path, w.fields[p.field])))
+                p.field_at(px[0], px[1]).map(|(wi, field)| {
+                    let w = &p.info.wells[wi];
+                    (w.name.clone(), format!("{}/{field}", w.path))
+                })
+            });
+            let member = o.source.members.as_ref().and_then(|m| {
+                let px = pixel?;
+                m.at(px[0], px[1]).map(|k| (m.names[k].clone(), m.rels[k].clone()))
             });
             layers.push(LayerPick {
                 layer: li,
@@ -3263,6 +3281,7 @@ impl Viewer {
                 voxel,
                 values,
                 well,
+                member,
             });
         }
         Ok(Pick { world, layers })

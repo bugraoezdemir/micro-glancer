@@ -1,6 +1,9 @@
 """micro-viewer's plates (Workplan WP14, task V9 part 2): an HCS plate opens as one image
-(its wells on a grid, one field of each, coarse levels zoomed out), the well under the
-pointer, switching fields, and the navigation tree (plate, wells, fields, label images).
+(its wells on a grid, coarse levels zoomed out), the well under the pointer, switching
+fields, and the navigation tree (plate, wells, fields, label images). A plate opens with
+every field of each well (see test_positions.py: at their positions, here on a small
+grid, as these fields carry none); these tests show one field, as asked for with
+`set_field`.
 
 Values are checked through `pick` against the plate laid out with NumPy: cell pitch =
 the largest field + 4 % (at least 2 pixels), positions without a well 0.
@@ -93,6 +96,9 @@ def _check(v, want, scale):
 def test_a_plate_opens_as_one_image(plate):
     v = Viewer.offscreen(3 * PX, 2 * PY)
     v.open(plate)
+    assert v.layers[0]["plate"] and v.layers[0]["field"] is None   # every field
+    assert [w["gridded"] for w in v.plate()["wells"]] == [True, False, False]
+    v.set_field(0)
     lay = v.layers[0]
     assert lay["plate"] and lay["field"] == 0
     info = v.plate()
@@ -113,6 +119,7 @@ def test_a_plate_opens_as_one_image(plate):
 def test_zoomed_out_a_plate_reads_coarse_levels(plate):
     v = Viewer.offscreen(3 * PX // 2, PY)
     v.open(plate)
+    v.set_field(0)
     v.look_at((3 * PX - 1) / 2, (2 * PY - 1) / 2, 2.0)
     v.settle(30.0)
     # the picked level is 1 wherever a value was found

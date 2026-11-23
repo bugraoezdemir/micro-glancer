@@ -3,8 +3,9 @@
 //! collection), and the virtual array that shows a whole plate as one image.
 //!
 //! A plate is shown as one image per level: its wells on a grid, one cell per well, each
-//! cell holding one field (the same field index in every well) at that level, with a
-//! small gap between cells. Positions without a well stay 0. Every level's cells line up
+//! cell holding every field of the well at its position (see `mosaic.rs`; fields without
+//! positions on a small grid), or one field (the same field index in every well), with
+//! a small gap between cells. Positions without a well stay 0. Every level's cells line up
 //! in world space, so the viewer's levels, tiles, bricks and histograms work on a plate as
 //! on any image: zoomed out it reads the wells' coarse levels, zoomed in only the wells in
 //! view at finer ones.
@@ -16,6 +17,8 @@ use std::sync::Arc;
 
 use dyna_zarr_arrays::{region, DType, Out, ReadError, Source, SourceRef};
 use ome_zarr_pyramid::Location;
+
+use crate::mosaic::Placed;
 use serde_json::{json, Map, Value};
 
 /// One well: its path in the plate ("A/1"), its row and column indices, its name ("A1")
@@ -183,23 +186,57 @@ impl PlateInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlateLayout {
     pub info: PlateInfo,
+    /// The field shown in every well, or `ALL_FIELDS` (every field at its position).
     pub field: usize,
     pub pitch: [u64; 2],
     pub cell: [u64; 2],
     pub skipped: Vec<String>,
+    /// Per well (in `info.wells`' order): its fields as placed in its cell (level-0
+    /// pixels from the cell's corner); empty for a well left out.
+    pub fields: Vec<Placed>,
 }
 
 impl PlateLayout {
-    /// The well whose field covers level-0 pixel (`x`, `y`) of the virtual image.
-    pub fn well_at(&self, x: u64, y: u64) -> Option<&WellInfo> {
+    /// The well whose cell holds level-0 pixel (`x`, `y`) of the virtual image (its index
+    /// in `info.wells`), when one of its fields covers the pixel; and that field's path
+    /// in the well.
+    pub fn field_at(&self, x: u64, y: u64) -> Option<(usize, String)> {
         let (r, c) = ((y / self.pitch[0]) as usize, (x / self.pitch[1]) as usize);
-        if y % self.pitch[0] >= self.cell[0] || x % self.pitch[1] >= self.cell[1] {
+        let (cy, cx) = (y % self.pitch[0], x % self.pitch[1]);
+        if cy >= self.cell[0] || cx >= self.cell[1] {
             return None;
         }
-        self.info
+        let wi = self
+            .info
             .wells
             .iter()
-            .find(|w| w.row == r && w.column == c && w.fields.len() > self.field)
+            .position(|w| w.row == r && w.column == c)?;
+        let placed = self.fields.get(wi)?;
+        let k = placed.at(cx, cy)?;
+        Some((wi, placed.rels[k].clone()))
+    }
+
+    /// The well whose field covers level-0 pixel (`x`, `y`) of the virtual image.
+    pub fn well_at(&self, x: u64, y: u64) -> Option<&WellInfo> {
+        self.field_at(x, y).map(|(wi, _)| &self.info.wells[wi])
+    }
+
+    /// Where well `wi`'s fields lie in its cell: [y0, x0, y1, x1) in level-0 pixels from
+    /// the cell's corner, or the whole cell when nothing is known.
+    pub fn well_extent(&self, wi: usize) -> [u64; 4] {
+        match self.fields.get(wi) {
+            Some(p) if !p.rects.is_empty() => {
+                let mut e = [u64::MAX, u64::MAX, 0, 0];
+                for r in &p.rects {
+                    e[0] = e[0].min(r[0]);
+                    e[1] = e[1].min(r[1]);
+                    e[2] = e[2].max(r[2]);
+                    e[3] = e[3].max(r[3]);
+                }
+                e
+            }
+            _ => [0, 0, self.cell[0], self.cell[1]],
+        }
     }
 }
 
@@ -338,8 +375,9 @@ pub fn plate_array(a: PlateArray) -> SourceRef {
 /// `{"kind", "name", "path", "children"}`. A plate lists its wells, each well its fields
 /// (kind "image", with "field"); an image lists its label images (kind "label"); a
 /// bioformats2raw collection its series. A field's label images are not read here (ask
-/// for the field's own tree). `kind` is "plate", "well", "image", "label", "collection"
-/// or "group" (a Zarr group without NGFF metadata the viewer knows).
+/// for the field's own tree); a well on its own its fields. `kind` is "plate", "well",
+/// "image", "label", "collection" or "group" (a Zarr group without NGFF metadata the
+/// viewer knows).
 pub fn tree(loc: &Location, name: &str, path: &str) -> Result<Value, String> {
     let attrs = loc.attributes().map_err(|e| e.to_string())?;
     let join = |rel: &str| format!("{}/{}", path.trim_end_matches(['/', '\\']), rel);
@@ -371,6 +409,18 @@ pub fn tree(loc: &Location, name: &str, path: &str) -> Result<Value, String> {
                          "grid": [rows, columns], "fields": info.field_count(),
                          "children": children}),
         );
+    }
+    if ome(&attrs, "well").is_some() && ome(&attrs, "multiscales").is_none() {
+        // a well on its own: its fields
+        let children: Vec<Value> = well_fields(loc)
+            .iter()
+            .enumerate()
+            .map(|(k, f)| {
+                json!({"kind": "image", "name": format!("field {f}"), "path": join(f),
+                       "field": k, "children": []})
+            })
+            .collect();
+        return Ok(json!({"kind": "well", "name": name, "path": path, "children": children}));
     }
     if ome(&attrs, "multiscales").is_some() {
         let label = ome(&attrs, "image-label").is_some();

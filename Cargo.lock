@@ -947,6 +947,7 @@ version = "0.0.1"
 dependencies = [
  "bytemuck",
  "dyna-zarr-arrays",
+ "dyna-zarr-transforms",
  "ome-zarr-pyramid",
  "pollster",
  "raw-window-handle",
