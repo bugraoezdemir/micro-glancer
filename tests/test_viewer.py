@@ -503,9 +503,11 @@ def test_the_qt_widget_reports_instead_of_crashing(qapp, tmp_path):
     w.close()
 
 
-@pytest.mark.skipif(sys.platform not in ("win32", "darwin"), reason="native hosting: Windows, macOS")
 def test_the_qt_widget_native(qapp, stores):
-    from micro_viewer.qt import ViewerWidget
+    from micro_viewer.qt import ViewerWidget, native_possible
+    if not native_possible():
+        pytest.skip(f"no native windows on {sys.platform} with Qt's "
+                    f"{qapp.platformName()!r} platform")
     w = ViewerWidget(mode="native")
     w.resize(320, 240)
     w.open(stores["0.5"])
@@ -514,3 +516,14 @@ def test_the_qt_widget_native(qapp, stores):
     assert w.viewer.size[0] >= 320
     assert w.last_stats[0] >= 1 and w.last_stats[2] == 0
     w.close()
+
+
+def test_native_without_real_windows_is_refused(qapp, monkeypatch):
+    # on Qt's offscreen platform the window id is no window: Windows refused it and
+    # macOS crashed on it (CI, 2026-11-23); the widget now says so before the core runs
+    import micro_viewer.qt as mvqt
+    monkeypatch.setattr(mvqt, "native_possible", lambda: False)
+    with pytest.raises(ValueError, match="mode='offscreen'"):
+        mvqt.ViewerWidget(mode="native")
+    monkeypatch.setenv("MICRO_VIEWER_MODE", "")
+    assert mvqt.default_mode() == "offscreen"

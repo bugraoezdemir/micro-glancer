@@ -22,3 +22,6 @@ and Linux, Python 3.11 and newer (one wheel per platform).
 - `micro-viewer` command (`pip install "micro-viewer[qt]"`); without PyQt6 it says what
   to install. Saving a translation into an NGFF 0.4 / 0.5 image needs ome_zarr_pyramid
   (`pip install "micro-viewer[save]"`).
+- The Qt widget draws into its own native window on Windows and macOS, and off screen
+  everywhere else. Asking for native drawing where Qt has no real windows (its
+  `offscreen` or `minimal` platform) raises an error that names `mode='offscreen'`.

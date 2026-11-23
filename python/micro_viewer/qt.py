@@ -67,19 +67,27 @@ TURN_DRAG = 0.3
 POLL_MS = 15
 
 
+def native_possible() -> bool:
+    """Whether the core can draw straight into a widget's native window here.
+
+    A native surface needs a real window: Qt's "windows" and "cocoa" platforms give one
+    (not "offscreen" or "minimal", as tests and CI run Qt; there the window id is no
+    window, which Windows refuses and macOS crashes on). Linux needs the X11 display
+    for a native surface, which the widget does not obtain from Qt yet; Wayland always
+    needs the off-screen mode.
+    """
+    if sys.platform not in ("win32", "darwin"):
+        return False
+    from PyQt6.QtGui import QGuiApplication
+    platform = QGuiApplication.platformName() if QGuiApplication.instance() else ""
+    return not platform or platform in ("windows", "cocoa")
+
+
 def default_mode() -> str:
     mode = os.environ.get("MICRO_VIEWER_MODE")
     if mode in ("native", "offscreen"):
         return mode
-    # a native surface needs a real window: Qt's "windows" and "cocoa" platforms give
-    # one (not "offscreen" or "minimal", as tests run Qt). Linux needs the X11 display
-    # for a native surface, which the widget does not obtain from Qt yet; Wayland
-    # always needs the off-screen mode
-    from PyQt6.QtGui import QGuiApplication
-    platform = QGuiApplication.platformName() if QGuiApplication.instance() else ""
-    if platform and platform not in ("windows", "cocoa"):
-        return "offscreen"
-    return "native" if sys.platform in ("win32", "darwin") else "offscreen"
+    return "native" if native_possible() else "offscreen"
 
 
 class ViewerWidget(QWidget):
@@ -94,6 +102,12 @@ class ViewerWidget(QWidget):
                  no_vsync: bool = False, atlas_mib: int = 0):
         super().__init__(parent)
         self.mode = mode or default_mode()
+        if self.mode == "native" and not native_possible():
+            from PyQt6.QtGui import QGuiApplication
+            raise ValueError(
+                f"micro-viewer cannot draw into a native window on Qt's "
+                f"{QGuiApplication.platformName()!r} platform ({sys.platform}); "
+                f"use mode='offscreen' (or unset MICRO_VIEWER_MODE)")
         self._software = software
         self._no_vsync = no_vsync
         self._atlas_mib = atlas_mib
