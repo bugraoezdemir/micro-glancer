@@ -2346,7 +2346,12 @@ impl Viewer {
             .find(|w| w.name == name || w.path == name)
             .ok_or_else(|| verr(format!("no well {name:?} in the plate")))?;
         // the well's fields as placed in its cell
-        let wi = p.info.wells.iter().position(|v| std::ptr::eq(v, w)).unwrap_or(0);
+        let wi = p
+            .info
+            .wells
+            .iter()
+            .position(|v| std::ptr::eq(v, w))
+            .unwrap_or(0);
         let e = p.well_extent(wi);
         let (cy, cx) = (w.row as u64 * p.pitch[0], w.column as u64 * p.pitch[1]);
         let (y0, x0) = ((cy + e[0]) as f64 - 0.5, (cx + e[1]) as f64 - 0.5);
@@ -3273,7 +3278,8 @@ impl Viewer {
             });
             let member = o.source.members.as_ref().and_then(|m| {
                 let px = pixel?;
-                m.at(px[0], px[1]).map(|k| (m.names[k].clone(), m.rels[k].clone()))
+                m.at(px[0], px[1])
+                    .map(|k| (m.names[k].clone(), m.rels[k].clone()))
             });
             layers.push(LayerPick {
                 layer: li,

@@ -16,9 +16,12 @@ bytemuck = { version = "1", features = ["derive"] }
 # the view state as JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# ozp in Rust (DR9): images, levels and their matrices. A path into the local ozp
-# checkout until its branch dr9-rust-core is merged (then a git dependency).
-ome-zarr-pyramid = { path = "../../../../../WS-OmeZarrPyramid/ome_zarr_pyramid/core/crates/ome-zarr-pyramid" }
+# ozp in Rust (DR9): images, levels and their matrices. A commit of ozp's pull request
+# #21 (branch dr9-rust-core), which stays in main's history once merged with a merge
+# commit. To build against a local ozp checkout instead, add to .cargo/config.toml:
+#   [patch."https://github.com/Euro-BioImaging/ome_zarr_pyramid"]
+#   ome-zarr-pyramid = { path = "<ozp>/core/crates/ome-zarr-pyramid" }
+ome-zarr-pyramid = { git = "https://github.com/Euro-BioImaging/ome_zarr_pyramid", rev = "bd73e58a91c5805edeaf5fbe35a94dc65908bd57" }
 # tiles are region reads of dyna's engine arrays: the commit ozp's core pins
 dyna-zarr-arrays = { git = "https://github.com/bugraoezdemir/dyna_zarr", rev = "8699f9b34a5bee5e550e7c436b65cf9de6aa99f7" }
 # scene transformations (NGFF 0.6 positions): the same commit

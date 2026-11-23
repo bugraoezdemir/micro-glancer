@@ -36,7 +36,12 @@ pub struct MosaicArray {
 impl MosaicArray {
     /// `pieces` (all of one dtype and number of axes) on a grid at least `size` (y, x)
     /// large, the lead axes as long as `lead`.
-    pub fn new(pieces: Vec<(SourceRef, [u64; 2])>, lead: Vec<u64>, size: [u64; 2], dtype: DType) -> Self {
+    pub fn new(
+        pieces: Vec<(SourceRef, [u64; 2])>,
+        lead: Vec<u64>,
+        size: [u64; 2],
+        dtype: DType,
+    ) -> Self {
         let n = lead.len() + 2;
         let mut sy = size[0];
         let mut sx = size[1];
@@ -101,7 +106,13 @@ impl Source for MosaicArray {
         self.dtype
     }
 
-    fn read_into(&self, start: &[u64], stop: &[u64], out: &Out, threads: usize) -> Result<(), ReadError> {
+    fn read_into(
+        &self,
+        start: &[u64],
+        stop: &[u64],
+        out: &Out,
+        threads: usize,
+    ) -> Result<(), ReadError> {
         region(&self.shape, start, stop)?;
         if out.dtype() != self.dtype {
             return Err(ReadError::new(format!(
@@ -138,7 +149,12 @@ pub struct Member {
 
 /// The member at `rel` below the group at `group` (whose scene, if it has one, is
 /// `scene`), named `name`.
-pub fn open_member(group: &Location, scene: Option<&Scene>, rel: &str, name: &str) -> Result<Member, String> {
+pub fn open_member(
+    group: &Location,
+    scene: Option<&Scene>,
+    rel: &str,
+    name: &str,
+) -> Result<Member, String> {
     let loc = group.child(rel);
     let image = Image::at(loc.clone()).map_err(|e| e.to_string())?;
     let ms = image
@@ -194,7 +210,9 @@ fn yx(m: &Matrix, n: usize) -> Result<(f64, f64, f64, f64), String> {
     }
     let (sx, sy) = (m.get(x, x), m.get(y, y));
     if !(sx > 0.0 && sy > 0.0) {
-        return Err(format!("y-x scales ({sy}, {sx}): positive scales are needed"));
+        return Err(format!(
+            "y-x scales ({sy}, {sx}): positive scales are needed"
+        ));
     }
     Ok((sx, sy, m.get(x, n), m.get(y, n)))
 }
@@ -205,7 +223,11 @@ pub fn compatible<T>(members: Vec<(T, Member)>) -> (Vec<(T, Member)>, Vec<String
     let mut kept: Vec<(T, Member)> = Vec::new();
     let mut skipped = Vec::new();
     let axes = |m: &Member| -> Vec<String> {
-        m.image.multiscales[0].axes.iter().map(|a| a.name.clone()).collect()
+        m.image.multiscales[0]
+            .axes
+            .iter()
+            .map(|a| a.name.clone())
+            .collect()
     };
     for (tag, m) in members {
         let Some((_, first)) = kept.first() else {
@@ -221,7 +243,10 @@ pub fn compatible<T>(members: Vec<(T, Member)>) -> (Vec<(T, Member)>, Vec<String
             continue;
         }
         if m.arrays[0].shape()[..n - 2] != first.arrays[0].shape()[..n - 2] {
-            skipped.push(format!("{}: other channels or planes than {}", m.name, first.name));
+            skipped.push(format!(
+                "{}: other channels or planes than {}",
+                m.name, first.name
+            ));
             continue;
         }
         match (yx(&m.matrices[0], n), yx(&first.matrices[0], n)) {
@@ -262,7 +287,13 @@ pub fn arrange(members: &[Member]) -> Arrangement {
             gridded: false,
         };
     }
-    let most = |k: usize| members.iter().map(|m| m.arrays[0].shape()[k]).max().unwrap_or(1);
+    let most = |k: usize| {
+        members
+            .iter()
+            .map(|m| m.arrays[0].shape()[k])
+            .max()
+            .unwrap_or(1)
+    };
     let (h, w) = (most(n - 2), most(n - 1));
     let (py, px) = (h + (h / 50).max(2), w + (w / 50).max(2));
     let cols = (members.len() as f64).sqrt().ceil().max(1.0) as usize;
@@ -391,12 +422,20 @@ mod tests {
     fn jobs_cut_reads_into_pieces_in_drawing_order() {
         let a: SourceRef = Arc::new(Shaped(vec![2, 10, 12]));
         let b: SourceRef = Arc::new(Shaped(vec![2, 10, 12]));
-        let m = MosaicArray::new(vec![(a, [0, 0]), (b, [5, 8])], vec![2], [0, 0], DType::UInt16);
+        let m = MosaicArray::new(
+            vec![(a, [0, 0]), (b, [5, 8])],
+            vec![2],
+            [0, 0],
+            DType::UInt16,
+        );
         assert_eq!(m.shape(), &[2, 15, 20]);
         // the overlap: both, the later last
         let jobs = m.jobs(&[0, 6, 9], &[2, 8, 11]);
         assert_eq!(jobs.len(), 2);
-        assert_eq!((jobs[1].1.clone(), jobs[1].3.clone()), (vec![0, 1, 1], vec![0, 0, 0]));
+        assert_eq!(
+            (jobs[1].1.clone(), jobs[1].3.clone()),
+            (vec![0, 1, 1], vec![0, 0, 0])
+        );
         // the gap beside the first
         assert!(m.jobs(&[0, 0, 12], &[2, 5, 20]).is_empty());
     }

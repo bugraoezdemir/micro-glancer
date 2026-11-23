@@ -2,7 +2,21 @@
 
 A viewer for OME-Zarr images that draws on the GPU. The drawing, the tile cache and the
 reading are Rust (the crate `micro-viewer-core`); Python gets a small API and a Qt widget
-(the package `micro-viewer`). It is in incubation: not released, and the API may change.
+(the package `micro-viewer`). It is new (alpha): the API may still change.
+
+## Install
+
+```
+pip install "micro-viewer[qt]"      # the app window and the Qt widget
+pip install micro-viewer            # only the off-screen viewer (needs numpy alone)
+pip install "micro-viewer[save]"    # also: saving translations into NGFF 0.4 / 0.5 images
+```
+
+There are wheels for Windows (x64), macOS (Apple silicon and Intel) and Linux (x86_64
+and aarch64), for Python 3.11 and newer. The viewer draws with the GPU through Vulkan,
+Metal or DX12. On a machine without a usable GPU it falls back to the system's software
+renderer (WARP on Windows, Mesa's lavapipe on Linux), which is slower but shows the same
+picture.
 
 ## What you can do
 
@@ -78,15 +92,10 @@ reads coarser levels while the view moves and the finer ones once it stops. To s
 it behaves, set `MICRO_VIEWER_SLOW_READS_MS` to add that many milliseconds to every
 tile read.
 
-## Trying it
-
-micro-viewer has its own virtual environment in `.venv` (Python 3.12, PyQt6, numpy),
-with micro-viewer installed in development mode: after a change to the Rust code,
-`maturin develop --release` (run in this folder) builds it again into the same place.
-Then:
+## Using it
 
 ```
-.venv\Scripts\micro-viewer PATH [PATH ...]
+micro-viewer PATH [PATH ...]
 ```
 
 opens the app (also `python -m micro_viewer`), with the images as layers; File > Open,
@@ -193,20 +202,13 @@ tree("plate.ome.zarr")          # {"kind": "plate", "children": [wells > fields]
 
 ## In eubi
 
-eubi's Inspect page uses micro-viewer when it can import it (`EUBI_VIEWER=classic`, or
-Settings > Viewer, switches back to eubi's classic viewer): planes at any angle and the
+eubi's Inspect page uses micro-viewer when it is installed in eubi's environment
+(`EUBI_VIEWER=classic`, or Settings > Viewer, switches back to eubi's classic viewer): planes at any angle and the
 3-D views, linked views, the histogram panel under eubi's channel panel, moving the image
 and saving its transform, image positions (plates with every field, wells and
 collections whole), and the Contents tree. Several images as layers are
-left out there until layers are stable. To try it with eubi's own venv, nothing
-installed into it:
-
-```
-.\eubi-dev.ps1 [PATH]
-```
-
-(it puts this folder's `python` directory on `PYTHONPATH` and starts `eubi-gui`). The
-code on eubi's side is `eubi_bridge/qt_gui/widgets/gpu_viewer.py` and `viewers.py`.
+left out there until layers are stable. The code on eubi's side is
+`eubi_bridge/qt_gui/widgets/gpu_viewer.py` and `viewers.py`.
 
 `micro_viewer.panel.ChannelPanel` (and its `HistogramWidget`) adjusts the channels of a
 `ViewerWidget`'s current layer.
@@ -222,6 +224,24 @@ frames never pass through Python. On Linux, and wherever a native window is not
 available, the core draws off-screen and Qt paints the frame. A machine without a GPU
 uses the system's software renderer. Set `MICRO_VIEWER_MODE=native` or `offscreen` to
 choose the mode.
+
+## Development
+
+micro-viewer has its own virtual environment in `.venv` (Python 3.12, PyQt6, numpy),
+with micro-viewer installed in development mode: after a change to the Rust code,
+`maturin develop --release` (run in this folder) builds it again into the same place,
+and `.venv\Scripts\micro-viewer PATH` starts the app. To try it inside eubi with eubi's
+own venv, nothing installed into it, run `.\eubi-dev.ps1 [PATH]`: it puts this folder's
+`python` directory on `PYTHONPATH` and starts `eubi-gui`.
+
+The core reads images through ome_zarr_pyramid's crate (`ome-zarr-pyramid`, a git
+dependency pinned to a commit). To build against a local ozp checkout instead, add a
+`[patch]` section to `.cargo/config.toml` (the form is in
+`crates/micro-viewer-core/Cargo.toml`).
+
+The wheels contain the Rust crates and C libraries listed, with their licences, in
+`THIRD_PARTY_LICENSES.txt`. After a change to `Cargo.lock`, run
+`python scripts/third_party_licenses.py`; CI checks that the file is current.
 
 ## Tests and numbers
 

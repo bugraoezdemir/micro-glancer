@@ -264,7 +264,10 @@ impl Viewer {
         let d = PyDict::new(py);
         d.set_item("names", m.names.clone())?;
         d.set_item("paths", m.rels.clone())?;
-        d.set_item("rects", m.rects.iter().map(|r| r.to_vec()).collect::<Vec<_>>())?;
+        d.set_item(
+            "rects",
+            m.rects.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        )?;
         d.set_item("gridded", m.gridded)?;
         d.set_item("skipped", m.skipped.clone())?;
         Ok(Some(d))
@@ -350,7 +353,14 @@ impl Viewer {
             d.set_item("volume", l.is_volume())?;
             d.set_item("label", l.is_label())?;
             d.set_item("plate", l.plate().is_some())?;
-            d.set_item("field", if l.plate().is_some() { field_out(l.field()) } else { Some(0) })?;
+            d.set_item(
+                "field",
+                if l.plate().is_some() {
+                    field_out(l.field())
+                } else {
+                    Some(0)
+                },
+            )?;
             d.set_item("group", l.members().is_some())?;
             d.set_item("outline", l.outline)?;
             d.set_item("selected", l.selected)?;

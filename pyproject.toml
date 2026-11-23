@@ -6,23 +6,42 @@ build-backend = "maturin"
 name = "micro-viewer"
 dynamic = ["version"]              # from Cargo.toml
 description = "A GPU viewer for OME-Zarr images on a Rust core, hosted in Qt."
+readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-license-files = ["LICENSE"]
+# THIRD_PARTY_LICENSES.txt: every crate and C library the wheels link
+# (scripts/third_party_licenses.py; CI checks it is current)
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES.txt"]
+authors = [{name = "Bugra Oezdemir"}]
+keywords = ["ome-zarr", "ngff", "zarr", "viewer", "gpu", "wgpu", "microscopy",
+            "bioimaging", "qt", "pyramid", "volume-rendering"]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Rust",
-    "Private :: Do Not Upload",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Visualization",
 ]
 dependencies = ["numpy>=1.26"]
 
+[project.urls]
+Homepage = "https://github.com/bugraoezdemir/micro-viewer"
+
 [project.scripts]
-micro-viewer = "micro_viewer.app:main"
+micro-viewer = "micro_viewer.cli:main"
 
 [project.optional-dependencies]
+# the window and the widget (micro_viewer.app, micro_viewer.qt)
 qt = ["PyQt6>=6.7"]
-dev = ["PyQt6>=6.7", "pytest", "ome_zarr_pyramid"]
+# saving a translation into an NGFF 0.4 / 0.5 image (0.6 needs nothing extra)
+save = ["ome_zarr_pyramid>=0.6.1"]
+dev = ["PyQt6>=6.7", "pytest", "ome_zarr_pyramid>=0.6.1"]
 
 [tool.maturin]
 python-source = "python"

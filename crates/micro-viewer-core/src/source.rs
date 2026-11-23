@@ -31,7 +31,10 @@ use ome_zarr_pyramid::{Image, Location};
 use serde_json::Value;
 
 use crate::geom::Affine3;
-use crate::mosaic::{arrange, compatible, layout, mosaic_array, open_member, Arrangement, Member, MosaicArray, Placed};
+use crate::mosaic::{
+    arrange, compatible, layout, mosaic_array, open_member, Arrangement, Member, MosaicArray,
+    Placed,
+};
 use crate::placement::{placement, Scene};
 use crate::plate::{par_map, PlateInfo, PlateLayout};
 use crate::ViewerError;
@@ -321,7 +324,12 @@ pub const ALL_FIELDS: usize = usize::MAX;
 /// other node.
 fn group_members(loc: &Location) -> Option<Vec<(String, String)>> {
     let attrs = loc.attributes().ok()?;
-    let ome = |k: &str| attrs.get("ome").and_then(|o| o.get(k)).or_else(|| attrs.get(k));
+    let ome = |k: &str| {
+        attrs
+            .get("ome")
+            .and_then(|o| o.get(k))
+            .or_else(|| attrs.get(k))
+    };
     if ome("multiscales").is_some() {
         return None;
     }
@@ -339,11 +347,12 @@ fn group_members(loc: &Location) -> Option<Vec<(String, String)>> {
         let mut series = Vec::new();
         for k in 0..100_000usize {
             let rel = k.to_string();
-            let found = loc
-                .child(&rel)
-                .attributes()
-                .ok()
-                .is_some_and(|a| a.get("ome").and_then(|o| o.get("multiscales")).or_else(|| a.get("multiscales")).is_some());
+            let found = loc.child(&rel).attributes().ok().is_some_and(|a| {
+                a.get("ome")
+                    .and_then(|o| o.get("multiscales"))
+                    .or_else(|| a.get("multiscales"))
+                    .is_some()
+            });
             if !found {
                 break;
             }
@@ -783,6 +792,8 @@ impl Source {
         let mut levels = Vec::new();
         let mut placed = Placed::default();
         let mut last = None;
+        // `l` is the level in every member at once (arrays, cast, layout, ms.levels)
+        #[allow(clippy::needless_range_loop)]
         for l in 0..nl {
             let lay = layout(&kept, &arr, l);
             if l == 0 {

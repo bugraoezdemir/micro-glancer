@@ -1245,6 +1245,7 @@ dependencies = [
 [[package]]
 name = "ome-zarr-pyramid"
 version = "0.0.1"
+source = "git+https://github.com/Euro-BioImaging/ome_zarr_pyramid?rev=bd73e58a91c5805edeaf5fbe35a94dc65908bd57#bd73e58a91c5805edeaf5fbe35a94dc65908bd57"
 dependencies = [
  "dyna-zarr-arrays",
  "dyna-zarr-transforms",

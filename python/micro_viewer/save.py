@@ -76,8 +76,13 @@ def save_transform(viewer: Viewer, layer: int | None = None, *, system: str = AL
 
 def _save_translation(path: str, shift, axes) -> str:
     """Add `shift` (per axis, world units) to every level's translation (0.4, 0.5)."""
-    import zarr
-    import ome_zarr_pyramid as ozp
+    try:
+        import zarr
+        import ome_zarr_pyramid as ozp
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            f"saving a translation into an NGFF 0.4 or 0.5 image needs ome_zarr_pyramid "
+            f"({exc}): pip install \"micro-viewer[save]\"") from exc
 
     if not any(shift):
         return "nothing to save: the layer is where the image places it"

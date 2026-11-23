@@ -59,8 +59,7 @@ fn ancestors(loc: &Location, depth: usize) -> Vec<(Location, String)> {
             let mut rel: Vec<String> = Vec::new();
             let mut here = p.clone();
             while out.len() < depth {
-                let Some(name) = here.file_name().map(|n| n.to_string_lossy().into_owned())
-                else {
+                let Some(name) = here.file_name().map(|n| n.to_string_lossy().into_owned()) else {
                     break;
                 };
                 let Some(up) = here.parent().map(|u| u.to_path_buf()) else {
@@ -249,10 +248,20 @@ pub fn placement(loc: &Location, image: &Image) -> Option<Matrix> {
             if rel.starts_with("labels/") {
                 let parent_image = Image::at(parent.clone()).ok()?;
                 let p = placement(parent, &parent_image)?;
-                let from: Vec<String> = parent_image.multiscales.first()?.axes.iter()
-                    .map(|a| a.name.clone()).collect();
-                let to: Vec<String> = image.multiscales.first()?.axes.iter()
-                    .map(|a| a.name.clone()).collect();
+                let from: Vec<String> = parent_image
+                    .multiscales
+                    .first()?
+                    .axes
+                    .iter()
+                    .map(|a| a.name.clone())
+                    .collect();
+                let to: Vec<String> = image
+                    .multiscales
+                    .first()?
+                    .axes
+                    .iter()
+                    .map(|a| a.name.clone())
+                    .collect();
                 if from == to {
                     return Some(p);
                 }
@@ -299,13 +308,13 @@ mod tests {
     #[test]
     fn a_scene_places_an_image_by_its_path() {
         let attrs = json!({"ome": {"version": "0.6", "scene": {
-            "coordinateSystems": [{"name": "well", "axes": [{"name": "y"}, {"name": "x"}]}],
-            "coordinateTransformations": [
-                {"type": "translation", "translation": [10.0, -5.0],
-                 "input": {"name": "physical", "path": "0"}, "output": {"name": "well"}},
-                {"type": "translation", "translation": [20.0, 7.0],
-                 "input": {"name": "physical", "path": "./1/"}, "output": {"name": "well"}}
-            ]}}});
+        "coordinateSystems": [{"name": "well", "axes": [{"name": "y"}, {"name": "x"}]}],
+        "coordinateTransformations": [
+            {"type": "translation", "translation": [10.0, -5.0],
+             "input": {"name": "physical", "path": "0"}, "output": {"name": "well"}},
+            {"type": "translation", "translation": [20.0, 7.0],
+             "input": {"name": "physical", "path": "./1/"}, "output": {"name": "well"}}
+        ]}}});
         let scene = Scene::from_attributes(attrs.as_object().unwrap()).unwrap();
         let axes = vec!["y".to_string(), "x".to_string()];
         let m = scene.placement("1", "physical", &axes, None).unwrap();
