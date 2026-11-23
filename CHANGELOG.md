@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.1 (2026-11-23)
+## 0.0.1 (2026-11-24)
 
 The first release: a viewer for OME-Zarr images (NGFF 0.4, 0.5 and 0.6) that draws on
 the GPU, with a Rust core and a Qt widget and app for Python. Wheels for Windows, macOS
