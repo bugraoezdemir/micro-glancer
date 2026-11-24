@@ -1,8 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.0.2 (2026-11-24)
 
 ### Changed
+- **Stepping through planes no longer winks**: a step showed a coarser stand-in or, after
+  a jump, an empty frame until the new plane's tiles arrived. Now:
+  - when the decode units a view needs (a sharded array's inner chunks, else its chunks)
+    fit half of the 512 MB block budget, tiles are put together from whole units, each
+    decoded once and kept. A chunk 96 planes deep then serves all of its planes. On a
+    96^3-chunked volume zoomed in, a step became sharp after 2 ms instead of 386 ms.
+    Images whose units do not fit keep reading blocks in their own plane, within the same
+    budget;
+  - every plane change keeps the previous plane's tiles drawn where the new plane has
+    none yet, so there is never an empty frame. After a jump (a slider dragged), a coarser
+    tile of the new plane replaces them as soon as it arrives;
+  - planes are read ahead in the direction of stepping (four ahead, one behind) when the
+    cache has room.
 - **Plates, wells and collections read their fields on several threads**: a read that
   covers many fields (a whole plate in view, a histogram, the contrast from the view)
   spreads them over the threads; fields that overlap keep their drawing order (the later

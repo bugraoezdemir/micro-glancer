@@ -23,6 +23,9 @@ pub struct Request {
     pub array: SourceRef,
     pub start: Vec<u64>,
     pub stop: Vec<u64>,
+    /// Put the tile together from whole decode units of this shape (the view's units fit
+    /// the block budget), else from its block in its own plane.
+    pub unit: Option<Vec<u64>>,
 }
 
 impl Request {
@@ -108,10 +111,13 @@ fn work(shared: Arc<Shared>, tx: Sender<Loaded>, notify: Wakeup, slow: std::time
         let t0 = std::time::Instant::now();
         // a panic while reading (a bug, or a backend's) becomes this tile's error: the
         // thread lives on and the tile stays missing
-        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            shared
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &r.unit {
+            Some(unit) if !r.key.brick => shared
                 .blocks
-                .read(r.gen, &r.array, &r.start, &r.stop, r.spatial())
+                .read_units(r.gen, &r.array, &r.start, &r.stop, unit),
+            _ => shared
+                .blocks
+                .read(r.gen, &r.array, &r.start, &r.stop, r.spatial()),
         }));
         let mut data = read.unwrap_or_else(|p| {
             let why = p

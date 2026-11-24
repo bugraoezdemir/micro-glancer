@@ -273,6 +273,47 @@ pub struct Level {
     pub depth: u64,
     /// Per axis: index to world scale and translation (used for the axes before y, x).
     lead: Vec<(f64, f64)>,
+    /// What the store decodes at once (a sharded array's inner chunk, else its chunk),
+    /// when the level is a plain Zarr array in a folder; None for mosaics, plates and
+    /// zips (their tiles are read from blocks in their plane).
+    pub unit: Option<Vec<u64>>,
+}
+
+impl Level {
+    /// Bytes per element of the level's array.
+    pub fn item(&self) -> u64 {
+        self.array.dtype().size() as u64
+    }
+}
+
+/// The decode unit of the Zarr array at `location` with `n` axes (see [`Level::unit`]):
+/// the inner chunk of a sharding codec, else the chunk grid (v3) or `chunks` (v2).
+fn decode_unit(location: &Location, n: usize) -> Option<Vec<u64>> {
+    let Location::Folder(path) = location else {
+        return None;
+    };
+    let as_shape = |v: &serde_json::Value| -> Option<Vec<u64>> {
+        let s: Vec<u64> = v.as_array()?.iter().filter_map(|x| x.as_u64()).collect();
+        (s.len() == n && !s.contains(&0)).then_some(s)
+    };
+    if let Ok(text) = std::fs::read(path.join("zarr.json")) {
+        let doc: serde_json::Value = serde_json::from_slice(&text).ok()?;
+        if let Some(codecs) = doc.get("codecs").and_then(|c| c.as_array()) {
+            for c in codecs {
+                if c.get("name").and_then(|n| n.as_str()) == Some("sharding_indexed") {
+                    return as_shape(c.get("configuration")?.get("chunk_shape")?);
+                }
+            }
+        }
+        return as_shape(
+            doc.get("chunk_grid")?
+                .get("configuration")?
+                .get("chunk_shape")?,
+        );
+    }
+    let text = std::fs::read(path.join(".zarray")).ok()?;
+    let doc: serde_json::Value = serde_json::from_slice(&text).ok()?;
+    as_shape(doc.get("chunks")?)
 }
 
 /// A channel as the image describes it (omero), or as defaults give it.
@@ -650,6 +691,7 @@ impl Source {
                 to_world,
                 to_index,
                 lead: (0..n).map(|a| (m.get(a, a), m.get(a, n))).collect(),
+                unit: decode_unit(&location.child(&lv.path), n),
             });
         }
         let texel = texel.ok_or_else(|| err("the image has no levels"))?;
@@ -762,6 +804,7 @@ impl Source {
             to_world,
             to_index,
             lead,
+            unit: None,
         })
     }
 

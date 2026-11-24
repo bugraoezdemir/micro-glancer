@@ -75,6 +75,15 @@ const MOVING_FRAMES: u64 = 4;
 /// The reading time (seconds, all reading threads together) a frame's missing tiles may
 /// take while the view moves before coarser levels are read instead.
 const MOVE_BUDGET: f64 = 0.15;
+/// Every plane change keeps the previous plane's tiles drawn where the new plane has none
+/// yet (never an empty frame). After a step of at most this many level-0 planes on every
+/// plane axis they stay until the new plane's tiles at their level arrive; after a larger
+/// jump (a slider dragged), a coarser tile of the new plane replaces them in its area as
+/// soon as it arrives, so the new plane shows at once, coarse first.
+const STEP_KEEPS: f64 = 4.0;
+/// Planes read ahead in the direction of stepping (and one behind), when the cache has
+/// room.
+const AHEAD: i64 = 4;
 /// The most bricks a level's page table holds (per channel); finer levels of larger
 /// volumes are not drawn as volumes (coarser ones stand in).
 const BRICK_PAGES_MAX: u64 = 1 << 22;
@@ -392,6 +401,18 @@ pub struct Layer {
     pub only_selected: bool,
     pub seed: u32,
     parent: Option<u16>,
+    /// Per level: whether tiles are put together from whole decode units (the view's
+    /// units fit half the block budget; see `blocks.rs`).
+    deep: Vec<bool>,
+    /// Page entries still showing the previous plane's tile (a plane step), and that
+    /// tile, until the new plane's tile arrives.
+    stale: std::collections::HashMap<usize, TileKey>,
+    /// The position the page table was last built for, and the direction of the last
+    /// step on each plane axis (-1, 0, 1).
+    shown_position: Vec<f64>,
+    step_dir: Vec<i64>,
+    /// The last plane change was a jump (more than STEP_KEEPS planes).
+    jumped: bool,
 }
 
 impl Layer {
@@ -756,6 +777,95 @@ impl Layer {
             array: self.source.array(k.level as usize),
             start,
             stop,
+            unit: if self.deep[k.level as usize] {
+                lv.unit.clone()
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Whether the decode units a view of tiles `(x0, y0, x1, y1)` at level `l` needs,
+    /// for `channels` channels, fit half the block budget (each unit decoded once and
+    /// kept; see `blocks.rs`).
+    fn units_fit(&self, l: usize, (x0, y0, x1, y1): (u32, u32, u32, u32), channels: usize) -> bool {
+        let lv = &self.source.levels[l];
+        let Some(unit) = &lv.unit else {
+            return false;
+        };
+        let n = lv.shape.len();
+        let (y, x) = (n - 2, n - 1);
+        let t = TILE as u64;
+        let py = (y0 as u64 * t, (y1 as u64 * t).min(lv.height));
+        let px = (x0 as u64 * t, (x1 as u64 * t).min(lv.width));
+        if py.1 <= py.0 || px.1 <= px.0 {
+            return false;
+        }
+        let count = |(a, b): (u64, u64), u: u64| (b - 1) / u - a / u + 1;
+        let units = count(py, unit[y]) * count(px, unit[x]);
+        // the channels: one unit each when the channel axis is chunked by one
+        let per_channel = match self.source.channel_axis {
+            Some(c) if unit[c] > 1 => 1,
+            _ => channels as u64,
+        };
+        let unit_bytes = (0..n).map(|i| unit[i].min(lv.shape[i])).product::<u64>() * lv.item();
+        unit_bytes <= blocks::BLOCK_MAX && units * per_channel * unit_bytes <= blocks::BUDGET / 2
+    }
+
+    /// After a jump: the previous plane's tiles at finer levels than `k` (a tile of the
+    /// current plane that arrived) leave its area, so the new plane shows through it.
+    fn clear_stale_under(&mut self, k: &TileKey) {
+        let coarse = &self.source.levels[k.level as usize];
+        let t = TILE as f64;
+        let (cx0, cy0) = (k.x as f64 * t, k.y as f64 * t);
+        let (cx1, cy1) = (cx0 + t, cy0 + t);
+        let gone: Vec<(usize, TileKey)> = self
+            .stale
+            .iter()
+            .filter(|(_, s)| s.level < k.level && s.channel == k.channel)
+            .filter(|(_, s)| {
+                // the stale tile's box in the coarse level's pixels
+                let fine = &self.source.levels[s.level as usize];
+                let (fx, fy) = (
+                    coarse.width as f64 / fine.width as f64,
+                    coarse.height as f64 / fine.height as f64,
+                );
+                let (x0, y0) = (s.x as f64 * t * fx, s.y as f64 * t * fy);
+                let (x1, y1) = (x0 + t * fx, y0 + t * fy);
+                x0 < cx1 && cx0 < x1 && y0 < cy1 && cy0 < y1
+            })
+            .map(|(e, s)| (*e, *s))
+            .collect();
+        for (e, s) in gone {
+            self.stale.remove(&e);
+            let mut cleared = s;
+            cleared.plane = self.planes[s.level as usize].1;
+            self.set_page(&cleared, 0);
+        }
+    }
+
+    /// After a plane step: page entries the new plane has no tile for keep showing what
+    /// they showed (`prev`, with `prev_stale`), recorded in `stale` until the new tile
+    /// arrives.
+    fn keep_previous(
+        &mut self,
+        prev: &[u32],
+        prev_stale: &std::collections::HashMap<usize, TileKey>,
+    ) {
+        let mut slot_key: std::collections::HashMap<u32, TileKey> =
+            self.cache.iter().map(|(k, s)| (*s, *k)).collect();
+        for k in prev_stale.values() {
+            if let Some(s) = self.cache.peek(k) {
+                slot_key.insert(s, *k);
+            }
+        }
+        for (e, (page, &before)) in self.pages.iter_mut().zip(prev).enumerate() {
+            if *page == 0 && before != 0 {
+                if let Some(k) = slot_key.get(&(before - 1)) {
+                    *page = before;
+                    self.stale.insert(e, *k);
+                }
+            }
         }
     }
 
@@ -775,6 +885,7 @@ impl Layer {
             array: self.source.array(k.level as usize),
             start,
             stop,
+            unit: None,
         }
     }
 
@@ -962,6 +1073,13 @@ fn place_loaded(
             Err(e) => {
                 o.error.get_or_insert(e);
                 o.failed.insert(t.key);
+                if !t.key.brick && o.current(&t.key) {
+                    // no new tile: the previous plane's stops standing in for it
+                    let e = o.entry(&t.key);
+                    if o.stale.remove(&e).is_some() {
+                        o.set_page(&t.key, 0);
+                    }
+                }
                 continue;
             }
             Ok(d) => d,
@@ -991,10 +1109,30 @@ fn place_loaded(
                 if o.current(&old) {
                     o.set_page(&old, 0);
                 }
+                // entries still drawing the evicted tile as a previous plane's stand-in
+                let gone: Vec<usize> = o
+                    .stale
+                    .iter()
+                    .filter(|(_, k)| **k == old)
+                    .map(|(e, _)| *e)
+                    .collect();
+                for e in gone {
+                    o.stale.remove(&e);
+                    o.pages[e] = 0;
+                    o.dirty = Some(match o.dirty {
+                        Some((a, b)) => (a.min(e), b.max(e)),
+                        None => (e, e),
+                    });
+                }
             }
             gpu.upload_tile(o.id, slot, &data, t.w, t.h);
             if o.current(&t.key) {
                 o.set_page(&t.key, slot + 1);
+                let e = o.entry(&t.key);
+                o.stale.remove(&e);
+                if o.jumped {
+                    o.clear_stale_under(&t.key);
+                }
             }
         }
         stats.loaded += 1;
@@ -1033,7 +1171,32 @@ fn prepare_flat(
         }
     }
     if moved {
+        // a small step keeps the previous plane's tiles drawn until the new ones arrive
+        let small = o.shown_position.len() == o.position.len()
+            && o.shown_position
+                .iter()
+                .zip(&o.position)
+                .all(|(a, b)| (a - b).abs() <= STEP_KEEPS);
+        for (k, (a, b)) in o.shown_position.iter().zip(&o.position).enumerate() {
+            if let Some(d) = o.step_dir.get_mut(k) {
+                if b > a {
+                    *d = 1;
+                } else if b < a {
+                    *d = -1;
+                }
+            }
+        }
+        let prev = o.pages.clone();
+        let prev_stale = std::mem::take(&mut o.stale);
         o.rebuild_pages();
+        o.keep_previous(&prev, &prev_stale);
+        o.jumped = !small;
+        o.shown_position = o.position.clone();
+    }
+    // the tiles still drawn from the previous plane stay in the cache
+    let kept: Vec<TileKey> = o.stale.values().copied().collect();
+    for k in &kept {
+        o.cache.touch(k, frame);
     }
     // per level: screen pixel to level index (x, y)
     let plane = cx.camera.plane(cx.tw, cx.th);
@@ -1061,6 +1224,10 @@ fn prepare_flat(
             *v = visible_tiles(&o.source.levels[l], &to_index[l], cx.tw, cx.th, 0);
         }
         order = views[level].map(centre_first).unwrap_or_default();
+        if let Some(r) = views[level] {
+            let fit = o.units_fit(level, r, active.len());
+            o.deep[level] = fit;
+        }
         for &t in &order {
             for &c in &active {
                 stats.visible += 1;
@@ -1149,9 +1316,22 @@ fn prepare_flat(
                 }
             }
             if here * 4 < room {
-                // the next and previous plane on each plane axis (z, t, ...)
+                // the next and previous plane on each plane axis (z, t, ...); after a
+                // step, further ahead in its direction while the cache has room
                 for k_axis in 0..o.source.plane_axes.len() {
-                    for step in [1.0, -1.0] {
+                    let dir = o.step_dir.get(k_axis).copied().unwrap_or(0);
+                    let steps: Vec<f64> = if dir == 0 {
+                        vec![1.0, -1.0]
+                    } else {
+                        (1..=AHEAD)
+                            .map(|i| (i * dir) as f64)
+                            .chain([(-dir) as f64])
+                            .collect()
+                    };
+                    for (i, step) in steps.into_iter().enumerate() {
+                        if i >= 2 && here * (4 + i) >= room {
+                            break;
+                        }
                         let mut pos = o.position.clone();
                         pos[k_axis] = pos[k_axis].round() + step;
                         let a = o.source.plane_axes[k_axis];
@@ -1655,6 +1835,7 @@ impl Viewer {
                     Ok(slots) => {
                         let l = &mut self.layers[i];
                         l.cache = Cache::new(slots);
+                        l.stale.clear();
                         l.rebuild_pages();
                     }
                     Err(e) => {
@@ -1805,6 +1986,7 @@ impl Viewer {
             .collect();
         let pages = vec![0u32; stride as usize * nc];
         let first = self.layers.is_empty();
+        let (nl, n_plane) = (source.levels.len(), source.plane_axes.len());
         let layer = Layer {
             id,
             path: path.to_path_buf(),
@@ -1837,6 +2019,11 @@ impl Viewer {
             only_selected: false,
             seed: 0,
             parent: None,
+            deep: vec![false; nl],
+            stale: std::collections::HashMap::new(),
+            shown_position: Vec::new(),
+            step_dir: vec![0; n_plane],
+            jumped: false,
         };
         if first {
             // the camera's plane where the image opens (its default z)
