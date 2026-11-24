@@ -37,15 +37,6 @@ BINS = 256
 _pool = None
 
 
-def _background():
-    """The one thread histograms are read on (one at a time: the newest wins anyway)."""
-    global _pool
-    if _pool is None:
-        from concurrent.futures import ThreadPoolExecutor
-        _pool = ThreadPoolExecutor(1, thread_name_prefix="micro-glancer-histogram")
-    return _pool
-
-
 class HistogramWidget(QWidget):
     """One channel's histogram with its contrast limits, isosurface level and opacity
     curve (see the module's notes)."""
@@ -53,8 +44,6 @@ class HistogramWidget(QWidget):
     changed = pyqtSignal()
     #: a histogram arrived (read on a background thread)
     read = pyqtSignal()
-    #: (request number, histogram or None, error or None), from the background thread
-    _arrived = pyqtSignal(int, object, object)
 
     def __init__(self, view, parent=None):
         super().__init__(parent)
@@ -63,9 +52,11 @@ class HistogramWidget(QWidget):
         self.whole = False
         self._hist = None                   # the histogram dict, or None
         self._drag = None                   # "lo", "hi", "iso" or ("point", k)
-        self._asked = 0                     # the newest request's number
-        self._done = 0                      # the newest request answered
-        self._arrived.connect(self._take)
+        self._job = None                    # the histogram being read
+        self._again = False                 # asked again while it was read
+        self._poll = QTimer(self)           # the window's thread looks for the answer
+        self._poll.setInterval(15)
+        self._poll.timeout.connect(self._take)
         self.setMinimumSize(220, 120)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.setMouseTracking(True)
@@ -79,9 +70,13 @@ class HistogramWidget(QWidget):
     def refresh(self) -> None:
         """Read the histogram again (what is in view, or the whole plane / volume).
 
-        The reading runs on a background thread (a whole plate in view reads every field
-        of it), so the window keeps drawing; the newest request wins, and ``read`` is
-        emitted when it arrives. ``wait()`` waits for it."""
+        The reading runs on a thread of the core's own (a whole plate in view reads every
+        field of it), so the window keeps drawing; a refresh asked for meanwhile reads
+        again once it is done (the newest view wins), and ``read`` is emitted when one
+        arrives. ``wait()`` waits for it."""
+        if self._job is not None:
+            self._again = True
+            return
         try:
             v = self.view.viewer
             if not v.layers:
@@ -102,31 +97,32 @@ class HistogramWidget(QWidget):
             self.view._fail(exc, force=True)
             self.update()
             return
-        self._asked += 1
-        number = self._asked
-        _background().submit(self._run, number, job)
-
-    def _run(self, number, job):
-        """On the background thread: the job, unless a newer one was asked for meanwhile."""
-        if number != self._asked:
-            return
         try:
-            result, error = job.run(), None
-        except ERRORS as exc:  # noqa: BLE001 (handed to the window's thread)
-            result, error = None, exc
-        try:
-            self._arrived.emit(number, result, error)
-        except RuntimeError:            # the widget is gone
-            pass
-
-    def _take(self, number, result, error):
-        """On the window's thread: the newest answer is shown, older ones are dropped."""
-        if number != self._asked:
+            job.start()                     # the core's own thread; this one polls
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
+            self.view._fail(exc, force=True)
             return
-        self._done = number
-        self._hist = result
-        if error is not None:
-            self.view._fail(error, force=True)
+        self._job = job
+        self._poll.start()
+
+    def _take(self):
+        """On the window's thread: the newest answer, once it is there."""
+        job = self._job
+        if job is None:
+            self._poll.stop()
+            return
+        if not job.done:
+            return
+        self._job = None
+        self._poll.stop()
+        try:
+            self._hist = job.result()
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
+            self._hist = None
+            self.view._fail(exc, force=True)
+        if self._again:                     # the view changed meanwhile: read it now
+            self._again = False
+            self.refresh()
         self.update()
         self.read.emit()
 
@@ -138,7 +134,7 @@ class HistogramWidget(QWidget):
         from PyQt6.QtWidgets import QApplication
 
         end = time.monotonic() + timeout
-        while self._done != self._asked:
+        while self._job is not None or self._again:
             if time.monotonic() > end:
                 return False
             QApplication.processEvents()

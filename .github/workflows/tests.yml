@@ -93,4 +93,6 @@ jobs:
           python -c "import micro_glancer as m; print(m.__file__); assert 'site-packages' in m.__file__, 'not the installed wheel'"
 
       - name: pytest
-        run: python -m pytest tests -v -o addopts=""
+        # an error Python could not raise (a viewer dropped on another thread, which
+        # leaks it) fails the run instead of passing as a warning
+        run: python -m pytest tests -v -o addopts="" -W error::pytest.PytestUnraisableExceptionWarning

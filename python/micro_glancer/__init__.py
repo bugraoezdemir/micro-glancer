@@ -9,8 +9,8 @@ Incubation: tasks V7 and V9, not released.
 """
 import json as _json
 
-from ._core import (ALIGNED, COLOUR_MAPS, PanicException, Viewer, ViewerError, __version__,
-                    tree_json as _tree_json)
+from ._core import (ALIGNED, COLOUR_MAPS, OpenJob, PanicException, Viewer, ViewerError,
+                    __version__, tree_json as _tree_json, warm_up)
 
 #: what a Qt host catches around the viewer: errors, and a Rust panic (which Python sees
 #: as a BaseException; PyQt6 ends the process when a slot lets one through)
@@ -28,4 +28,5 @@ def tree(path) -> dict:
     return _json.loads(_tree_json(str(path)))
 
 
-__all__ = ["ALIGNED", "COLOUR_MAPS", "ERRORS", "Viewer", "ViewerError", "__version__", "tree"]
+__all__ = ["ALIGNED", "COLOUR_MAPS", "ERRORS", "OpenJob", "Viewer", "ViewerError", "__version__",
+           "tree", "warm_up"]

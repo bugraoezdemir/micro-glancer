@@ -155,18 +155,24 @@ def test_histograms_of_the_whole_image_and_the_view(stores, flat):
 
 def test_a_histogram_job_runs_on_another_thread_while_the_viewer_draws(stores, flat):
     # the panel reads histograms this way: a whole plate in view reads every field
-    from concurrent.futures import ThreadPoolExecutor
+    import time
 
     v = Viewer.offscreen(200, 150)
     v.open(stores["flat"])
     for kw in ({"bins": 64, "whole": True}, {"bins": 32, "range": (0.0, 9000.0)}):
         job = v.histogram_job(0, **kw)
-        with ThreadPoolExecutor(1) as pool:
-            running = pool.submit(job.run)
-            v.render_rgba()                              # the viewer is free meanwhile
-            h = running.result(timeout=30)
-        assert h == v.histogram(0, **kw)
+        job.start()                                      # the core's own thread
+        v.render_rgba()                                  # the viewer is free meanwhile
+        end = time.monotonic() + 30
+        while not job.done and time.monotonic() < end:
+            time.sleep(0.005)
+        h = job.result()
+        assert h == v.histogram(0, **kw) == v.histogram_job(0, **kw).run()
         assert job.level == h["level"]
+        with pytest.raises(ViewerError, match="started already"):
+            job.start()
+    with pytest.raises(ViewerError, match="not finished"):
+        v.histogram_job(0).result()
     with pytest.raises(ViewerError, match="bins"):
         v.histogram_job(0, bins=0)
 

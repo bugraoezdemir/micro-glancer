@@ -185,6 +185,9 @@ def test_label_images_in_the_app(qapp, labelled, monkeypatch):
                         Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
         view.mouseDoubleClickEvent(e)
     w, h = v.size
+    # the ids come from the label tiles in the cache: wait for the view to be sharp (a
+    # slow runner may not have read them in a fixed pause, CI macOS 2026-11-24)
+    v.settle(30.0, False)
     dbl(w / 2, h / 2)
     assert v.layers[1]["selected"] == 5
     win.channel_panel.refresh()

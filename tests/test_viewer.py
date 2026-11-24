@@ -527,3 +527,36 @@ def test_native_without_real_windows_is_refused(qapp, monkeypatch):
         mvqt.ViewerWidget(mode="native")
     monkeypatch.setenv("MICRO_GLANCER_MODE", "")
     assert mvqt.default_mode() == "offscreen"
+
+
+def test_the_qt_widget_opens_in_the_background(qapp, stores):
+    import time
+
+    from micro_glancer import warm_up
+    from micro_glancer.qt import ViewerWidget
+
+    assert isinstance(warm_up(), str)                     # the adapter's description
+    w = ViewerWidget(mode="offscreen")
+    w.resize(160, 120)
+    w.show()
+    seen, done = [], []
+    w.opening.connect(lambda a, b: seen.append((a, b)))
+    w.open_in_background(stores["0.4"], done=done.append)   # replaced by the next one
+    w.open_in_background(stores["0.5"], done=done.append)
+    end = time.monotonic() + 30
+    while w.opening_now and time.monotonic() < end:
+        qapp.processEvents()
+        time.sleep(0.005)
+    qapp.processEvents()
+    assert done == [None]                                 # only the newest is shown
+    assert w.viewer.image is not None
+    assert w.viewer.layers[0]["path"].replace("\\", "/").endswith(
+        stores["0.5"].replace("\\", "/").rstrip("/").split("/")[-1])
+    errors = []
+    w.open_in_background(stores["0.5"] + "-missing", done=errors.append)
+    end = time.monotonic() + 30
+    while w.opening_now and time.monotonic() < end:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert len(errors) == 1 and errors[0] is not None
+    w.close()

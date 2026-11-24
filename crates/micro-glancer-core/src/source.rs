@@ -511,13 +511,31 @@ impl Source {
     /// As [`Source::open`]; a plate shows field `field` of every well ([`ALL_FIELDS`]:
     /// every field).
     pub fn open_field(path: &Path, field: usize) -> Result<Self, ViewerError> {
+        Self::open_counted(path, field, &Progress::default())
+    }
+
+    /// As [`Source::open_field`], counting in `progress` the images opened (a plate's
+    /// fields, a group's members; one for an image).
+    pub fn open_counted(
+        path: &Path,
+        field: usize,
+        progress: &Progress,
+    ) -> Result<Self, ViewerError> {
         let location = locate(path);
         if let Some(info) = PlateInfo::read(&location) {
-            return Self::open_plate(location, info, field);
+            return Self::open_plate(location, info, field, progress);
         }
         if let Some(members) = group_members(&location) {
-            return Self::open_group(location, members);
+            return Self::open_group(location, members, progress);
         }
+        progress.start(1);
+        let opened = Self::open_image(location);
+        progress.tick();
+        opened
+    }
+
+    /// One image (not a plate or a group).
+    fn open_image(location: Location) -> Result<Self, ViewerError> {
         let image = Image::at(location.clone()).map_err(err)?;
         let label = image.image_label.is_some();
         let mut signed = false;
@@ -751,10 +769,17 @@ impl Source {
     /// collection) as one image, each at its position (see `mosaic.rs`); the first that
     /// opens sets the axes, channels and type. Coarser levels than the members have are
     /// added (the last level averaged by 2, 4, ...) until it fits about 2048 pixels.
-    fn open_group(location: Location, members: Vec<(String, String)>) -> Result<Self, ViewerError> {
+    fn open_group(
+        location: Location,
+        members: Vec<(String, String)>,
+        progress: &Progress,
+    ) -> Result<Self, ViewerError> {
         let scene = Scene::read(&location);
+        progress.start(members.len());
         let opened: Vec<Result<Member, String>> = par_map(&members, |(rel, name)| {
-            open_member(&location, scene.as_ref(), rel, name)
+            let m = open_member(&location, scene.as_ref(), rel, name);
+            progress.tick();
+            m
         });
         let mut skipped = Vec::new();
         let mut ok = Vec::new();
@@ -870,7 +895,12 @@ impl Source {
     /// the well ([`ALL_FIELDS`]: every field at its position, see `mosaic.rs`), the wells
     /// on a grid. The first field that opens sets the axes, channels and type; fields of
     /// other axes, pixel sizes or channels, or that cannot be read, are left out (named).
-    fn open_plate(location: Location, info: PlateInfo, field: usize) -> Result<Self, ViewerError> {
+    fn open_plate(
+        location: Location,
+        info: PlateInfo,
+        field: usize,
+        progress: &Progress,
+    ) -> Result<Self, ViewerError> {
         let all = field == ALL_FIELDS;
         let picks: Vec<(usize, usize)> = info
             .wells
@@ -902,14 +932,17 @@ impl Source {
                 None
             }
         });
+        progress.start(picks.len());
         let opened: Vec<Result<Member, String>> = par_map(&picks, |&(wi, k)| {
             let w = &info.wells[wi];
-            open_member(
+            let m = open_member(
                 &location.child(&w.path),
                 scenes[wi].as_ref(),
                 &w.fields[k],
                 &format!("{} field {}", w.name, w.fields[k]),
-            )
+            );
+            progress.tick();
+            m
         });
         let mut skipped = Vec::new();
         let mut ok = Vec::new();
@@ -1238,6 +1271,35 @@ pub fn direct_threads() -> usize {
         .map(|n| n.get())
         .unwrap_or(4)
         .clamp(2, 8)
+}
+
+/// How far an open has got: the images to open (a plate's fields, a group's members) and
+/// those opened so far. Shared between the thread that opens and one that shows progress.
+#[derive(Debug, Default)]
+pub struct Progress {
+    total: std::sync::atomic::AtomicUsize,
+    done: std::sync::atomic::AtomicUsize,
+}
+
+impl Progress {
+    fn start(&self, total: usize) {
+        use std::sync::atomic::Ordering;
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    fn tick(&self) {
+        self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// (opened, to open); (0, 0) before the images are known.
+    pub fn get(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.done.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
 }
 
 /// A region of an array as bytes, on this thread (the tile loader's reads: each worker

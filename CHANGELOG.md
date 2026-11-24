@@ -8,17 +8,34 @@
   spreads them over the threads; fields that overlap keep their drawing order (the later
   one shows). A histogram of a whole 384-well plate in view (10,640 fields) took 0.25 s
   instead of 1.4 s.
-- **The histogram panel no longer stops the window**: it reads on a background thread,
-  the newest request wins, and the window keeps drawing meanwhile. Before, every pause
-  while panning over a whole plate froze the window for about a second (the histogram
-  read every field in view), so the coarse tiles that stand in while finer ones load
-  could not be drawn either.
+- **The histogram panel no longer stops the window**: it reads on a thread of the core's
+  own, and the window keeps drawing meanwhile; a refresh asked for while one is read
+  follows when it is done. Before, every pause while panning over a whole plate froze
+  the window for about a second (the histogram read every field in view), so the coarse
+  tiles that stand in while finer ones load could not be drawn either.
+- **The first viewer of a process starts sooner**: every Qt widget loads the GPU driver
+  on a thread of its own when it is made, which took about 1.3 s at the first image
+  opened (later viewers took 0.08 s).
 
 ### Added
-- `Viewer.histogram_job(...)`: the same histogram as `Viewer.histogram`, as a job whose
-  `run()` reads and counts on any thread without Python's lock, while the viewer keeps
-  drawing. `HistogramWidget.wait()` waits for the newest histogram asked for, and its
-  `read` signal tells when one arrives.
+- **Opening in the background**: `ViewerWidget.open_in_background(path, done=...)` reads
+  an image's metadata (a plate: every field's) on a thread of the core's own while the
+  window stays responsive, reports `opening(done, total)` (fields of a plate, members of
+  a group), then shows it and calls `done(error)`; a newer call replaces an older one.
+  Underneath, `micro_glancer.OpenJob(path)` with `start()` / `done` / `progress` /
+  `error` (or `run()` on the calling thread) and `Viewer.open_job(job)` /
+  `Viewer.add_job(job)`.
+- `Viewer.histogram_job(...)`: the same histogram as `Viewer.histogram`, as a job:
+  `start()` reads and counts on a thread of the core's own (`done`, `result()`), or
+  `run()` on the calling thread without Python's lock. `HistogramWidget.wait()` waits
+  for the newest histogram asked for, and its `read` signal tells when one arrives.
+- `micro_glancer.warm_up(software=False, background=False)`: loads the GPU driver and
+  makes a device once, so the first viewer need not wait for it.
+
+Background work runs on the core's own threads, never on Python threads, so Python's
+cycle collector stays on the window's thread (on another thread it could drop a widget
+and its viewer, which belongs to the window's thread). CI fails on such an error
+(`PytestUnraisableExceptionWarning` as an error).
 
 ## 0.0.1 (2026-11-24)
 

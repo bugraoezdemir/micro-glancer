@@ -45,7 +45,7 @@ use loader::{Loaded, Loader, Request};
 pub use luts::NAMES as COLOUR_MAPS;
 pub use raw_window_handle;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-pub use source::{Affine2, ChannelInfo, Level, Source, Texel, ALL_FIELDS};
+pub use source::{Affine2, ChannelInfo, Level, Progress, Source, Texel, ALL_FIELDS};
 use tiles::{Cache, TileKey, TILE};
 pub use view::{parse_transform, ViewState};
 
@@ -1738,7 +1738,31 @@ impl Viewer {
     /// As [`Viewer::add`]; a plate shows field `field` of every well ([`ALL_FIELDS`]:
     /// every field at its position).
     pub fn add_field(&mut self, path: &Path, field: usize) -> Result<usize, ViewerError> {
-        let source = Source::open_field(path, field)?;
+        self.add_opened(Opened::open(path, field, &Progress::default())?)
+    }
+
+    /// Open `opened` (see [`Opened::open`]) as the only layer, as [`Viewer::open`] does
+    /// with a path.
+    pub fn open_opened(&mut self, opened: Opened) -> Result<(), ViewerError> {
+        while !self.layers.is_empty() {
+            self.remove(self.layers.len() - 1);
+        }
+        self.camera = Camera::new();
+        self.add_opened(opened)?;
+        self.fit();
+        Ok(())
+    }
+
+    /// Add `opened` (see [`Opened::open`]) as a new layer on top, as [`Viewer::add`] does
+    /// with a path: quick, the reading was done when it was opened.
+    pub fn add_opened(&mut self, opened: Opened) -> Result<usize, ViewerError> {
+        let Opened {
+            path,
+            source,
+            position,
+            channels,
+        } = opened;
+        let path = path.as_path();
         let label = source.label;
         if source.z_axis.is_some() {
             // its brick and projection pipelines, built while the plane is looked at
@@ -1776,11 +1800,9 @@ impl Viewer {
                 bstride += n as u32;
             }
         }
-        let position = source.default_position.clone();
         let planes = (0..source.levels.len())
             .map(|l| source.plane(l, &position))
             .collect();
-        let channels = Self::initial_display(&source, &position);
         let pages = vec![0u32; stride as usize * nc];
         let first = self.layers.is_empty();
         let layer = Layer {
@@ -1835,6 +1857,18 @@ impl Viewer {
         }
         self.sync_z();
         Ok(self.layers.len() - 1)
+    }
+
+    /// Load the GPU driver and make a device once, then let it go: the first viewer of a
+    /// process takes about a second longer than the next ones (the driver's loading).
+    /// Returns the adapter's description.
+    pub fn warm_up(software: bool) -> Result<String, ViewerError> {
+        let options = GpuOptions {
+            software,
+            no_vsync: false,
+            atlas_mib: 0,
+        };
+        Ok(Gpu::offscreen(16, 16, options)?.adapter_info)
     }
 
     fn fresh_id(&mut self) -> u16 {
@@ -3318,6 +3352,34 @@ pub struct Histogram {
     pub lo: f64,
     pub hi: f64,
     pub level: usize,
+}
+
+/// An image opened apart from a viewer: its metadata read (a plate: every field's) and
+/// its channels' starting display (the contrast from the coarsest level when the image
+/// gives none). Made on any thread with [`Opened::open`], then handed to
+/// [`Viewer::open_opened`] or [`Viewer::add_opened`] on the viewer's thread, which is
+/// quick.
+pub struct Opened {
+    path: PathBuf,
+    source: Source,
+    position: Vec<f64>,
+    channels: Vec<ChannelDisplay>,
+}
+
+impl Opened {
+    /// Open the image at `path` (see [`Viewer::add_field`]; `field` [`ALL_FIELDS`] for
+    /// every field of a plate), counting in `progress` the images opened.
+    pub fn open(path: &Path, field: usize, progress: &Progress) -> Result<Self, ViewerError> {
+        let source = Source::open_counted(path, field, progress)?;
+        let position = source.default_position.clone();
+        let channels = Viewer::initial_display(&source, &position);
+        Ok(Self {
+            path: path.to_path_buf(),
+            source,
+            position,
+            channels,
+        })
+    }
 }
 
 /// A histogram's values to gather, apart from the viewer (see [`Viewer::histogram_job`]):
