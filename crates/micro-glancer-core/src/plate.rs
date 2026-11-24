@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use dyna_zarr_arrays::pool::{piece_plan, pieces};
 use dyna_zarr_arrays::{region, DType, Out, ReadError, Source, SourceRef};
 use ome_zarr_pyramid::Location;
 
@@ -350,19 +351,28 @@ impl Source for PlateArray {
                 out.dtype().name()
             )));
         }
-        for (a, s, e, at) in self.jobs(start, stop) {
-            a.read_into(&s, &e, &out.moved(at), threads)?;
-        }
-        Ok(())
+        // cells on several threads, at most `threads` at once: each cell is one well (a
+        // mosaic keeps its own drawing order inside), and the cells' regions of the
+        // destination are disjoint. A whole plate in view is thousands of small reads
+        // (10,640 fields of a 384-well plate), so one after another was the slow part.
+        let jobs = self.jobs(start, stop);
+        pieces(jobs.len(), threads, |k, each| {
+            let (a, s, e, at) = &jobs[k];
+            a.read_into(s, e, &out.moved(at.clone()), each)
+        })
     }
 
     fn cost(&self, start: &[u64], stop: &[u64], threads: usize) -> Result<u64, ReadError> {
         region(&self.shape, start, stop)?;
-        let mut most = 0;
-        for (a, s, e, _) in self.jobs(start, stop) {
-            most = most.max(a.cost(&s, &e, threads)?);
-        }
-        Ok(most)
+        let jobs = self.jobs(start, stop);
+        let (open, each) = piece_plan(jobs.len(), threads);
+        let mut costs = jobs
+            .iter()
+            .map(|(a, s, e, _)| a.cost(s, e, each))
+            .collect::<Result<Vec<u64>, _>>()?;
+        // the `open` most costly cells at once
+        costs.sort_unstable_by(|x, y| y.cmp(x));
+        Ok(costs.iter().take(open).sum())
     }
 }
 

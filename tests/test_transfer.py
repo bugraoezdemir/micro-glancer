@@ -153,6 +153,24 @@ def test_histograms_of_the_whole_image_and_the_view(stores, flat):
         v.histogram(0, bins=0)
 
 
+def test_a_histogram_job_runs_on_another_thread_while_the_viewer_draws(stores, flat):
+    # the panel reads histograms this way: a whole plate in view reads every field
+    from concurrent.futures import ThreadPoolExecutor
+
+    v = Viewer.offscreen(200, 150)
+    v.open(stores["flat"])
+    for kw in ({"bins": 64, "whole": True}, {"bins": 32, "range": (0.0, 9000.0)}):
+        job = v.histogram_job(0, **kw)
+        with ThreadPoolExecutor(1) as pool:
+            running = pool.submit(job.run)
+            v.render_rgba()                              # the viewer is free meanwhile
+            h = running.result(timeout=30)
+        assert h == v.histogram(0, **kw)
+        assert job.level == h["level"]
+    with pytest.raises(ViewerError, match="bins"):
+        v.histogram_job(0, bins=0)
+
+
 def test_the_histogram_of_a_whole_volume(stores, sparse):
     v = _volume(stores["sparse"])
     h = v.histogram(0, bins=50, whole=True)
@@ -196,6 +214,7 @@ def test_the_panel_drags_contrast_level_and_curve(qapp, stores):
     qapp.processEvents()
     panel.refresh()
     hist = panel.hist
+    assert hist.wait()                     # read on a background thread
     assert hist._hist is not None and sum(hist._hist["counts"]) > 0
     v = w.viewer
     v.set_contrast(1000.0, 15000.0)

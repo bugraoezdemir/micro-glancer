@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- **Plates, wells and collections read their fields on several threads**: a read that
+  covers many fields (a whole plate in view, a histogram, the contrast from the view)
+  spreads them over the threads; fields that overlap keep their drawing order (the later
+  one shows). A histogram of a whole 384-well plate in view (10,640 fields) took 0.25 s
+  instead of 1.4 s.
+- **The histogram panel no longer stops the window**: it reads on a background thread,
+  the newest request wins, and the window keeps drawing meanwhile. Before, every pause
+  while panning over a whole plate froze the window for about a second (the histogram
+  read every field in view), so the coarse tiles that stand in while finer ones load
+  could not be drawn either.
+
+### Added
+- `Viewer.histogram_job(...)`: the same histogram as `Viewer.histogram`, as a job whose
+  `run()` reads and counts on any thread without Python's lock, while the viewer keeps
+  drawing. `HistogramWidget.wait()` waits for the newest histogram asked for, and its
+  `read` signal tells when one arrives.
+
 ## 0.0.1 (2026-11-24)
 
 The first release: a viewer for OME-Zarr images (NGFF 0.4, 0.5 and 0.6) that draws on

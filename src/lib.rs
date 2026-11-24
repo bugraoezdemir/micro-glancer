@@ -534,17 +534,28 @@ impl Viewer {
             .inner
             .histogram(i, channel, bins, range, whole)
             .map_err(err)?;
-        let d = PyDict::new(py);
-        let step = (h.hi - h.lo) / h.counts.len() as f64;
-        let edges: Vec<f64> = (0..=h.counts.len())
-            .map(|k| h.lo + k as f64 * step)
-            .collect();
-        d.set_item("counts", h.counts)?;
-        d.set_item("edges", edges)?;
-        d.set_item("lo", h.lo)?;
-        d.set_item("hi", h.hi)?;
-        d.set_item("level", h.level)?;
-        Ok(d)
+        histogram_dict(py, h)
+    }
+
+    /// The same histogram as :meth:`histogram`, as a job to run later, on any thread:
+    /// making it is quick (what to read: the view's box and level); its ``run()`` reads
+    /// and counts without Python's lock, while the viewer keeps drawing. A whole plate in
+    /// view reads every field of it, which takes a moment.
+    #[pyo3(signature = (channel = 0, *, bins = 256, range = None, whole = false, layer = None))]
+    fn histogram_job(
+        &self,
+        channel: usize,
+        bins: usize,
+        range: Option<(f64, f64)>,
+        whole: bool,
+        layer: Option<usize>,
+    ) -> PyResult<HistogramJob> {
+        if bins == 0 || bins > 1 << 16 {
+            return Err(ViewerError::new_err(format!("{bins} bins: 1 to 65536")));
+        }
+        let i = self.layer_index(layer)?;
+        let job = self.inner.histogram_job(i, channel, whole).map_err(err)?;
+        Ok(HistogramJob { job, bins, range })
     }
 
     /// Whether volume and isosurface projections are lit from their gradients.
@@ -1131,6 +1142,47 @@ fn field_out(field: usize) -> Option<usize> {
     (field != micro_glancer_core::ALL_FIELDS).then_some(field)
 }
 
+/// A histogram to read later (from :meth:`Viewer.histogram_job`): ``run()`` reads and
+/// counts on any thread, without Python's lock; the result is the same dict as
+/// :meth:`Viewer.histogram` gives.
+#[pyclass(frozen, module = "micro_glancer._core")]
+pub struct HistogramJob {
+    job: core::HistogramJob,
+    bins: usize,
+    range: Option<(f64, f64)>,
+}
+
+#[pymethods]
+impl HistogramJob {
+    /// Read and count: {"counts", "edges", "lo", "hi", "level"}.
+    fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let (job, bins, range) = (&self.job, self.bins, self.range);
+        let h = py.detach(|| job.run(bins, range)).map_err(err)?;
+        histogram_dict(py, h)
+    }
+
+    /// The level the values come from.
+    #[getter]
+    fn level(&self) -> usize {
+        self.job.level
+    }
+}
+
+/// A histogram as Python sees it: {"counts", "edges" (bins + 1), "lo", "hi", "level"}.
+fn histogram_dict(py: Python<'_>, h: core::Histogram) -> PyResult<Bound<'_, PyDict>> {
+    let d = PyDict::new(py);
+    let step = (h.hi - h.lo) / h.counts.len() as f64;
+    let edges: Vec<f64> = (0..=h.counts.len())
+        .map(|k| h.lo + k as f64 * step)
+        .collect();
+    d.set_item("counts", h.counts)?;
+    d.set_item("edges", edges)?;
+    d.set_item("lo", h.lo)?;
+    d.set_item("hi", h.hi)?;
+    d.set_item("level", h.level)?;
+    Ok(d)
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tree_json, m)?)?;
@@ -1144,5 +1196,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("COLOUR_MAPS", core::COLOUR_MAPS.to_vec())?;
     m.add("ALIGNED", core::ALIGNED)?;
     m.add_class::<Viewer>()?;
+    m.add_class::<HistogramJob>()?;
     Ok(())
 }

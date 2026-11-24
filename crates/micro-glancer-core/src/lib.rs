@@ -3055,7 +3055,8 @@ impl Viewer {
     /// outside are left out). Of what is in view (`whole` false: the view's box at the
     /// finest level within about a million pixels, for a volume cut at an angle the
     /// voxels next to the plane), or of the whole plane of a 2-D image or the whole volume
-    /// (at the finest level within about four million pixels or voxels).
+    /// (at the finest level within about four million pixels or voxels). The same as
+    /// [`Viewer::histogram_job`] run right here.
     pub fn histogram(
         &self,
         i: usize,
@@ -3064,9 +3065,19 @@ impl Viewer {
         range: Option<(f64, f64)>,
         whole: bool,
     ) -> Result<Histogram, ViewerError> {
-        if bins == 0 || bins > 1 << 16 {
-            return Err(verr(format!("{bins} bins: 1 to 65536")));
-        }
+        self.histogram_job(i, c, whole)?.run(bins, range)
+    }
+
+    /// What [`Viewer::histogram`] reads, as a job that runs without the viewer: on another
+    /// thread, while the viewer keeps drawing. Making it is quick (the view's box and
+    /// level); [`HistogramJob::run`] reads and counts (a whole plate in view reads every
+    /// field of it).
+    pub fn histogram_job(
+        &self,
+        i: usize,
+        c: usize,
+        whole: bool,
+    ) -> Result<HistogramJob, ViewerError> {
         let l = self.layer(i)?;
         if c >= l.channels.len() {
             return Err(verr(format!(
@@ -3074,54 +3085,27 @@ impl Viewer {
                 l.channels.len()
             )));
         }
-        let (values, level) = self.channel_values(l, c, whole)?;
-        let (lo, hi) = match range {
-            Some((a, b)) if a.is_finite() && b.is_finite() && a < b => (a, b),
-            Some((a, b)) => return Err(verr(format!("a histogram over {a} .. {b}"))),
-            None => {
-                let lo = values.iter().copied().fold(f64::MAX, f64::min);
-                let hi = values.iter().copied().fold(f64::MIN, f64::max);
-                if lo > hi {
-                    (0.0, 1.0)
-                } else if lo == hi {
-                    (lo - 0.5, hi + 0.5)
-                } else {
-                    (lo, hi)
-                }
-            }
-        };
-        let mut counts = vec![0u64; bins];
-        let k = bins as f64 / (hi - lo);
-        for v in values {
-            if v < lo || v > hi {
-                continue;
-            }
-            let b = (((v - lo) * k) as usize).min(bins - 1);
-            counts[b] += 1;
-        }
-        Ok(Histogram {
-            counts,
-            lo,
-            hi,
-            level,
-        })
+        self.channel_values(l, c, whole)
     }
 
-    /// Channel `c`'s finite values for a histogram (see [`Viewer::histogram`]) and the
-    /// level they come from.
+    /// Channel `c`'s values for a histogram (see [`Viewer::histogram`]): the region to read
+    /// and its level, or (a volume cut at an angle) the voxels next to the plane.
     fn channel_values(
         &self,
         l: &Layer,
         c: usize,
         whole: bool,
-    ) -> Result<(Vec<f64>, usize), ViewerError> {
+    ) -> Result<HistogramJob, ViewerError> {
         let nl = l.source.levels.len();
         let texel = l.source.texel;
-        let finite = |data: Vec<u8>| -> Vec<f64> {
-            (0..data.len() / texel.bytes())
-                .map(|k| texel.value(&data, k))
-                .filter(|v| v.is_finite())
-                .collect()
+        let read = |level: usize, start: Vec<u64>, stop: Vec<u64>| HistogramJob {
+            values: JobValues::Read {
+                array: l.source.array(level),
+                start,
+                stop,
+                texel,
+            },
+            level,
         };
         if whole {
             let size = |lv: &Level| lv.width * lv.height * if l.is_volume() { lv.depth } else { 1 };
@@ -3129,18 +3113,15 @@ impl Viewer {
                 .find(|&k| size(&l.source.levels[k]) <= 1 << 22)
                 .unwrap_or(nl - 1);
             let lv = &l.source.levels[level];
-            let data = if l.is_volume() {
+            let (start, stop) = if l.is_volume() {
                 let (lead, _) = l.source.lead(level, &l.position);
-                let (start, stop) =
-                    l.source
-                        .region3(&lead, c, (0, lv.depth), (0, lv.height), (0, lv.width));
-                l.source.read(level, &start, &stop)?
+                l.source
+                    .region3(&lead, c, (0, lv.depth), (0, lv.height), (0, lv.width))
             } else {
                 let (plane, _) = l.source.plane(level, &l.position);
-                let (start, stop) = l.source.region(&plane, c, 0, 0, lv.height, lv.width);
-                l.source.read(level, &start, &stop)?
+                l.source.region(&plane, c, 0, 0, lv.height, lv.width)
             };
-            return Ok((finite(data), level));
+            return Ok(read(level, start, stop));
         }
         // what is in view: the same boxes as for the contrast from the view
         let (tw, th) = self.gpu.size();
@@ -3152,7 +3133,10 @@ impl Viewer {
                 level = lv;
                 values.push(v)
             })?;
-            return Ok((values, level));
+            return Ok(HistogramJob {
+                values: JobValues::Ready(values),
+                level,
+            });
         }
         let mut pick = None;
         for lv in 0..nl {
@@ -3174,7 +3158,7 @@ impl Viewer {
         let (lv, ty, tx, h, w) = pick.ok_or_else(|| verr("the image has no levels"))?;
         let (plane_idx, _) = l.source.plane(lv, &l.position);
         let (start, stop) = l.source.region(&plane_idx, c, ty, tx, h, w);
-        Ok((finite(l.source.read(lv, &start, &stop)?), lv))
+        Ok(read(lv, start, stop))
     }
 
     /// What lies under screen point (`x`, `y`): the world point, and per layer the
@@ -3334,6 +3318,92 @@ pub struct Histogram {
     pub lo: f64,
     pub hi: f64,
     pub level: usize,
+}
+
+/// A histogram's values to gather, apart from the viewer (see [`Viewer::histogram_job`]):
+/// it holds the level's array, so it runs on any thread while the viewer draws.
+pub struct HistogramJob {
+    values: JobValues,
+    /// The level the values come from.
+    pub level: usize,
+}
+
+enum JobValues {
+    /// A region of a level, read when the job runs.
+    Read {
+        array: dyna_zarr_arrays::SourceRef,
+        start: Vec<u64>,
+        stop: Vec<u64>,
+        texel: Texel,
+    },
+    /// Values gathered already (the voxels next to a plane through a volume).
+    Ready(Vec<f64>),
+}
+
+impl HistogramJob {
+    /// Read (on several threads) and count: `bins` equal bins over `range` (default: the
+    /// values' lowest to highest; see [`Viewer::histogram`]).
+    pub fn run(&self, bins: usize, range: Option<(f64, f64)>) -> Result<Histogram, ViewerError> {
+        if bins == 0 || bins > 1 << 16 {
+            return Err(verr(format!("{bins} bins: 1 to 65536")));
+        }
+        if let Some((a, b)) = range {
+            if !(a.is_finite() && b.is_finite() && a < b) {
+                return Err(verr(format!("a histogram over {a} .. {b}")));
+            }
+        }
+        let read;
+        let values: &[f64] = match &self.values {
+            JobValues::Ready(v) => v,
+            JobValues::Read {
+                array,
+                start,
+                stop,
+                texel,
+            } => {
+                let data = source::read_region_threads(
+                    array.as_ref(),
+                    start,
+                    stop,
+                    source::direct_threads(),
+                )?;
+                read = (0..data.len() / texel.bytes())
+                    .map(|k| texel.value(&data, k))
+                    .filter(|v| v.is_finite())
+                    .collect::<Vec<f64>>();
+                &read
+            }
+        };
+        let (lo, hi) = match range {
+            Some(r) => r,
+            None => {
+                let lo = values.iter().copied().fold(f64::MAX, f64::min);
+                let hi = values.iter().copied().fold(f64::MIN, f64::max);
+                if lo > hi {
+                    (0.0, 1.0)
+                } else if lo == hi {
+                    (lo - 0.5, hi + 0.5)
+                } else {
+                    (lo, hi)
+                }
+            }
+        };
+        let mut counts = vec![0u64; bins];
+        let k = bins as f64 / (hi - lo);
+        for &v in values {
+            if v < lo || v > hi {
+                continue;
+            }
+            let b = (((v - lo) * k) as usize).min(bins - 1);
+            counts[b] += 1;
+        }
+        Ok(Histogram {
+            counts,
+            lo,
+            hi,
+            level: self.level,
+        })
+    }
 }
 
 /// The voxels of channel `c` within half a voxel of a volume's plane (in the box the view

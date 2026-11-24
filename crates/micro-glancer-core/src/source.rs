@@ -1218,19 +1218,46 @@ impl Source {
         self.levels[level].array.clone()
     }
 
-    /// The bytes of `start .. stop` of level `level` (texels, native byte order).
+    /// The bytes of `start .. stop` of level `level` (texels, native byte order), read on
+    /// [`direct_threads`] threads: the reads made outside the tile loader (contrast,
+    /// histograms) cover a whole view at once, and a plate spreads them over its wells.
     pub fn read(&self, level: usize, start: &[u64], stop: &[u64]) -> Result<Vec<u8>, ViewerError> {
-        read_region(self.levels[level].array.as_ref(), start, stop)
+        read_region_threads(
+            self.levels[level].array.as_ref(),
+            start,
+            stop,
+            direct_threads(),
+        )
     }
 }
 
-/// A region of an array as bytes, on this thread.
+/// The threads of a read made outside the tile loader: the machine's threads, 2 to 8 (as
+/// the loader's workers).
+pub fn direct_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 8)
+}
+
+/// A region of an array as bytes, on this thread (the tile loader's reads: each worker
+/// reads one tile).
 pub fn read_region(
     array: &dyn dyna_zarr_arrays::Source,
     start: &[u64],
     stop: &[u64],
 ) -> Result<Vec<u8>, ViewerError> {
     read(array, start, stop, 1).map_err(err)
+}
+
+/// A region of an array as bytes, on up to `threads` threads.
+pub fn read_region_threads(
+    array: &dyn dyna_zarr_arrays::Source,
+    start: &[u64],
+    stop: &[u64],
+    threads: usize,
+) -> Result<Vec<u8>, ViewerError> {
+    read(array, start, stop, threads.max(1)).map_err(err)
 }
 
 /// The lowest and highest finite value of `data` (native byte order) of `dtype` (one of

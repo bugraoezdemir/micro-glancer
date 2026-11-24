@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use dyna_zarr_arrays::pool::{piece_plan, pieces};
 use dyna_zarr_arrays::{region, DType, Out, ReadError, Source, SourceRef};
 use dyna_zarr_transforms::Matrix;
 use ome_zarr_pyramid::{Image, Location};
@@ -31,6 +32,54 @@ pub struct MosaicArray {
     shape: Vec<u64>,
     dtype: DType,
     pieces: Vec<(SourceRef, [u64; 2])>,
+    /// Each piece's group: pieces that overlap (directly or through others) share one, so
+    /// a read keeps their drawing order inside a group and reads the groups on several
+    /// threads (their regions of the destination are disjoint).
+    groups: Vec<usize>,
+}
+
+/// The overlap groups of boxes `(y0, x0, y1, x1)` (end exclusive): each box's group
+/// index, the groups numbered from 0 in the order their first box comes.
+fn overlap_groups(boxes: &[[u64; 4]]) -> Vec<usize> {
+    let n = boxes.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    // a sweep down y: each box is compared with the boxes still open at its top edge
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| boxes[i][0]);
+    let mut open: Vec<usize> = Vec::new();
+    for &i in &order {
+        let b = boxes[i];
+        open.retain(|&j| boxes[j][2] > b[0]);
+        for &j in &open {
+            let o = boxes[j];
+            if o[1] < b[3] && b[1] < o[3] {
+                let (ri, rj) = (root(&mut parent, i), root(&mut parent, j));
+                if ri != rj {
+                    parent[ri.max(rj)] = ri.min(rj);
+                }
+            }
+        }
+        open.push(i);
+    }
+    let mut number = vec![usize::MAX; n];
+    let mut next = 0;
+    (0..n)
+        .map(|i| {
+            let r = root(&mut parent, i);
+            if number[r] == usize::MAX {
+                number[r] = next;
+                next += 1;
+            }
+            number[r]
+        })
+        .collect()
 }
 
 impl MosaicArray {
@@ -50,23 +99,36 @@ impl MosaicArray {
             sy = sy.max(at[0] + s[n - 2]);
             sx = sx.max(at[1] + s[n - 1]);
         }
+        let boxes: Vec<[u64; 4]> = pieces
+            .iter()
+            .map(|(a, at)| {
+                let s = a.shape();
+                [at[0], at[1], at[0] + s[n - 2], at[1] + s[n - 1]]
+            })
+            .collect();
+        let groups = overlap_groups(&boxes);
         let mut shape = lead;
         shape.extend([sy, sx]);
         Self {
             shape,
             dtype,
             pieces,
+            groups,
         }
     }
 
     /// The pieces a read of `start .. stop` touches: (array, its start, its stop, where
-    /// its region lands in the destination), in the order they are drawn.
+    /// its region lands in the destination, its group), in the order they are drawn.
     #[allow(clippy::type_complexity)]
-    fn jobs(&self, start: &[u64], stop: &[u64]) -> Vec<(&SourceRef, Vec<u64>, Vec<u64>, Vec<u64>)> {
+    fn jobs(
+        &self,
+        start: &[u64],
+        stop: &[u64],
+    ) -> Vec<(&SourceRef, Vec<u64>, Vec<u64>, Vec<u64>, usize)> {
         let n = self.shape.len();
         let (y, x) = (n - 2, n - 1);
         let mut jobs = Vec::new();
-        for (a, at) in &self.pieces {
+        for (k, (a, at)) in self.pieces.iter().enumerate() {
             let shape = a.shape();
             let origin = |k: usize| match k {
                 _ if k == y => at[0],
@@ -90,10 +152,30 @@ impl MosaicArray {
                 put[k] = lo - start[k];
             }
             if !empty {
-                jobs.push((a, s, e, put));
+                jobs.push((a, s, e, put, self.groups[k]));
             }
         }
         jobs
+    }
+}
+
+impl MosaicArray {
+    /// `jobs` by group, in the order each group first comes; inside a group in drawing
+    /// order.
+    #[allow(clippy::type_complexity)]
+    fn grouped(
+        jobs: Vec<(&SourceRef, Vec<u64>, Vec<u64>, Vec<u64>, usize)>,
+    ) -> Vec<Vec<(&SourceRef, Vec<u64>, Vec<u64>, Vec<u64>, usize)>> {
+        let mut index = std::collections::HashMap::new();
+        let mut groups: Vec<Vec<_>> = Vec::new();
+        for job in jobs {
+            let k = *index.entry(job.4).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[k].push(job);
+        }
+        groups
     }
 }
 
@@ -121,19 +203,34 @@ impl Source for MosaicArray {
                 out.dtype().name()
             )));
         }
-        for (a, s, e, at) in self.jobs(start, stop) {
-            a.read_into(&s, &e, &out.moved(at), threads)?;
-        }
-        Ok(())
+        // overlap groups on several threads, at most `threads` at once; inside a group
+        // its pieces in drawing order (the later one shows where they overlap). A whole
+        // plate in view is thousands of small reads (10,640 fields of a 384-well plate),
+        // so one after another was the slow part.
+        let groups = Self::grouped(self.jobs(start, stop));
+        pieces(groups.len(), threads, |g, each| {
+            for (a, s, e, at, _) in &groups[g] {
+                a.read_into(s, e, &out.moved(at.clone()), each)?;
+            }
+            Ok(())
+        })
     }
 
     fn cost(&self, start: &[u64], stop: &[u64], threads: usize) -> Result<u64, ReadError> {
         region(&self.shape, start, stop)?;
-        let mut total = 0u64;
-        for (a, s, e, _) in self.jobs(start, stop) {
-            total = total.saturating_add(a.cost(&s, &e, threads)?);
+        let groups = Self::grouped(self.jobs(start, stop));
+        let (open, each) = piece_plan(groups.len(), threads);
+        let mut costs = Vec::with_capacity(groups.len());
+        for g in &groups {
+            let mut total = 0u64;
+            for (a, s, e, _, _) in g {
+                total = total.saturating_add(a.cost(s, e, each)?);
+            }
+            costs.push(total);
         }
-        Ok(total)
+        // the `open` most costly groups at once
+        costs.sort_unstable_by(|x, y| y.cmp(x));
+        Ok(costs.iter().take(open).sum())
     }
 }
 
@@ -415,6 +512,77 @@ mod tests {
         }
         fn cost(&self, _: &[u64], _: &[u64], _: usize) -> Result<u64, ReadError> {
             Ok(1)
+        }
+    }
+
+    #[test]
+    fn overlapping_boxes_share_a_group() {
+        // a chain a-b-c (a and c apart, both touching b), d alone, e overlapping a
+        let boxes = [
+            [0, 0, 10, 10],   // a
+            [5, 8, 15, 20],   // b: overlaps a
+            [12, 18, 20, 30], // c: overlaps b only
+            [40, 40, 50, 50], // d: alone
+            [9, 9, 11, 11],   // e: overlaps a
+            [10, 0, 20, 8],   // f: touches a's edge only (end exclusive)
+        ];
+        let g = overlap_groups(&boxes);
+        assert_eq!(g[0], g[1]);
+        assert_eq!(g[1], g[2]);
+        assert_eq!(g[0], g[4]);
+        assert_ne!(g[0], g[3]);
+        assert_ne!(g[0], g[5]);
+        assert_ne!(g[3], g[5]);
+        // numbered in the order each group first comes
+        assert_eq!((g[0], g[3], g[5]), (0, 1, 2));
+    }
+
+    /// A piece that records when it is read (no pixels: the order is what counts).
+    struct Logged(Vec<u64>, usize, Arc<std::sync::Mutex<Vec<usize>>>);
+
+    impl Source for Logged {
+        fn shape(&self) -> &[u64] {
+            &self.0
+        }
+        fn dtype(&self) -> DType {
+            DType::UInt16
+        }
+        fn read_into(&self, _: &[u64], _: &[u64], _: &Out, _: usize) -> Result<(), ReadError> {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            self.2.lock().unwrap().push(self.1);
+            Ok(())
+        }
+        fn cost(&self, _: &[u64], _: &[u64], _: usize) -> Result<u64, ReadError> {
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn a_read_on_several_threads_keeps_the_drawing_order_where_pieces_overlap() {
+        // 8 wells apart, each of 3 pieces that overlap one after another
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut pieces: Vec<(SourceRef, [u64; 2])> = Vec::new();
+        for w in 0..8u64 {
+            for f in 0..3u64 {
+                let id = (w * 3 + f) as usize;
+                let a: SourceRef = Arc::new(Logged(vec![1, 10, 10], id, log.clone()));
+                pieces.push((a, [0, w * 100 + f * 5]));
+            }
+        }
+        let m = MosaicArray::new(pieces, vec![1], [0, 0], DType::UInt16);
+        let mut buf = vec![0u8; m.shape().iter().product::<u64>() as usize * 2];
+        let shape = m.shape().to_vec();
+        let out = Out::new(&mut buf, &shape, &[0, 0, 0], DType::UInt16).unwrap();
+        m.read_into(&[0, 0, 0], &shape, &out, 8).unwrap();
+        let order = log.lock().unwrap().clone();
+        assert_eq!(order.len(), 24);
+        for w in 0..8 {
+            let mine: Vec<usize> = order.iter().copied().filter(|&i| i / 3 == w).collect();
+            assert_eq!(
+                mine,
+                vec![w * 3, w * 3 + 1, w * 3 + 2],
+                "well {w}: {order:?}"
+            );
         }
     }
 
