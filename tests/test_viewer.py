@@ -560,3 +560,32 @@ def test_the_qt_widget_opens_in_the_background(qapp, stores):
         time.sleep(0.005)
     assert len(errors) == 1 and errors[0] is not None
     w.close()
+
+
+def test_a_viewer_dropped_on_another_thread_is_handed_back():
+    # Python's cycle collector can free a Qt window (and its viewer) on any thread that
+    # happens to allocate (zarr's event loop, CI 2026-11-24): no error then; the viewer's
+    # own thread frees it the next time it uses a viewer. Used on another thread: refused.
+    import threading
+
+    from micro_glancer._core import PanicException
+
+    held = [Viewer.offscreen(64, 64)]
+    t = threading.Thread(target=held.clear)               # the last reference goes there
+    t.start()
+    t.join()
+    w = Viewer.offscreen(64, 64)                           # frees what came back
+    w.fit()
+    caught = []
+
+    def use():
+        try:
+            w.fit()
+        except BaseException as exc:  # noqa: BLE001 (a PanicException is a BaseException)
+            caught.append(exc)
+
+    t = threading.Thread(target=use)
+    t.start()
+    t.join()
+    assert len(caught) == 1 and isinstance(caught[0], PanicException)
+    assert "another thread" in str(caught[0])

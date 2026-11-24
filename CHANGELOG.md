@@ -32,10 +32,17 @@
 - `micro_glancer.warm_up(software=False, background=False)`: loads the GPU driver and
   makes a device once, so the first viewer need not wait for it.
 
-Background work runs on the core's own threads, never on Python threads, so Python's
-cycle collector stays on the window's thread (on another thread it could drop a widget
-and its viewer, which belongs to the window's thread). CI fails on such an error
-(`PytestUnraisableExceptionWarning` as an error).
+### Fixed
+- **A viewer freed on another thread** no longer raises "Viewer is unsendable, but is
+  being dropped on another thread" (an error Python cannot raise, printed instead) and is
+  no longer leaked. Python frees objects in reference cycles, such as Qt windows, from
+  whichever thread its cycle collector runs on, for example zarr's event-loop thread. Such
+  a viewer is now handed back to its own thread, which frees it the next time it uses a
+  viewer. A viewer drawing into a native window is let go without freeing, because its
+  window may already be gone. Using a viewer on another thread than the one that made it
+  raises a `PanicException`, as before. Background work runs on the core's own threads,
+  never on Python threads. CI fails on such errors (`PytestUnraisableExceptionWarning` as
+  an error).
 
 ## 0.0.1 (2026-11-24)
 

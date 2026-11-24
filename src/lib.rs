@@ -130,11 +130,117 @@ fn channel_list<'py>(
     Ok(out)
 }
 
+/// A core viewer that belongs to the thread that made it, and may be dropped on any.
+///
+/// Python frees objects caught in reference cycles from whichever thread its cycle
+/// collector runs on (a library's event-loop thread, for one), so a Qt window's viewer can
+/// be dropped far from the window's thread. pyo3's `unsendable` would then refuse and leak
+/// it with an error Python cannot raise. Here every use on another thread panics (Python
+/// sees a PanicException), and a drop on another thread hands the viewer back: an
+/// off-screen one is freed by its own thread the next time that thread uses any viewer; one
+/// drawing into a native window is let go without freeing (its window may be gone by
+/// then, and a surface must not outlive its window).
+struct Owned {
+    viewer: std::mem::ManuallyDrop<core::Viewer>,
+    owner: std::thread::ThreadId,
+    native: bool,
+}
+
+/// Viewers dropped on another thread than their own, waiting for it: (owner, viewer).
+struct Grave {
+    owner: std::thread::ThreadId,
+    /// held only to be dropped by its owner
+    _viewer: core::Viewer,
+}
+// SAFETY: a grave's viewer is only moved here, never used; it is dropped by its owner
+unsafe impl Send for Grave {}
+
+static GRAVES: Mutex<Vec<Grave>> = Mutex::new(Vec::new());
+static BURIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Owned {
+    fn new(viewer: core::Viewer, native: bool) -> Self {
+        bury_mine();
+        Self {
+            viewer: std::mem::ManuallyDrop::new(viewer),
+            owner: std::thread::current().id(),
+            native,
+        }
+    }
+
+    fn check(&self) {
+        if std::thread::current().id() != self.owner {
+            panic!("a micro-glancer viewer is used on another thread than the one that made it");
+        }
+        bury_mine();
+    }
+}
+
+/// Free the viewers this thread owns that were dropped on other threads.
+fn bury_mine() {
+    if BURIED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let me = std::thread::current().id();
+    let mine: Vec<Grave> = match GRAVES.lock() {
+        Ok(mut graves) => {
+            let (mine, rest): (Vec<Grave>, Vec<Grave>) =
+                graves.drain(..).partition(|g| g.owner == me);
+            *graves = rest;
+            BURIED.store(graves.len(), Ordering::Relaxed);
+            mine
+        }
+        Err(_) => return,
+    };
+    drop(mine);
+}
+
+impl std::ops::Deref for Owned {
+    type Target = core::Viewer;
+    fn deref(&self) -> &core::Viewer {
+        self.check();
+        &self.viewer
+    }
+}
+
+impl std::ops::DerefMut for Owned {
+    fn deref_mut(&mut self) -> &mut core::Viewer {
+        self.check();
+        &mut self.viewer
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        // SAFETY: taken once, here; `viewer` is not used after
+        let viewer = unsafe { std::mem::ManuallyDrop::take(&mut self.viewer) };
+        if std::thread::current().id() == self.owner {
+            drop(viewer);
+            bury_mine();
+        } else if self.native {
+            std::mem::forget(viewer);
+        } else if let Ok(mut graves) = GRAVES.lock() {
+            graves.push(Grave {
+                owner: self.owner,
+                _viewer: viewer,
+            });
+            BURIED.store(graves.len(), Ordering::Relaxed);
+        } else {
+            std::mem::forget(viewer);
+        }
+    }
+}
+
+// SAFETY: the viewer is used only on its own thread (`check` panics otherwise) and dropped
+// there, or handed back to it (see `Owned`)
+unsafe impl Send for Owned {}
+unsafe impl Sync for Owned {}
+
 /// A viewer: one GPU target, its layers (images, each with channels, plane and
-/// transform) and a camera.
-#[pyclass(unsendable, module = "micro_glancer._core")]
+/// transform) and a camera. It belongs to the thread that made it.
+#[pyclass(module = "micro_glancer._core")]
 pub struct Viewer {
-    inner: core::Viewer,
+    inner: Owned,
 }
 
 #[pymethods]
@@ -163,7 +269,9 @@ impl Viewer {
         // SAFETY: the Qt widget that owns the window owns this viewer and drops it first
         let inner =
             unsafe { core::Viewer::for_window(d, w, width, height, options) }.map_err(err)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: Owned::new(inner, true),
+        })
     }
 
     /// A viewer drawing off-screen; frames come back from `render_into` / `render_rgba`.
@@ -176,7 +284,10 @@ impl Viewer {
             atlas_mib,
         };
         Ok(Self {
-            inner: core::Viewer::offscreen(width, height, options).map_err(err)?,
+            inner: Owned::new(
+                core::Viewer::offscreen(width, height, options).map_err(err)?,
+                false,
+            ),
         })
     }
 
