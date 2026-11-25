@@ -273,6 +273,47 @@ pub struct Level {
     pub depth: u64,
     /// Per axis: index to world scale and translation (used for the axes before y, x).
     lead: Vec<(f64, f64)>,
+    /// What the store decodes at once (a sharded array's inner chunk, else its chunk),
+    /// when the level is a plain Zarr array in a folder; None for mosaics, plates and
+    /// zips (their tiles are read from blocks in their plane).
+    pub unit: Option<Vec<u64>>,
+}
+
+impl Level {
+    /// Bytes per element of the level's array.
+    pub fn item(&self) -> u64 {
+        self.array.dtype().size() as u64
+    }
+}
+
+/// The decode unit of the Zarr array at `location` with `n` axes (see [`Level::unit`]):
+/// the inner chunk of a sharding codec, else the chunk grid (v3) or `chunks` (v2).
+fn decode_unit(location: &Location, n: usize) -> Option<Vec<u64>> {
+    let Location::Folder(path) = location else {
+        return None;
+    };
+    let as_shape = |v: &serde_json::Value| -> Option<Vec<u64>> {
+        let s: Vec<u64> = v.as_array()?.iter().filter_map(|x| x.as_u64()).collect();
+        (s.len() == n && !s.contains(&0)).then_some(s)
+    };
+    if let Ok(text) = std::fs::read(path.join("zarr.json")) {
+        let doc: serde_json::Value = serde_json::from_slice(&text).ok()?;
+        if let Some(codecs) = doc.get("codecs").and_then(|c| c.as_array()) {
+            for c in codecs {
+                if c.get("name").and_then(|n| n.as_str()) == Some("sharding_indexed") {
+                    return as_shape(c.get("configuration")?.get("chunk_shape")?);
+                }
+            }
+        }
+        return as_shape(
+            doc.get("chunk_grid")?
+                .get("configuration")?
+                .get("chunk_shape")?,
+        );
+    }
+    let text = std::fs::read(path.join(".zarray")).ok()?;
+    let doc: serde_json::Value = serde_json::from_slice(&text).ok()?;
+    as_shape(doc.get("chunks")?)
 }
 
 /// A channel as the image describes it (omero), or as defaults give it.
@@ -511,13 +552,31 @@ impl Source {
     /// As [`Source::open`]; a plate shows field `field` of every well ([`ALL_FIELDS`]:
     /// every field).
     pub fn open_field(path: &Path, field: usize) -> Result<Self, ViewerError> {
+        Self::open_counted(path, field, &Progress::default())
+    }
+
+    /// As [`Source::open_field`], counting in `progress` the images opened (a plate's
+    /// fields, a group's members; one for an image).
+    pub fn open_counted(
+        path: &Path,
+        field: usize,
+        progress: &Progress,
+    ) -> Result<Self, ViewerError> {
         let location = locate(path);
         if let Some(info) = PlateInfo::read(&location) {
-            return Self::open_plate(location, info, field);
+            return Self::open_plate(location, info, field, progress);
         }
         if let Some(members) = group_members(&location) {
-            return Self::open_group(location, members);
+            return Self::open_group(location, members, progress);
         }
+        progress.start(1);
+        let opened = Self::open_image(location);
+        progress.tick();
+        opened
+    }
+
+    /// One image (not a plate or a group).
+    fn open_image(location: Location) -> Result<Self, ViewerError> {
         let image = Image::at(location.clone()).map_err(err)?;
         let label = image.image_label.is_some();
         let mut signed = false;
@@ -632,6 +691,7 @@ impl Source {
                 to_world,
                 to_index,
                 lead: (0..n).map(|a| (m.get(a, a), m.get(a, n))).collect(),
+                unit: decode_unit(&location.child(&lv.path), n),
             });
         }
         let texel = texel.ok_or_else(|| err("the image has no levels"))?;
@@ -744,6 +804,7 @@ impl Source {
             to_world,
             to_index,
             lead,
+            unit: None,
         })
     }
 
@@ -751,10 +812,17 @@ impl Source {
     /// collection) as one image, each at its position (see `mosaic.rs`); the first that
     /// opens sets the axes, channels and type. Coarser levels than the members have are
     /// added (the last level averaged by 2, 4, ...) until it fits about 2048 pixels.
-    fn open_group(location: Location, members: Vec<(String, String)>) -> Result<Self, ViewerError> {
+    fn open_group(
+        location: Location,
+        members: Vec<(String, String)>,
+        progress: &Progress,
+    ) -> Result<Self, ViewerError> {
         let scene = Scene::read(&location);
+        progress.start(members.len());
         let opened: Vec<Result<Member, String>> = par_map(&members, |(rel, name)| {
-            open_member(&location, scene.as_ref(), rel, name)
+            let m = open_member(&location, scene.as_ref(), rel, name);
+            progress.tick();
+            m
         });
         let mut skipped = Vec::new();
         let mut ok = Vec::new();
@@ -870,7 +938,12 @@ impl Source {
     /// the well ([`ALL_FIELDS`]: every field at its position, see `mosaic.rs`), the wells
     /// on a grid. The first field that opens sets the axes, channels and type; fields of
     /// other axes, pixel sizes or channels, or that cannot be read, are left out (named).
-    fn open_plate(location: Location, info: PlateInfo, field: usize) -> Result<Self, ViewerError> {
+    fn open_plate(
+        location: Location,
+        info: PlateInfo,
+        field: usize,
+        progress: &Progress,
+    ) -> Result<Self, ViewerError> {
         let all = field == ALL_FIELDS;
         let picks: Vec<(usize, usize)> = info
             .wells
@@ -902,14 +975,17 @@ impl Source {
                 None
             }
         });
+        progress.start(picks.len());
         let opened: Vec<Result<Member, String>> = par_map(&picks, |&(wi, k)| {
             let w = &info.wells[wi];
-            open_member(
+            let m = open_member(
                 &location.child(&w.path),
                 scenes[wi].as_ref(),
                 &w.fields[k],
                 &format!("{} field {}", w.name, w.fields[k]),
-            )
+            );
+            progress.tick();
+            m
         });
         let mut skipped = Vec::new();
         let mut ok = Vec::new();
@@ -1218,19 +1294,75 @@ impl Source {
         self.levels[level].array.clone()
     }
 
-    /// The bytes of `start .. stop` of level `level` (texels, native byte order).
+    /// The bytes of `start .. stop` of level `level` (texels, native byte order), read on
+    /// [`direct_threads`] threads: the reads made outside the tile loader (contrast,
+    /// histograms) cover a whole view at once, and a plate spreads them over its wells.
     pub fn read(&self, level: usize, start: &[u64], stop: &[u64]) -> Result<Vec<u8>, ViewerError> {
-        read_region(self.levels[level].array.as_ref(), start, stop)
+        read_region_threads(
+            self.levels[level].array.as_ref(),
+            start,
+            stop,
+            direct_threads(),
+        )
     }
 }
 
-/// A region of an array as bytes, on this thread.
+/// The threads of a read made outside the tile loader: the machine's threads, 2 to 8 (as
+/// the loader's workers).
+pub fn direct_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 8)
+}
+
+/// How far an open has got: the images to open (a plate's fields, a group's members) and
+/// those opened so far. Shared between the thread that opens and one that shows progress.
+#[derive(Debug, Default)]
+pub struct Progress {
+    total: std::sync::atomic::AtomicUsize,
+    done: std::sync::atomic::AtomicUsize,
+}
+
+impl Progress {
+    fn start(&self, total: usize) {
+        use std::sync::atomic::Ordering;
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    fn tick(&self) {
+        self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// (opened, to open); (0, 0) before the images are known.
+    pub fn get(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering;
+        (
+            self.done.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// A region of an array as bytes, on this thread (the tile loader's reads: each worker
+/// reads one tile).
 pub fn read_region(
     array: &dyn dyna_zarr_arrays::Source,
     start: &[u64],
     stop: &[u64],
 ) -> Result<Vec<u8>, ViewerError> {
     read(array, start, stop, 1).map_err(err)
+}
+
+/// A region of an array as bytes, on up to `threads` threads.
+pub fn read_region_threads(
+    array: &dyn dyna_zarr_arrays::Source,
+    start: &[u64],
+    stop: &[u64],
+    threads: usize,
+) -> Result<Vec<u8>, ViewerError> {
+    read(array, start, stop, threads.max(1)).map_err(err)
 }
 
 /// The lowest and highest finite value of `data` (native byte order) of `dtype` (one of

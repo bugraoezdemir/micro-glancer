@@ -3,6 +3,8 @@
 //! itself is Python (`micro_glancer.qt`).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use micro_glancer_core as core;
@@ -128,11 +130,117 @@ fn channel_list<'py>(
     Ok(out)
 }
 
+/// A core viewer that belongs to the thread that made it, and may be dropped on any.
+///
+/// Python frees objects caught in reference cycles from whichever thread its cycle
+/// collector runs on (a library's event-loop thread, for one), so a Qt window's viewer can
+/// be dropped far from the window's thread. pyo3's `unsendable` would then refuse and leak
+/// it with an error Python cannot raise. Here every use on another thread panics (Python
+/// sees a PanicException), and a drop on another thread hands the viewer back: an
+/// off-screen one is freed by its own thread the next time that thread uses any viewer; one
+/// drawing into a native window is let go without freeing (its window may be gone by
+/// then, and a surface must not outlive its window).
+struct Owned {
+    viewer: std::mem::ManuallyDrop<core::Viewer>,
+    owner: std::thread::ThreadId,
+    native: bool,
+}
+
+/// Viewers dropped on another thread than their own, waiting for it: (owner, viewer).
+struct Grave {
+    owner: std::thread::ThreadId,
+    /// held only to be dropped by its owner
+    _viewer: core::Viewer,
+}
+// SAFETY: a grave's viewer is only moved here, never used; it is dropped by its owner
+unsafe impl Send for Grave {}
+
+static GRAVES: Mutex<Vec<Grave>> = Mutex::new(Vec::new());
+static BURIED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Owned {
+    fn new(viewer: core::Viewer, native: bool) -> Self {
+        bury_mine();
+        Self {
+            viewer: std::mem::ManuallyDrop::new(viewer),
+            owner: std::thread::current().id(),
+            native,
+        }
+    }
+
+    fn check(&self) {
+        if std::thread::current().id() != self.owner {
+            panic!("a micro-glancer viewer is used on another thread than the one that made it");
+        }
+        bury_mine();
+    }
+}
+
+/// Free the viewers this thread owns that were dropped on other threads.
+fn bury_mine() {
+    if BURIED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let me = std::thread::current().id();
+    let mine: Vec<Grave> = match GRAVES.lock() {
+        Ok(mut graves) => {
+            let (mine, rest): (Vec<Grave>, Vec<Grave>) =
+                graves.drain(..).partition(|g| g.owner == me);
+            *graves = rest;
+            BURIED.store(graves.len(), Ordering::Relaxed);
+            mine
+        }
+        Err(_) => return,
+    };
+    drop(mine);
+}
+
+impl std::ops::Deref for Owned {
+    type Target = core::Viewer;
+    fn deref(&self) -> &core::Viewer {
+        self.check();
+        &self.viewer
+    }
+}
+
+impl std::ops::DerefMut for Owned {
+    fn deref_mut(&mut self) -> &mut core::Viewer {
+        self.check();
+        &mut self.viewer
+    }
+}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        // SAFETY: taken once, here; `viewer` is not used after
+        let viewer = unsafe { std::mem::ManuallyDrop::take(&mut self.viewer) };
+        if std::thread::current().id() == self.owner {
+            drop(viewer);
+            bury_mine();
+        } else if self.native {
+            std::mem::forget(viewer);
+        } else if let Ok(mut graves) = GRAVES.lock() {
+            graves.push(Grave {
+                owner: self.owner,
+                _viewer: viewer,
+            });
+            BURIED.store(graves.len(), Ordering::Relaxed);
+        } else {
+            std::mem::forget(viewer);
+        }
+    }
+}
+
+// SAFETY: the viewer is used only on its own thread (`check` panics otherwise) and dropped
+// there, or handed back to it (see `Owned`)
+unsafe impl Send for Owned {}
+unsafe impl Sync for Owned {}
+
 /// A viewer: one GPU target, its layers (images, each with channels, plane and
-/// transform) and a camera.
-#[pyclass(unsendable, module = "micro_glancer._core")]
+/// transform) and a camera. It belongs to the thread that made it.
+#[pyclass(module = "micro_glancer._core")]
 pub struct Viewer {
-    inner: core::Viewer,
+    inner: Owned,
 }
 
 #[pymethods]
@@ -161,7 +269,9 @@ impl Viewer {
         // SAFETY: the Qt widget that owns the window owns this viewer and drops it first
         let inner =
             unsafe { core::Viewer::for_window(d, w, width, height, options) }.map_err(err)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner: Owned::new(inner, true),
+        })
     }
 
     /// A viewer drawing off-screen; frames come back from `render_into` / `render_rgba`.
@@ -174,8 +284,26 @@ impl Viewer {
             atlas_mib,
         };
         Ok(Self {
-            inner: core::Viewer::offscreen(width, height, options).map_err(err)?,
+            inner: Owned::new(
+                core::Viewer::offscreen(width, height, options).map_err(err)?,
+                false,
+            ),
         })
+    }
+
+    /// Open what `job` (an :class:`OpenJob` that has run) read, as the only layer, and fit
+    /// it: quick, as the reading is done (see :class:`OpenJob`). The same as
+    /// :meth:`open` of its path.
+    fn open_job(&mut self, job: &OpenJob) -> PyResult<()> {
+        let opened = job.take()?;
+        self.inner.open_opened(opened).map_err(err)
+    }
+
+    /// Add what `job` read as a new layer on top, as :meth:`add` of its path; returns its
+    /// index.
+    fn add_job(&mut self, job: &OpenJob) -> PyResult<usize> {
+        let opened = job.take()?;
+        self.inner.add_opened(opened).map_err(err)
     }
 
     /// Open the OME-Zarr image at `path` (a folder, or .zip / .ozx) as the only layer
@@ -534,17 +662,34 @@ impl Viewer {
             .inner
             .histogram(i, channel, bins, range, whole)
             .map_err(err)?;
-        let d = PyDict::new(py);
-        let step = (h.hi - h.lo) / h.counts.len() as f64;
-        let edges: Vec<f64> = (0..=h.counts.len())
-            .map(|k| h.lo + k as f64 * step)
-            .collect();
-        d.set_item("counts", h.counts)?;
-        d.set_item("edges", edges)?;
-        d.set_item("lo", h.lo)?;
-        d.set_item("hi", h.hi)?;
-        d.set_item("level", h.level)?;
-        Ok(d)
+        histogram_dict(py, h)
+    }
+
+    /// The same histogram as :meth:`histogram`, as a job to run later, on any thread:
+    /// making it is quick (what to read: the view's box and level); its ``run()`` reads
+    /// and counts without Python's lock, while the viewer keeps drawing. A whole plate in
+    /// view reads every field of it, which takes a moment.
+    #[pyo3(signature = (channel = 0, *, bins = 256, range = None, whole = false, layer = None))]
+    fn histogram_job(
+        &self,
+        channel: usize,
+        bins: usize,
+        range: Option<(f64, f64)>,
+        whole: bool,
+        layer: Option<usize>,
+    ) -> PyResult<HistogramJob> {
+        if bins == 0 || bins > 1 << 16 {
+            return Err(ViewerError::new_err(format!("{bins} bins: 1 to 65536")));
+        }
+        let i = self.layer_index(layer)?;
+        let job = self.inner.histogram_job(i, channel, whole).map_err(err)?;
+        Ok(HistogramJob {
+            job: Arc::new(job),
+            bins,
+            range,
+            result: Arc::new(Mutex::new(None)),
+            started: AtomicBool::new(false),
+        })
     }
 
     /// Whether volume and isosurface projections are lit from their gradients.
@@ -1131,9 +1276,236 @@ fn field_out(field: usize) -> Option<usize> {
     (field != micro_glancer_core::ALL_FIELDS).then_some(field)
 }
 
+/// Opening an image in two steps, so the window need not wait: ``run()`` reads its
+/// metadata (a plate: every field's) and its channels' starting contrast, on any thread
+/// and without Python's lock, counting in ``progress`` the images opened; then
+/// :meth:`Viewer.open_job` (or :meth:`Viewer.add_job`) on the viewer's thread shows it.
+#[pyclass(frozen, module = "micro_glancer._core")]
+pub struct OpenJob {
+    path: PathBuf,
+    field: usize,
+    progress: Arc<core::Progress>,
+    result: Arc<Mutex<Option<Result<core::Opened, String>>>>,
+    started: AtomicBool,
+}
+
+impl OpenJob {
+    /// What the job read, once.
+    fn take(&self) -> PyResult<core::Opened> {
+        let mut slot = self
+            .result
+            .lock()
+            .map_err(|_| ViewerError::new_err("an open job's lock is poisoned"))?;
+        match slot.take() {
+            Some(Ok(opened)) => Ok(opened),
+            Some(Err(e)) => Err(ViewerError::new_err(e)),
+            None => Err(ViewerError::new_err(format!(
+                "{}: the open job has not run (or was shown already)",
+                self.path.display()
+            ))),
+        }
+    }
+
+    /// The reading (on whichever thread calls it).
+    fn read(&self) -> Result<core::Opened, String> {
+        core::Opened::open(&self.path, self.field, &self.progress).map_err(|e| e.to_string())
+    }
+}
+
+#[pymethods]
+impl OpenJob {
+    /// The image at `path` (a folder, or .zip / .ozx); a plate shows field `field` of
+    /// every well (None: every field at its position).
+    #[new]
+    #[pyo3(signature = (path, field = None))]
+    fn new(path: PathBuf, field: Option<usize>) -> Self {
+        Self {
+            path,
+            field: field.unwrap_or(core::ALL_FIELDS),
+            progress: Arc::new(core::Progress::default()),
+            result: Arc::new(Mutex::new(None)),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    /// Read here (without Python's lock): raises ViewerError when the image cannot be
+    /// opened (the viewer's ``open_job`` then raises it too).
+    fn run(&self, py: Python<'_>) -> PyResult<()> {
+        self.started.store(true, Ordering::SeqCst);
+        let read = py.detach(|| self.read());
+        let failed = read.as_ref().err().cloned();
+        *self
+            .result
+            .lock()
+            .map_err(|_| ViewerError::new_err("an open job's lock is poisoned"))? = Some(read);
+        match failed {
+            Some(e) => Err(ViewerError::new_err(e)),
+            None => Ok(()),
+        }
+    }
+
+    /// Read on a thread of its own (no Python runs there) and return at once; ``done``
+    /// tells when it has finished, ``progress`` how far it is.
+    fn start(&self) -> PyResult<()> {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return Err(ViewerError::new_err("the open job has started already"));
+        }
+        let (path, field) = (self.path.clone(), self.field);
+        let (progress, result) = (self.progress.clone(), self.result.clone());
+        std::thread::Builder::new()
+            .name("micro-glancer-open".into())
+            .spawn(move || {
+                let read = core::Opened::open(&path, field, &progress).map_err(|e| e.to_string());
+                if let Ok(mut slot) = result.lock() {
+                    *slot = Some(read);
+                }
+            })
+            .map_err(|e| ViewerError::new_err(format!("cannot start a thread: {e}")))?;
+        Ok(())
+    }
+
+    /// Whether the reading has finished (successfully or not).
+    #[getter]
+    fn done(&self) -> bool {
+        self.result.lock().map(|r| r.is_some()).unwrap_or(true)
+    }
+
+    /// The error of a finished reading, or None.
+    #[getter]
+    fn error(&self) -> Option<String> {
+        match self.result.lock().ok()?.as_ref()? {
+            Err(e) => Some(e.clone()),
+            Ok(_) => None,
+        }
+    }
+
+    /// (images opened, images to open): a plate's fields, a group's members, 1 for an
+    /// image; (0, 0) before they are known.
+    #[getter]
+    fn progress(&self) -> (usize, usize) {
+        self.progress.get()
+    }
+
+    /// The image's path.
+    #[getter]
+    fn path(&self) -> PathBuf {
+        self.path.clone()
+    }
+}
+
+/// Load the GPU driver and make a device once, without Python's lock (on any thread): the
+/// first viewer of a process otherwise takes about a second longer than the next ones.
+/// Returns the adapter's description.
+///
+/// With `background` true it runs on a thread of its own (no Python runs there) and
+/// returns None at once.
+#[pyfunction]
+#[pyo3(signature = (software = false, background = false))]
+fn warm_up(py: Python<'_>, software: bool, background: bool) -> PyResult<Option<String>> {
+    if background {
+        std::thread::Builder::new()
+            .name("micro-glancer-warm-up".into())
+            .spawn(move || {
+                let _ = core::Viewer::warm_up(software);
+            })
+            .map_err(|e| ViewerError::new_err(format!("cannot start a thread: {e}")))?;
+        return Ok(None);
+    }
+    py.detach(|| core::Viewer::warm_up(software).map_err(|e| e.to_string()))
+        .map(Some)
+        .map_err(ViewerError::new_err)
+}
+
+/// A histogram to read later (from :meth:`Viewer.histogram_job`): ``run()`` reads and
+/// counts on any thread, without Python's lock; the result is the same dict as
+/// :meth:`Viewer.histogram` gives.
+#[pyclass(frozen, module = "micro_glancer._core")]
+pub struct HistogramJob {
+    job: Arc<core::HistogramJob>,
+    bins: usize,
+    range: Option<(f64, f64)>,
+    result: Arc<Mutex<Option<Result<core::Histogram, String>>>>,
+    started: AtomicBool,
+}
+
+#[pymethods]
+impl HistogramJob {
+    /// Read and count here (without Python's lock): {"counts", "edges", "lo", "hi",
+    /// "level"}.
+    fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let (job, bins, range) = (&self.job, self.bins, self.range);
+        let h = py.detach(|| job.run(bins, range)).map_err(err)?;
+        histogram_dict(py, h)
+    }
+
+    /// Read and count on a thread of its own (no Python runs there) and return at once;
+    /// ``done`` tells when it has finished, ``result()`` gives the histogram.
+    fn start(&self) -> PyResult<()> {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return Err(ViewerError::new_err(
+                "the histogram job has started already",
+            ));
+        }
+        let (job, bins, range, result) =
+            (self.job.clone(), self.bins, self.range, self.result.clone());
+        std::thread::Builder::new()
+            .name("micro-glancer-histogram".into())
+            .spawn(move || {
+                let h = job.run(bins, range).map_err(|e| e.to_string());
+                if let Ok(mut slot) = result.lock() {
+                    *slot = Some(h);
+                }
+            })
+            .map_err(|e| ViewerError::new_err(format!("cannot start a thread: {e}")))?;
+        Ok(())
+    }
+
+    /// Whether a started job has finished.
+    #[getter]
+    fn done(&self) -> bool {
+        self.result.lock().map(|r| r.is_some()).unwrap_or(true)
+    }
+
+    /// A finished started job's histogram (the dict :meth:`run` gives); raises
+    /// ViewerError when it failed or has not finished.
+    fn result<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let slot = self
+            .result
+            .lock()
+            .map_err(|_| ViewerError::new_err("a histogram job's lock is poisoned"))?;
+        match slot.as_ref() {
+            Some(Ok(h)) => histogram_dict(py, h.clone()),
+            Some(Err(e)) => Err(ViewerError::new_err(e.clone())),
+            None => Err(ViewerError::new_err("the histogram job has not finished")),
+        }
+    }
+
+    /// The level the values come from.
+    #[getter]
+    fn level(&self) -> usize {
+        self.job.level
+    }
+}
+
+/// A histogram as Python sees it: {"counts", "edges" (bins + 1), "lo", "hi", "level"}.
+fn histogram_dict(py: Python<'_>, h: core::Histogram) -> PyResult<Bound<'_, PyDict>> {
+    let d = PyDict::new(py);
+    let step = (h.hi - h.lo) / h.counts.len() as f64;
+    let edges: Vec<f64> = (0..=h.counts.len())
+        .map(|k| h.lo + k as f64 * step)
+        .collect();
+    d.set_item("counts", h.counts)?;
+    d.set_item("edges", edges)?;
+    d.set_item("lo", h.lo)?;
+    d.set_item("hi", h.hi)?;
+    d.set_item("level", h.level)?;
+    Ok(d)
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tree_json, m)?)?;
+    m.add_function(wrap_pyfunction!(warm_up, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("ViewerError", m.py().get_type::<ViewerError>())?;
     // a Rust panic reaches Python as this (a BaseException): hosts catch it with errors
@@ -1144,5 +1516,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("COLOUR_MAPS", core::COLOUR_MAPS.to_vec())?;
     m.add("ALIGNED", core::ALIGNED)?;
     m.add_class::<Viewer>()?;
+    m.add_class::<HistogramJob>()?;
+    m.add_class::<OpenJob>()?;
     Ok(())
 }

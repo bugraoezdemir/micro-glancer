@@ -287,3 +287,40 @@ def test_fields_without_positions_lie_on_a_grid(tmp_path):
     assert m["gridded"]
     (a, b) = m["rects"]
     assert a[0] == b[0] and b[1] >= a[3]                      # one row, the second right of the first
+
+
+# ------------------------------------------------------------------ opening apart
+
+def test_an_open_job_reads_a_plate_apart_from_the_viewer(plate):
+    # the Qt widget opens this way in the background (a plate: every field's metadata)
+    import time
+
+    from micro_glancer import OpenJob, ViewerError
+
+    job = OpenJob(plate)
+    assert job.progress == (0, 0) and not job.done
+    job.start()                                           # the core's own thread
+    end = time.monotonic() + 60
+    while not job.done and time.monotonic() < end:
+        time.sleep(0.005)
+    assert job.done and job.error is None
+    fields = sum(n for _, _, n in WELLS.values())
+    assert job.progress == (fields, fields)
+    v = Viewer.offscreen(200, 150)
+    v.open_job(job)
+    w = Viewer.offscreen(200, 150)
+    w.open(plate)
+    assert v.image == w.image and v.bounds == w.bounds and v.channels == w.channels
+    with pytest.raises(ViewerError, match="has not run"):
+        v.open_job(job)                                   # shown already
+
+
+def test_an_open_job_that_cannot_open_says_why(tmp_path):
+    from micro_glancer import OpenJob, ViewerError
+
+    job = OpenJob(tmp_path / "missing.ome.zarr")
+    with pytest.raises(ViewerError):
+        job.run()
+    assert job.done and job.error
+    with pytest.raises(ViewerError):
+        Viewer.offscreen(64, 64).open_job(job)

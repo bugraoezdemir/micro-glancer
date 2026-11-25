@@ -34,12 +34,16 @@ GRAB = 6
 #: the histogram's bins
 BINS = 256
 
+_pool = None
+
 
 class HistogramWidget(QWidget):
     """One channel's histogram with its contrast limits, isosurface level and opacity
     curve (see the module's notes)."""
 
     changed = pyqtSignal()
+    #: a histogram arrived (read on a background thread)
+    read = pyqtSignal()
 
     def __init__(self, view, parent=None):
         super().__init__(parent)
@@ -48,6 +52,11 @@ class HistogramWidget(QWidget):
         self.whole = False
         self._hist = None                   # the histogram dict, or None
         self._drag = None                   # "lo", "hi", "iso" or ("point", k)
+        self._job = None                    # the histogram being read
+        self._again = False                 # asked again while it was read
+        self._poll = QTimer(self)           # the window's thread looks for the answer
+        self._poll.setInterval(15)
+        self._poll.timeout.connect(self._take)
         self.setMinimumSize(220, 120)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.setMouseTracking(True)
@@ -59,20 +68,78 @@ class HistogramWidget(QWidget):
         return chans[self.channel] if self.channel < len(chans) else None
 
     def refresh(self) -> None:
-        """Read the histogram again (what is in view, or the whole plane / volume)."""
+        """Read the histogram again (what is in view, or the whole plane / volume).
+
+        The reading runs on a thread of the core's own (a whole plate in view reads every
+        field of it), so the window keeps drawing; a refresh asked for meanwhile reads
+        again once it is done (the newest view wins), and ``read`` is emitted when one
+        arrives. ``wait()`` waits for it."""
+        if self._job is not None:
+            self._again = True
+            return
         try:
             v = self.view.viewer
             if not v.layers:
                 self._hist = None
-            else:
-                # with a projection shown the plane does not matter: the whole volume
-                volume = v.layers[v.current]["volume"]
-                whole = self.whole or (volume and self._mode() is not None)
+                self.update()
+                return
+            # with a projection shown the plane does not matter: the whole volume
+            volume = v.layers[v.current]["volume"]
+            whole = self.whole or (volume and self._mode() is not None)
+            if not hasattr(v, "histogram_job"):
                 self._hist = v.histogram(self.channel, bins=BINS, whole=whole)
+                self.update()
+                self.read.emit()
+                return
+            job = v.histogram_job(self.channel, bins=BINS, whole=whole)
         except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
             self._hist = None
             self.view._fail(exc, force=True)
+            self.update()
+            return
+        try:
+            job.start()                     # the core's own thread; this one polls
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
+            self.view._fail(exc, force=True)
+            return
+        self._job = job
+        self._poll.start()
+
+    def _take(self):
+        """On the window's thread: the newest answer, once it is there."""
+        job = self._job
+        if job is None:
+            self._poll.stop()
+            return
+        if not job.done:
+            return
+        self._job = None
+        self._poll.stop()
+        try:
+            self._hist = job.result()
+        except ERRORS as exc:  # noqa: BLE001 (see the module's notes)
+            self._hist = None
+            self.view._fail(exc, force=True)
+        if self._again:                     # the view changed meanwhile: read it now
+            self._again = False
+            self.refresh()
         self.update()
+        self.read.emit()
+
+    def wait(self, timeout: float = 30.0) -> bool:
+        """Wait (handling events) until the newest histogram asked for has arrived; False
+        on a timeout."""
+        import time
+
+        from PyQt6.QtWidgets import QApplication
+
+        end = time.monotonic() + timeout
+        while self._job is not None or self._again:
+            if time.monotonic() > end:
+                return False
+            QApplication.processEvents()
+            time.sleep(0.002)
+        return True
 
     def _range(self):
         """The values the widget spans: the data's and the contrast window's."""
@@ -313,6 +380,7 @@ class ChannelPanel(QWidget):
         self.whole.toggled.connect(self._whole)
         self.auto.clicked.connect(self._auto)
         self.hist.changed.connect(self._show_info)
+        self.hist.read.connect(self._show_info)
         # the histogram follows the view, a little behind it (reading takes a moment)
         self._later = QTimer(self)
         self._later.setSingleShot(True)

@@ -323,3 +323,52 @@ def test_deep_chunks_flat_then_turned(tmp_path, vol):
     assert v.error is None
     val, inside = _nearest(vol, _index(_world(v)))
     _match(rgba[..., 0], _grey(val), inside, share=0.01)
+
+
+# ------------------------------------------------------------------ deep chunks (V12)
+
+@pytest.fixture(scope="module")
+def deep(tmp_path_factory, vol):
+    """The volume in chunks 16 planes deep, sharded 2 x 2 x 2: a plane's tiles are put
+    together from whole decode units (the inner chunks), each serving 16 planes."""
+    path = tmp_path_factory.mktemp("deep") / "deep.ome.zarr"
+    pyr = ozp.Pyramid().from_arrays([vol], axis_order="zyx", scales=[[ZS, 1.0, 1.0]],
+                                    version="0.5")
+    ozp.IO().write_pyramid(pyr, str(path), overwrite=True, chunk_shape=(16, 32, 32),
+                           shard_coefficients=(2, 2, 2))
+    with open(os.path.join(str(path), "0", "zarr.json")) as fh:
+        codecs = json.load(fh)["codecs"]
+    assert codecs[0]["name"] == "sharding_indexed"
+    assert codecs[0]["configuration"]["chunk_shape"] == [16, 32, 32]
+    return str(path)
+
+
+def test_planes_of_deep_chunks_come_out_right(deep, vol):
+    # every plane, inside a unit and across unit boundaries, from the cached units
+    v = Viewer.offscreen(200, 150)
+    v.open(deep)
+    v.look_at(75.25, 60.25, 1.0)
+    for z in (0, 1, 15, 16, 17, 31, 32, 49, 30, 2):
+        v.set_position("z", z)
+        v.settle(30.0)
+        for sx, sy in ((100.0, 75.0), (60.0, 40.0), (160.0, 120.0)):     # all inside
+            p = v.pick(sx, sy)
+            x, y = p["pixel"]
+            assert p["values"][0]["value"] == vol[z, y, x], (z, x, y)
+
+
+def test_a_plane_change_never_shows_an_empty_frame(deep):
+    # a step and a jump: the frame right after shows the previous plane where the new
+    # one has nothing yet (an empty frame was the "wink"), then the new plane
+    v = Viewer.offscreen(200, 150)
+    v.open(deep)
+    v.fit()
+    v.set_position("z", 5)
+    v.settle(30.0)
+    for target in (6, 40, 41, 3):
+        v.set_position("z", target)
+        data, w, h, _ = v.render_rgba()                  # before the new tiles arrive
+        first = np.frombuffer(data, np.uint8).reshape(h, w, 4)[..., :3]
+        assert first.max() > 0, target
+        v.settle(30.0)
+        assert v.position[0][1] == pytest.approx(target)

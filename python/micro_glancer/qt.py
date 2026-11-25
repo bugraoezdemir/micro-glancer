@@ -55,7 +55,28 @@ from PyQt6.QtGui import QColor, QImage, QPainter
 from PyQt6.QtWidgets import QWidget
 
 from . import ERRORS
-from ._core import Viewer
+from ._core import OpenJob, Viewer
+
+_warming = False
+
+
+def warm_up_in_background(software: bool = False) -> None:
+    """Load the GPU driver on a thread of its own, once per process: the first viewer
+    otherwise takes about a second longer (the driver's loading). Every
+    :class:`ViewerWidget` starts it when it is made; a host may call it earlier.
+
+    Background work here runs on the core's own threads, never Python's: Python's cycle
+    collector then runs on the window's thread only (on another thread it could drop a
+    widget and its viewer, which belongs to the window's thread)."""
+    global _warming
+    if _warming:
+        return
+    _warming = True
+    from . import warm_up
+    try:
+        warm_up(software, background=True)
+    except ERRORS:  # noqa: BLE001 (the viewer reports it when it is made)
+        pass
 
 #: zoom per wheel notch
 ZOOM_STEP = 1.25
@@ -97,6 +118,8 @@ class ViewerWidget(QWidget):
     picked = pyqtSignal(dict)
     saved = pyqtSignal(str)
     failed = pyqtSignal(str)
+    #: (images opened, images to open) while :meth:`open_in_background` reads
+    opening = pyqtSignal(int, int)
 
     def __init__(self, parent=None, *, mode: str | None = None, software: bool = False,
                  no_vsync: bool = False, atlas_mib: int = 0):
@@ -125,6 +148,12 @@ class ViewerWidget(QWidget):
         self._poll.setSingleShot(True)
         self._poll.setInterval(POLL_MS)
         self._poll.timeout.connect(self.update)
+        self._open_job = None                   # the newest open_in_background's job
+        self._open_done = None
+        self._open_timer = QTimer(self)          # its progress and end, every 30 ms
+        self._open_timer.setInterval(30)
+        self._open_timer.timeout.connect(self._open_progress)
+        warm_up_in_background(software)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.setMinimumSize(64, 64)
@@ -167,6 +196,47 @@ class ViewerWidget(QWidget):
         else:
             self._viewer.open(str(path))
         self._changed()
+
+    def open_in_background(self, path, done=None, field=None) -> None:
+        """Open the OME-Zarr image at ``path`` as the only layer without making the
+        window wait: its metadata (a plate: every field's) is read on a background thread,
+        ``opening`` reports progress meanwhile, then it is shown and fitted, and ``done``
+        is called with None, or with the error, on the window's thread. A newer call
+        replaces an older one still reading. ``field``: one field of every well of a plate
+        (None: every field at its position)."""
+        job = OpenJob(str(path), field)
+        self._open_job, self._open_done = job, done
+        job.start()                             # the core's own thread; this one polls
+        self._open_timer.start()
+
+    @property
+    def opening_now(self) -> bool:
+        """Whether an :meth:`open_in_background` is still reading."""
+        return self._open_job is not None
+
+    def _open_progress(self):
+        """Every 30 ms while an open reads: its progress, and once read, show it."""
+        job = self._open_job
+        if job is None:
+            self._open_timer.stop()
+            return
+        if not job.done:
+            self.opening.emit(*job.progress)
+            return
+        self._open_job = None
+        self._open_timer.stop()
+        done, self._open_done = self._open_done, None
+        error = None
+        try:
+            self.viewer.open_job(job)               # raises the reading's error, if any
+        except ERRORS as exc:  # noqa: BLE001 (handed to `done`)
+            # without its traceback: that holds this frame, whose `error` holds it back,
+            # a cycle only Python's collector frees, on whichever thread it then runs
+            # (where it would drop this widget and its viewer)
+            error = exc.with_traceback(None)
+        self._changed()
+        if done is not None:
+            done(error)
 
     def add(self, path) -> None:
         """Add the OME-Zarr image at ``path`` as a new layer on top."""
