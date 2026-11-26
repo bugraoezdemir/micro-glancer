@@ -2365,6 +2365,70 @@ impl Viewer {
         self.step_along(self.camera.normal(), steps)
     }
 
+    /// Where the view's plane can cut the visible layers along its normal: (first, last,
+    /// now, step), world distances along the normal (from the world's origin), `step` one
+    /// voxel of the current layer along it (as [`Viewer::step_depth`] moves). None
+    /// without a visible layer.
+    pub fn depth_range(&self) -> Option<(f64, f64, f64, f64)> {
+        let n = self.camera.normal();
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        for l in self.layers.iter().filter(|l| l.visible) {
+            for c in l.corners() {
+                let d = dot(c, n);
+                lo = lo.min(d);
+                hi = hi.max(d);
+            }
+        }
+        if lo > hi {
+            return None;
+        }
+        let step = self.layer(self.current).ok().map_or(0.0, |l| {
+            let v = l.to_index(0).linear(n);
+            let most = v.iter().fold(0.0f64, |m, c| m.max(c.abs()));
+            if most > 0.0 {
+                1.0 / most
+            } else {
+                0.0
+            }
+        });
+        Some((lo, hi, dot(self.camera.center, n), step))
+    }
+
+    /// Move the view's plane along its normal to depth `d` (see [`Viewer::depth_range`]);
+    /// the point at the screen's centre moves straight along the normal.
+    pub fn set_depth(&mut self, d: f64) -> Result<(), ViewerError> {
+        if !d.is_finite() {
+            return Err(verr(format!("depth {d}")));
+        }
+        let n = self.camera.normal();
+        let now = dot(self.camera.center, n);
+        self.camera.center = add(self.camera.center, mul(n, d - now));
+        self.moved();
+        Ok(())
+    }
+
+    /// The world directions (unit vectors) of layer `i`'s image axes x, y and z (a 2-D
+    /// image's z: its plane's normal), its transform applied: where the dataset's own
+    /// axes point, whatever the view.
+    pub fn axes(&self, i: usize) -> Result<[V3; 3], ViewerError> {
+        let l = self.layer(i)?;
+        let lv = &l.source.levels[0];
+        let unit = |v: V3| {
+            let len = dot(v, v).sqrt();
+            if len > 0.0 {
+                mul(v, 1.0 / len)
+            } else {
+                v
+            }
+        };
+        let axis = |e: V3| unit(l.transform.linear(lv.to_world3.linear(e)));
+        Ok([
+            axis([1.0, 0.0, 0.0]),
+            axis([0.0, 1.0, 0.0]),
+            axis([0.0, 0.0, 1.0]),
+        ])
+    }
+
     /// Move the camera's centre by `steps` voxels of the current layer along `normal`.
     fn step_along(&mut self, normal: V3, steps: f64) -> Result<(), ViewerError> {
         let l = self.layer(self.current)?;

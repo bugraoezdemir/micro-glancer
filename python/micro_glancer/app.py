@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget, QF
 
 from . import ERRORS
 from .contents import ContentsPanel, open_node
+from .controls import ViewBar
 from .panel import ChannelPanel
 from .qt import ViewerWidget
 
@@ -279,7 +280,15 @@ class MainWindow(QMainWindow):
         self.resize(1600, 900)
         self.setAcceptDrops(True)
         self.view = ViewerWidget()
-        self.setCentralWidget(self.view)
+        # the view, and below it the view bar: compass, angles, Depth (Workplan V14)
+        self.view_bar = ViewBar(self.view)
+        centre = QWidget()
+        cl = QVBoxLayout(centre)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+        cl.addWidget(self.view, 1)
+        cl.addWidget(self.view_bar)
+        self.setCentralWidget(centre)
         self._pick = ""
         self._note = ""
         # docks
