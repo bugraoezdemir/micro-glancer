@@ -372,3 +372,90 @@ def test_a_plane_change_never_shows_an_empty_frame(deep):
         assert first.max() > 0, target
         v.settle(30.0)
         assert v.position[0][1] == pytest.approx(target)
+
+
+# ------------------------------------------------------------------ view controls (V14)
+
+def test_the_depth_range_and_setting_the_depth(stores):
+    v = Viewer.offscreen(200, 150)
+    v.open(stores["vol"])
+    lo, hi, now, step = v.depth_range                     # looking along z
+    assert step == pytest.approx(ZS)
+    assert (lo, hi) == (pytest.approx(-0.5 * ZS), pytest.approx((D - 0.5) * ZS))
+    v.set_depth(10 * ZS)
+    assert v.position[0][1] == pytest.approx(10.0)
+    assert v.depth_range[2] == pytest.approx(10 * ZS)
+    v.turn(30.0, 0.0)                                     # the range follows the view
+    lo2, hi2, _, step2 = v.depth_range
+    assert hi2 - lo2 > hi - lo                            # across the volume's diagonal
+    v.step_depth(1)                                       # a step is what the keys move
+    assert v.depth_range[2] - _ == pytest.approx(step2)
+
+
+def test_the_dataset_axes_follow_the_layer_not_the_view(stores):
+    v = Viewer.offscreen(200, 150)
+    v.open(stores["vol"])
+    assert np.allclose(v.axes(), np.eye(3))
+    v.turn(40.0, 20.0)                                    # the view turns: axes stay
+    assert np.allclose(v.axes(), np.eye(3))
+    v.turn_layer(30.0, 0.0)                               # the layer turns: axes turn
+    assert not np.allclose(v.axes(), np.eye(3))
+    a = np.array(v.axes())
+    assert np.allclose(a @ a.T, np.eye(3), atol=1e-9)    # still unit and perpendicular
+
+
+def test_the_view_bar_drives_the_viewer(qapp, stores):
+    from PyQt6.QtCore import QPoint, Qt
+    from PyQt6.QtTest import QTest
+    from micro_glancer.controls import ViewBar
+    from micro_glancer.qt import ViewerWidget
+
+    w = ViewerWidget(mode="offscreen")
+    w.resize(240, 180)
+    w.open(stores["vol"])
+    bar = ViewBar(w)
+    w.show()
+    bar.show()
+    qapp.processEvents()
+    w._changed()
+    qapp.processEvents()
+    v = w.viewer
+    assert not bar.isHidden()
+    # Depth: one step per plane along z
+    assert bar.depth.slider.maximum() == D - 1
+    bar.depth.slider.setValue(7)
+    assert v.position[0][1] == pytest.approx(7.0)
+    assert bar.depth.readout.text() == f"depth 7 of {D - 1}"
+    # Tilt + by the 5 degree step: the viewing direction turns by 5 degrees
+    n0 = np.array(v.orientation[2])
+    row = [r for r in range(1, 4) if bar.angles.layout().itemAtPosition(r, 0).widget().text() == "Tilt"][0]
+    bar.angles.layout().itemAtPosition(row, 3).widget().click()
+    n1 = np.array(v.orientation[2])
+    assert np.degrees(np.arccos(np.clip(n0 @ n1, -1, 1))) == pytest.approx(5.0, abs=1e-6)
+    # Roll by an exact 12.5 degrees: the direction stays, the screen's right turns
+    r0 = np.array(v.orientation[0])
+    field = bar.angles.fields["Roll"]
+    field.setValue(12.5)
+    field.editingFinished.emit()
+    assert np.allclose(v.orientation[2], n1)
+    r1 = np.array(v.orientation[0])
+    assert np.degrees(np.arccos(np.clip(r0 @ r1, -1, 1))) == pytest.approx(12.5, abs=1e-6)
+    assert field.value() == 0.0
+    assert "from z" in bar.angles.readout.text()
+    # the compass draws, and a double-click on z's arrow looks along z again
+    bar.compass.grab()
+    tip = bar.compass._tips["z"]
+    QTest.mouseDClick(bar.compass, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                      QPoint(round(tip.x()), round(tip.y())))
+    assert abs(np.array(v.orientation[2]) @ np.array(v.axes()[2])) == pytest.approx(1.0)
+    # a drag inside the ball, started sideways, only turns (no tilt mixed in)
+    c = bar.compass.rect().center()
+    QTest.mousePress(bar.compass, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, c)
+    for dx in range(2, 42, 4):
+        QTest.mouseMove(bar.compass, QPoint(c.x() + dx, c.y() + (1 if dx % 8 else -1)))
+    QTest.mouseRelease(bar.compass, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                       QPoint(c.x() + 40, c.y()))
+    down = np.array(v.orientation[1])
+    assert abs(down @ np.array(v.axes()[1])) == pytest.approx(1.0)   # turned about down only
+    bar.close()
+    w.close()

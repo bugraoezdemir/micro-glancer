@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.2 (2026-11-24)
+## 0.0.2 (2026-11-26)
 
 ### Changed
 - **Stepping through planes no longer winks**: a step showed a coarser stand-in or, after
@@ -31,6 +31,21 @@
   opened (later viewers took 0.08 s).
 
 ### Added
+- **A view bar below the canvas** (`micro_glancer.controls.ViewBar`, in the app and in
+  eubi's GPU viewer), for volumes:
+  - **Depth**: a slider moving the cutting plane along the viewing direction, as the
+    Up / Down keys do, from where the plane first touches the layers to where it last does,
+    one position per plane. The plane sliders keep moving along the image's own z, y, x;
+  - **Tilt, Turn, Roll**: turning the view about its own axes (the screen's horizontal and
+    vertical axes, and the viewing direction) by a step of 1, 5, 15, 45 or 90 degrees, or by
+    an exact angle typed in; a readout of the viewing direction's angle from the dataset's
+    x, y and z;
+  - **the compass**: the dataset's own axes as seen from the view (x red, y green, z blue;
+    an arrow pointing away dashed and faint), so its orientation stays readable after any
+    turn. Dragging on it never mixes axes: on the outer ring it rolls, inside it tilts or
+    turns, whichever way the drag starts; Shift snaps to 15 degrees. A double-click on an
+    arrow looks along that axis of the dataset.
+  - In Python: `Viewer.depth_range`, `Viewer.set_depth(depth)` and `Viewer.axes(layer)`.
 - **Opening in the background**: `ViewerWidget.open_in_background(path, done=...)` reads
   an image's metadata (a plate: every field's) on a thread of the core's own while the
   window stays responsive, reports `opening(done, total)` (fields of a plate, members of

@@ -992,6 +992,33 @@ impl Viewer {
         Ok(())
     }
 
+    /// Where the view's plane can cut the visible layers along its normal: (first, last,
+    /// now, step) in world units along the normal, `step` one voxel of the current layer
+    /// along it; None without a visible layer.
+    #[getter]
+    fn depth_range(&self) -> Option<(f64, f64, f64, f64)> {
+        self.inner.depth_range()
+    }
+
+    /// Move the view's plane along its normal to depth `depth` (see `depth_range`).
+    fn set_depth(&mut self, depth: f64) -> PyResult<()> {
+        self.inner.set_depth(depth).map_err(err)
+    }
+
+    /// The world directions (unit vectors) of the image axes x, y and z of the current
+    /// layer (or `layer`), its transform applied: where the dataset's own axes point.
+    #[pyo3(signature = (layer = None))]
+    fn axes(&self, layer: Option<usize>) -> PyResult<Vec<Vec<f64>>> {
+        let i = self.layer_index(layer)?;
+        Ok(self
+            .inner
+            .axes(i)
+            .map_err(err)?
+            .iter()
+            .map(|a| a.to_vec())
+            .collect())
+    }
+
     /// Move the view's plane by `steps` voxels of the current layer along the view's
     /// normal (along z: one plane per step).
     #[pyo3(signature = (steps = 1.0, x = None, y = None))]
